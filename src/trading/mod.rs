@@ -32,6 +32,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod order_checker;
 pub mod order_manager;
 pub mod order_ws;
 pub mod orders;
@@ -54,6 +55,7 @@ pub use orders::{
 };
 pub use position::{SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle};
 pub use wallet_tracker::{WalletTracker, WalletTrackerConfig, WalletTrackerHandle};
+pub use order_checker::{OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

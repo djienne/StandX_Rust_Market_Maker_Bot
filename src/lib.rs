@@ -103,6 +103,7 @@ pub use trading::{
     AuthManager, SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle,
     QuoteOrderManager, OrderManagerConfig, OrderDecision, LiveOrder, OrderState, Side, OrderManagerStats,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
+    OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
 };
 pub use types::{OrderbookSnapshot, PriceLevel, Symbol, MAX_LEVELS};
 pub use websocket::{

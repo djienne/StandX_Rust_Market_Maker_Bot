@@ -18,6 +18,7 @@ use standx_orderbook::{
     QuoteOrderManager, OrderManagerConfig, OrderDecision, Side,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OrderbookSanityChecker, SanityCheckerConfig, SanityCheckerHandle,
+    OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
 };
 use standx_orderbook::trading::TradingStats;
 use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest};
@@ -772,6 +773,37 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Start open orders checker if order management is enabled
+    // This detects when exchange has no orders but internal state thinks we do,
+    // allowing immediate new order placement instead of waiting for timeout.
+    let mut order_checker_handle: Option<OpenOrdersCheckerHandle> = None;
+    let mut clear_orders_rx: Option<mpsc::Receiver<ClearOrdersSignal>> = None;
+    if config.order.enabled {
+        if let Some(ref auth) = shared_auth {
+            // Create channel for clear signals (small buffer, we only need latest)
+            let (tx, rx) = mpsc::channel::<ClearOrdersSignal>(10);
+            clear_orders_rx = Some(rx);
+
+            // Start checker for each symbol
+            for symbol in &config.symbols {
+                let checker_config = OpenOrdersCheckerConfig {
+                    interval: Duration::from_secs(3), // Poll every 3 seconds
+                    symbol: symbol.clone(),
+                    debounce_count: 2, // 2 consecutive zero polls = 6 seconds
+                };
+                let checker = OpenOrdersChecker::new(
+                    Arc::clone(auth),
+                    checker_config,
+                    tx.clone(),
+                );
+                order_checker_handle = Some(checker.start());
+            }
+            info!(
+                "Open orders checker started (interval: 3s, debounce: 2)"
+            );
+        }
+    }
+
     // Create WebSocket client for market data
     let client = WsClientBuilder::new()
         .config(config.websocket.clone())
@@ -961,6 +993,20 @@ async fn main() -> anyhow::Result<()> {
 
             // Periodic tasks: timeout checking and stats logging (runs every 1 second)
             _ = periodic_interval.tick() => {
+                // Check for clear order signals from OpenOrdersChecker (non-blocking)
+                // This is O(1) try_recv - zero latency impact on hot path
+                if let Some(ref mut rx) = clear_orders_rx {
+                    while let Ok(signal) = rx.try_recv() {
+                        info!(
+                            "[{}] Clearing internal order state: {}",
+                            signal.symbol, signal.reason
+                        );
+                        if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
+                            manager.clear_all_orders();
+                        }
+                    }
+                }
+
                 // Check pending order timeouts (independent of market data)
                 app.check_order_timeouts();
                 app.log_stats();
@@ -974,6 +1020,12 @@ async fn main() -> anyhow::Result<()> {
         for handle in position_handles {
             handle.stop();
         }
+    }
+
+    // Stop open orders checker
+    if let Some(handle) = order_checker_handle {
+        info!("Stopping open orders checker...");
+        handle.stop();
     }
 
     // Final stats

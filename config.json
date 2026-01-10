@@ -32,7 +32,7 @@
   "order": {
     "enabled": true,
     "reprice_threshold_bps": 1.0,
-    "pending_timeout_secs": 60
+    "pending_timeout_secs": 30
   },
   "pnl_tracking": {
     "enabled": true,
