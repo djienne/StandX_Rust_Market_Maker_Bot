@@ -22,6 +22,127 @@ use standx_orderbook::{
 use standx_orderbook::trading::TradingStats;
 use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest};
 
+/// Statistics tracker for monitoring throughput and rates.
+/// Extracted from App to reduce struct bloat and separate concerns.
+struct StatsTracker {
+    /// Message counter for logging
+    message_count: u64,
+    /// Quote counter
+    quote_count: u64,
+    /// Order decision counter
+    order_decision_count: u64,
+    /// Last stats log time
+    last_stats_time: std::time::Instant,
+    /// Shared trading stats for volume/price tracking (used by WalletTracker)
+    trading_stats: Arc<TradingStats>,
+}
+
+impl StatsTracker {
+    fn new() -> Self {
+        Self {
+            message_count: 0,
+            quote_count: 0,
+            order_decision_count: 0,
+            last_stats_time: std::time::Instant::now(),
+            trading_stats: Arc::new(TradingStats::default()),
+        }
+    }
+
+    /// Get trading stats for wallet tracker.
+    fn trading_stats(&self) -> Arc<TradingStats> {
+        Arc::clone(&self.trading_stats)
+    }
+
+    /// Log statistics if interval has elapsed.
+    fn log_if_needed(
+        &mut self,
+        config: &Config,
+        store: &OrderbookStore,
+        strategies: &HashMap<String, ObiStrategy>,
+        order_managers: &HashMap<String, QuoteOrderManager>,
+    ) {
+        // 0 means disabled (as documented)
+        if config.stats_interval_secs == 0 {
+            return;
+        }
+        let elapsed = self.last_stats_time.elapsed();
+        if elapsed < Duration::from_secs(config.stats_interval_secs) {
+            return;
+        }
+
+        let stats = store.stats();
+        for stat in &stats {
+            // Get strategy status for this symbol
+            let strategy_status = strategies.get(&stat.symbol)
+                .map(|s| if s.is_warmed_up() {
+                    format!("vol={:.4} alpha={:.3}", s.volatility(), s.alpha())
+                } else {
+                    "warming up".to_string()
+                })
+                .unwrap_or_default();
+
+            info!(
+                "[{}] updates={} history={}/{} bid={:.2} ask={:.2} spread={:.4} {}",
+                stat.symbol,
+                stat.update_count,
+                stat.history_count,
+                config.history_buffer_size,
+                stat.best_bid.unwrap_or(0.0),
+                stat.best_ask.unwrap_or(0.0),
+                stat.spread.unwrap_or(0.0),
+                strategy_status,
+            );
+        }
+
+        let rate = self.message_count as f64 / elapsed.as_secs_f64();
+        let quote_rate = self.quote_count as f64 / elapsed.as_secs_f64();
+        let order_rate = self.order_decision_count as f64 / elapsed.as_secs_f64();
+
+        if config.order.enabled {
+            info!(
+                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} orders ({:.1}/sec)",
+                self.message_count,
+                rate,
+                self.quote_count,
+                quote_rate,
+                self.order_decision_count,
+                order_rate,
+            );
+
+            // Log order manager stats
+            for (symbol, manager) in order_managers {
+                let stats = manager.stats();
+                if stats.orders_sent > 0 {
+                    info!(
+                        "[{}] Orders: sent={} accepted={} canceled={} rejected={} reprices={} timeouts={}",
+                        symbol,
+                        stats.orders_sent,
+                        stats.orders_accepted,
+                        stats.orders_canceled,
+                        stats.rejections,
+                        stats.reprices,
+                        stats.timeouts,
+                    );
+                }
+            }
+        } else {
+            info!(
+                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} total history entries",
+                self.message_count,
+                rate,
+                self.quote_count,
+                quote_rate,
+                stats.iter().map(|s| s.history_count).sum::<usize>(),
+            );
+        }
+
+        self.message_count = 0;
+        self.quote_count = 0;
+        self.order_decision_count = 0;
+        self.last_stats_time = std::time::Instant::now();
+    }
+}
+
 /// Application state.
 struct App {
     /// Configuration
@@ -36,18 +157,23 @@ struct App {
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
     order_tx: Option<mpsc::Sender<(Arc<str>, OrderDecision)>>,
+    /// Pre-allocated Arc<str> per symbol for hot path (avoids allocation on each decision)
+    symbol_arcs: HashMap<String, Arc<str>>,
     /// Quote formatter
     quote_formatter: QuoteFormatter,
-    /// Message counter for logging
-    message_count: u64,
-    /// Quote counter
-    quote_count: u64,
-    /// Order decision counter
-    order_decision_count: u64,
-    /// Last stats log time
-    last_stats_time: std::time::Instant,
-    /// Shared trading stats for volume/price tracking (used by WalletTracker)
-    trading_stats: Arc<TradingStats>,
+    /// Statistics tracker (extracted to reduce App struct size)
+    stats: StatsTracker,
+    /// Latest received_at timestamp from orderbook messages (nanoseconds).
+    ///
+    /// # Clock Source Design
+    /// This uses StandX server time (`received_at` from orderbook messages) rather than
+    /// local system time (`chrono::Utc::now()`). This ensures consistent timeout checking
+    /// since orders are also timestamped with `received_at` when created.
+    ///
+    /// Note: Other components use different clock sources:
+    /// - `order_manager.rs:189`: session_prefix uses local `chrono::Utc::now()` (for uniqueness only)
+    /// - `position.rs:52-57`: staleness check uses local `SystemTime::now()` (acceptable for staleness)
+    last_received_at_ns: i64,
 }
 
 impl App {
@@ -59,10 +185,11 @@ impl App {
             config.history_minutes,
         ));
 
-        // Create OBI strategy, shared position, and order manager for each symbol
+        // Create OBI strategy, shared position, order manager, and Arc<str> for each symbol
         let mut strategies = HashMap::new();
         let mut positions = HashMap::new();
         let mut order_managers = HashMap::new();
+        let mut symbol_arcs = HashMap::new();
 
         for symbol in &config.symbols {
             let strategy = ObiStrategy::with_required_history(config.strategy.clone(), config.history_minutes);
@@ -79,9 +206,13 @@ impl App {
                 pending_timeout_ns: config.order.pending_timeout_secs * 1_000_000_000,
                 tick_size: config.strategy.tick_size,
                 lot_size: config.strategy.lot_size,
+                debug: config.debug,
             };
             let order_manager = QuoteOrderManager::new(om_config, position);
             order_managers.insert(symbol.clone(), order_manager);
+
+            // Pre-allocate Arc<str> for hot path (avoids allocation per decision)
+            symbol_arcs.insert(symbol.clone(), Arc::from(symbol.as_str()));
         }
 
         // Determine price precision from tick_size
@@ -99,12 +230,10 @@ impl App {
             positions,
             order_managers,
             order_tx: None,
+            symbol_arcs,
             quote_formatter: QuoteFormatter::new(price_precision, 4),
-            message_count: 0,
-            quote_count: 0,
-            order_decision_count: 0,
-            last_stats_time: std::time::Instant::now(),
-            trading_stats: Arc::new(TradingStats::default()),
+            stats: StatsTracker::new(),
+            last_received_at_ns: 0,
         }
     }
 
@@ -120,7 +249,15 @@ impl App {
 
     /// Get trading stats for wallet tracker.
     fn trading_stats(&self) -> Arc<TradingStats> {
-        Arc::clone(&self.trading_stats)
+        self.stats.trading_stats()
+    }
+
+    /// Get pre-allocated Arc<str> for a symbol (hot path optimization).
+    #[inline]
+    fn get_symbol_arc(&self, symbol: &str) -> Arc<str> {
+        self.symbol_arcs.get(symbol)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(symbol))
     }
 
     /// Get mutable reference to order managers.
@@ -141,15 +278,25 @@ impl App {
             return;
         }
 
-        let current_time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        // Skip if we haven't received any orderbook messages yet
+        if self.last_received_at_ns == 0 {
+            return;
+        }
+
+        // Use the same timestamp source as order creation (StandX server time)
+        // This avoids clock drift issues between local system and StandX server
+        let current_time_ns = self.last_received_at_ns;
 
         for (symbol, manager) in &mut self.order_managers {
             let timeout_decisions = manager.check_timeouts_now(current_time_ns);
             if !timeout_decisions.is_empty() {
                 if let Some(tx) = &self.order_tx {
-                    let symbol_arc: Arc<str> = symbol.as_str().into();
+                    // Use pre-allocated Arc<str> for hot path (avoids allocation)
+                    let symbol_arc = self.symbol_arcs.get(symbol)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::from(symbol.as_str()));
                     for decision in timeout_decisions {
-                        self.order_decision_count += 1;
+                        self.stats.order_decision_count += 1;
                         if tx.try_send((Arc::clone(&symbol_arc), decision)).is_err() {
                             warn!("[{}] Order decision channel full, dropping timeout cancel", symbol);
                         }
@@ -194,7 +341,9 @@ impl App {
     fn process_message(&mut self, msg: StandXMessage, received_at: i64) {
         match msg {
             StandXMessage::DepthBook(data) => {
-                self.message_count += 1;
+                self.stats.message_count += 1;
+                // Update latest timestamp for timeout checking (same clock as order creation)
+                self.last_received_at_ns = received_at;
 
                 // Convert to snapshot
                 match data.to_snapshot(self.config.orderbook_levels, received_at) {
@@ -202,7 +351,7 @@ impl App {
 
                         // Validate orderbook integrity in debug builds only (no production latency)
                         #[cfg(debug_assertions)]
-                        if self.message_count % 100 == 1 {
+                        if self.stats.message_count % 100 == 1 {
                             if let Err(e) = snapshot.validate() {
                                 error!("[{}] Orderbook validation failed: {}", data.symbol, e);
                                 debug!("[{}] {}", data.symbol, snapshot.debug_levels(5));
@@ -223,7 +372,7 @@ impl App {
 
                             if let Some(quote) = strategy.update(&snapshot) {
                                 quote_result = Some(quote);
-                            } else if !strategy.is_warmed_up() && self.message_count % 20 == 0 {
+                            } else if !strategy.is_warmed_up() && self.stats.message_count % 20 == 0 {
                                 is_warming_up = true;
                             }
                         }
@@ -233,14 +382,14 @@ impl App {
                             info!(
                                 "[{}] Warming up... {} msgs, mid={:.2}",
                                 data.symbol,
-                                self.message_count,
+                                self.stats.message_count,
                                 snapshot.mid_price().unwrap_or(0.0)
                             );
                         }
 
                         // Update trading stats mid_price (single atomic store ~1ns)
                         if let Some(mid) = snapshot.mid_price() {
-                            self.trading_stats.set_mid_price(mid);
+                            self.stats.trading_stats.set_mid_price(mid);
                         }
 
                         // Update orderbook store (still clones internally for history,
@@ -249,30 +398,15 @@ impl App {
                             ob.update(snapshot);
                         }
 
-                        // ALWAYS check pending order timeouts on every orderbook update
-                        // This ensures orders are cleaned up even when strategy isn't producing quotes
-                        if self.config.order.enabled {
-                            if let Some(order_manager) = self.order_managers.get_mut(&data.symbol) {
-                                let timeout_decisions = order_manager.check_pending_timeouts(received_at);
-                                if !timeout_decisions.is_empty() {
-                                    if let Some(tx) = &self.order_tx {
-                                        let symbol: Arc<str> = data.symbol.as_str().into();
-                                        for decision in timeout_decisions {
-                                            self.order_decision_count += 1;
-                                            if tx.try_send((Arc::clone(&symbol), decision)).is_err() {
-                                                warn!("[{}] Order decision channel full, dropping timeout cancel", data.symbol);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // Note: Timeout checking is now consolidated in the periodic 1-second timer
+                        // (check_order_timeouts). This removes duplicate checking that was here before.
+                        // The periodic timer uses the same StandX server timestamp for consistency.
 
                         // Process quote if we got one
                         if let Some(quote) = quote_result {
                             // Log quote using formatter
                             self.quote_formatter.log_quote(&quote);
-                            self.quote_count += 1;
+                            self.stats.quote_count += 1;
 
                             // Process quote through order manager if enabled
                             if self.config.order.enabled {
@@ -281,12 +415,12 @@ impl App {
 
                                     // Send decisions to executor via channel
                                     if let Some(tx) = &self.order_tx {
-                                        // Create Arc<str> once, then clone Arc for each decision (cheap refcount)
-                                        let symbol: Arc<str> = data.symbol.as_str().into();
+                                        // Use pre-allocated Arc<str> for hot path (avoids allocation)
+                                        let symbol_arc = self.get_symbol_arc(&data.symbol);
                                         for decision in decisions {
-                                            self.order_decision_count += 1;
+                                            self.stats.order_decision_count += 1;
                                             // Non-blocking send (Arc::clone is just a refcount increment)
-                                            if tx.try_send((Arc::clone(&symbol), decision)).is_err() {
+                                            if tx.try_send((Arc::clone(&symbol_arc), decision)).is_err() {
                                                 warn!("[{}] Order decision channel full, dropping decision", data.symbol);
                                             }
                                         }
@@ -296,7 +430,7 @@ impl App {
                         }
 
                         // Log periodic orderbook updates if verbose
-                        if self.config.verbose && self.message_count % 100 == 0 {
+                        if self.config.verbose && self.stats.message_count % 100 == 0 {
                             if let Some(ob) = self.store.get(&data.symbol) {
                                 if let Some(latest) = ob.latest() {
                                     info!(
@@ -345,87 +479,14 @@ impl App {
         }
     }
 
-    /// Log statistics.
+    /// Log statistics (delegates to StatsTracker).
     fn log_stats(&mut self) {
-        // 0 means disabled (as documented)
-        if self.config.stats_interval_secs == 0 {
-            return;
-        }
-        let elapsed = self.last_stats_time.elapsed();
-        if elapsed < Duration::from_secs(self.config.stats_interval_secs) {
-            return;
-        }
-
-        let stats = self.store.stats();
-        for stat in &stats {
-            // Get strategy status for this symbol
-            let strategy_status = self.strategies.get(&stat.symbol)
-                .map(|s| if s.is_warmed_up() {
-                    format!("vol={:.4} alpha={:.3}", s.volatility(), s.alpha())
-                } else {
-                    "warming up".to_string()
-                })
-                .unwrap_or_default();
-
-            info!(
-                "[{}] updates={} history={}/{} bid={:.2} ask={:.2} spread={:.4} {}",
-                stat.symbol,
-                stat.update_count,
-                stat.history_count,
-                self.config.history_buffer_size,
-                stat.best_bid.unwrap_or(0.0),
-                stat.best_ask.unwrap_or(0.0),
-                stat.spread.unwrap_or(0.0),
-                strategy_status,
-            );
-        }
-
-        let rate = self.message_count as f64 / elapsed.as_secs_f64();
-        let quote_rate = self.quote_count as f64 / elapsed.as_secs_f64();
-        let order_rate = self.order_decision_count as f64 / elapsed.as_secs_f64();
-
-        if self.config.order.enabled {
-            info!(
-                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} orders ({:.1}/sec)",
-                self.message_count,
-                rate,
-                self.quote_count,
-                quote_rate,
-                self.order_decision_count,
-                order_rate,
-            );
-
-            // Log order manager stats
-            for (symbol, manager) in &self.order_managers {
-                let stats = manager.stats();
-                if stats.orders_sent > 0 {
-                    info!(
-                        "[{}] Orders: sent={} accepted={} canceled={} rejected={} reprices={} timeouts={}",
-                        symbol,
-                        stats.orders_sent,
-                        stats.orders_accepted,
-                        stats.orders_canceled,
-                        stats.rejections,
-                        stats.reprices,
-                        stats.timeouts,
-                    );
-                }
-            }
-        } else {
-            info!(
-                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} total history entries",
-                self.message_count,
-                rate,
-                self.quote_count,
-                quote_rate,
-                stats.iter().map(|s| s.history_count).sum::<usize>(),
-            );
-        }
-
-        self.message_count = 0;
-        self.quote_count = 0;
-        self.order_decision_count = 0;
-        self.last_stats_time = std::time::Instant::now();
+        self.stats.log_if_needed(
+            &self.config,
+            &self.store,
+            &self.strategies,
+            &self.order_managers,
+        );
     }
 }
 
@@ -726,6 +787,10 @@ async fn main() -> anyhow::Result<()> {
     // Main event loop
     info!("Starting event loop (press Ctrl+C to stop)");
 
+    // Create interval OUTSIDE the loop so it persists across iterations
+    // (Using sleep inside select! would recreate it every iteration, never completing)
+    let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
+
     loop {
         tokio::select! {
             // Handle market data WebSocket events
@@ -760,9 +825,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    OrderEvent::OrderFilled { .. } => {
+                    OrderEvent::OrderFilled { order_id, fill_qty, fill_price } => {
                         // Volume is inferred from position changes in PositionPoller
                         // Position poller remains source of truth for position
+                        // Log fills for debugging
+                        info!("Fill received: order_id={}, qty={}, price={}", order_id, fill_qty, fill_price);
                     }
                     OrderEvent::OrderCanceled { order_id, cl_ord_id } => {
                         // First try matching by cl_ord_id (works for orders that were never accepted)
@@ -892,8 +959,8 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            // Periodic tasks: timeout checking and stats logging
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            // Periodic tasks: timeout checking and stats logging (runs every 1 second)
+            _ = periodic_interval.tick() => {
                 // Check pending order timeouts (independent of market data)
                 app.check_order_timeouts();
                 app.log_stats();

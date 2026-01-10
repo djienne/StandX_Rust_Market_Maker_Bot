@@ -119,12 +119,14 @@ pub struct OrderManagerConfig {
     pub reprice_threshold_bps: f64,
     /// Maximum position in dollar value (from strategy config).
     pub max_position_dollar: f64,
-    /// Pending order timeout in nanoseconds (default: 5 seconds).
+    /// Order timeout in nanoseconds (applies to Pending and Live states).
     pub pending_timeout_ns: u64,
     /// Tick size for price snapping.
     pub tick_size: f64,
     /// Lot size for quantity.
     pub lot_size: f64,
+    /// Enable debug logging for order state tracking.
+    pub debug: bool,
 }
 
 impl Default for OrderManagerConfig {
@@ -136,6 +138,7 @@ impl Default for OrderManagerConfig {
             pending_timeout_ns: 5_000_000_000, // 5 seconds
             tick_size: 0.01,
             lot_size: 0.001,
+            debug: false,
         }
     }
 }
@@ -369,23 +372,22 @@ impl OrderManager {
             }
             Some(o) if o.state == OrderState::Pending => {
                 // Still pending - wait for confirmation
-                debug!(
-                    "[{}] {} order blocked: pending confirmation for {} (sent {}ms ago)",
-                    self.config.symbol,
-                    side,
-                    o.cl_ord_id,
-                    (current_time_ns - o.sent_at_ns) / 1_000_000
-                );
+                let age_secs = (current_time_ns - o.sent_at_ns) / 1_000_000_000;
+                if self.config.debug {
+                    info!(
+                        "[{}] {} order blocked: pending confirmation for {} ({}s ago)",
+                        self.config.symbol, side, o.cl_ord_id, age_secs
+                    );
+                }
                 None
             }
             Some(o) if o.state == OrderState::Canceling => {
                 // Cancel in progress - wait for confirmation
-                debug!(
-                    "[{}] {} order blocked: cancel pending for {} (sent {}ms ago)",
-                    self.config.symbol,
-                    side,
-                    o.cl_ord_id,
-                    (current_time_ns - o.sent_at_ns) / 1_000_000
+                let age_secs = (current_time_ns - o.sent_at_ns) / 1_000_000_000;
+                // Always log at info level for Canceling - this blocks new orders
+                info!(
+                    "[{}] {} order blocked: cancel pending for {} ({}s ago, order_id={:?})",
+                    self.config.symbol, side, o.cl_ord_id, age_secs, o.order_id
                 );
                 None
             }
@@ -418,104 +420,67 @@ impl OrderManager {
         change_bps >= self.config.reprice_threshold_bps
     }
 
-    /// Check for and handle timed out orders (both Pending and Canceling).
+    /// Check for and handle timed out orders.
     ///
-    /// Returns cancel decisions for any timed-out pending orders so they are actually
-    /// canceled on the exchange, preventing orphaned orders from accumulating.
-    ///
-    /// For Pending orders: Transitions to Canceling state and sends cancel request.
-    /// For Canceling orders: Force-clears if stuck too long (cancel confirmation lost).
-    ///
-    /// Uses same timeout for both states to keep latency impact minimal.
+    /// Simple logic: any order older than timeout is cleared immediately
+    /// and a cancel request is sent. No complex state machine - just clear
+    /// the slot so new orders can be placed.
     #[inline]
     fn check_timeouts(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
         let mut cancels = Vec::new();
         let timeout_ns = self.config.pending_timeout_ns as i64;
+        let timeout_secs = timeout_ns / 1_000_000_000;
 
-        // Check bid for Pending timeout
-        let bid_pending_timeout = self.bid_order.as_ref().map_or(false, |order| {
-            order.state == OrderState::Pending
-                && current_time_ns - order.sent_at_ns > timeout_ns
-        });
+        // Check bid order - if older than timeout, clear and cancel
+        if let Some(order) = &self.bid_order {
+            let age_ns = current_time_ns - order.sent_at_ns;
+            let age_secs = age_ns / 1_000_000_000;
 
-        if bid_pending_timeout {
-            if let Some(order) = &self.bid_order {
+            // Debug: log every check when order exists and is getting old
+            if age_secs >= 50 {
+                info!(
+                    "[{}] Timeout check: {} order {} age={}s timeout={}s",
+                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
+                );
+            }
+
+            if age_ns > timeout_ns {
                 warn!(
-                    "[{}] Bid order {} timed out after {}ms - canceling",
-                    self.config.symbol,
-                    order.cl_ord_id,
-                    (current_time_ns - order.sent_at_ns) / 1_000_000
+                    "[{}] {} order {} timed out after {}s (>{}s) - CLEARING SLOT",
+                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
                 );
                 cancels.push(OrderDecision::Cancel {
                     cl_ord_id: order.cl_ord_id.clone(),
                 });
                 self.stats.timeouts += 1;
-            }
-            // Transition to Canceling state
-            if let Some(order) = &mut self.bid_order {
-                order.state = OrderState::Canceling;
-            }
-        } else {
-            // Check bid for Canceling stuck (cancel confirmation lost)
-            let bid_cancel_stuck = self.bid_order.as_ref().map_or(false, |order| {
-                order.state == OrderState::Canceling
-                    && current_time_ns - order.sent_at_ns > timeout_ns * 2
-            });
-
-            if bid_cancel_stuck {
-                if let Some(order) = &self.bid_order {
-                    warn!(
-                        "[{}] Bid order {} stuck in Canceling for {}ms - force clearing",
-                        self.config.symbol,
-                        order.cl_ord_id,
-                        (current_time_ns - order.sent_at_ns) / 1_000_000
-                    );
-                    self.stats.timeouts += 1;
-                }
+                // Clear immediately
                 self.bid_order = None;
             }
         }
 
-        // Check ask for Pending timeout
-        let ask_pending_timeout = self.ask_order.as_ref().map_or(false, |order| {
-            order.state == OrderState::Pending
-                && current_time_ns - order.sent_at_ns > timeout_ns
-        });
+        // Check ask order - if older than timeout, clear and cancel
+        if let Some(order) = &self.ask_order {
+            let age_ns = current_time_ns - order.sent_at_ns;
+            let age_secs = age_ns / 1_000_000_000;
 
-        if ask_pending_timeout {
-            if let Some(order) = &self.ask_order {
+            // Debug: log every check when order exists and is getting old
+            if age_secs >= 50 {
+                info!(
+                    "[{}] Timeout check: {} order {} age={}s timeout={}s",
+                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
+                );
+            }
+
+            if age_ns > timeout_ns {
                 warn!(
-                    "[{}] Ask order {} timed out after {}ms - canceling",
-                    self.config.symbol,
-                    order.cl_ord_id,
-                    (current_time_ns - order.sent_at_ns) / 1_000_000
+                    "[{}] {} order {} timed out after {}s (>{}s) - CLEARING SLOT",
+                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
                 );
                 cancels.push(OrderDecision::Cancel {
                     cl_ord_id: order.cl_ord_id.clone(),
                 });
                 self.stats.timeouts += 1;
-            }
-            // Transition to Canceling state
-            if let Some(order) = &mut self.ask_order {
-                order.state = OrderState::Canceling;
-            }
-        } else {
-            // Check ask for Canceling stuck
-            let ask_cancel_stuck = self.ask_order.as_ref().map_or(false, |order| {
-                order.state == OrderState::Canceling
-                    && current_time_ns - order.sent_at_ns > timeout_ns * 2
-            });
-
-            if ask_cancel_stuck {
-                if let Some(order) = &self.ask_order {
-                    warn!(
-                        "[{}] Ask order {} stuck in Canceling for {}ms - force clearing",
-                        self.config.symbol,
-                        order.cl_ord_id,
-                        (current_time_ns - order.sent_at_ns) / 1_000_000
-                    );
-                    self.stats.timeouts += 1;
-                }
+                // Clear immediately
                 self.ask_order = None;
             }
         }
@@ -566,13 +531,29 @@ impl OrderManager {
     pub fn on_order_accepted(&mut self, cl_ord_id: &str, order_id: i64) {
         if let Some(order) = self.find_order_mut(cl_ord_id) {
             let side = order.side;
+            let prev_state = order.state;
+
+            // Always update order_id (needed for cancel matching)
             order.order_id = Some(order_id);
-            order.state = OrderState::Live;
-            self.stats.orders_accepted += 1;
-            debug!(
-                "[{}] {} order accepted: {} -> {}",
-                self.config.symbol, side, cl_ord_id, order_id
-            );
+
+            // Only transition to Live if still Pending
+            // If already Canceling, keep it Canceling (cancel is in flight)
+            if prev_state == OrderState::Pending {
+                order.state = OrderState::Live;
+                self.stats.orders_accepted += 1;
+                debug!(
+                    "[{}] {} order accepted: {} -> {}",
+                    self.config.symbol, side, cl_ord_id, order_id
+                );
+            } else if prev_state == OrderState::Canceling {
+                // Order was already being canceled when acceptance arrived
+                // Keep in Canceling state - cancel request is in flight
+                warn!(
+                    "[{}] {} order {} accepted while Canceling (order_id={}) - keeping Canceling state",
+                    self.config.symbol, side, cl_ord_id, order_id
+                );
+                self.stats.orders_accepted += 1;
+            }
         }
     }
 
@@ -591,20 +572,26 @@ impl OrderManager {
 
     /// Called when an order is canceled.
     pub fn on_order_canceled(&mut self, order_id: i64) {
-        // Get cl_ord_id for logging before clearing
-        let cl_ord_id = self.bid_order.as_ref()
+        // Get info for logging before clearing
+        let order_info = self.bid_order.as_ref()
             .filter(|o| o.order_id == Some(order_id))
-            .map(|o| o.cl_ord_id.clone())
+            .map(|o| (o.cl_ord_id.clone(), o.side, o.state))
             .or_else(|| {
                 self.ask_order.as_ref()
                     .filter(|o| o.order_id == Some(order_id))
-                    .map(|o| o.cl_ord_id.clone())
+                    .map(|o| (o.cl_ord_id.clone(), o.side, o.state))
             });
 
-        if let Some(cl_ord_id) = cl_ord_id {
+        if let Some((cl_ord_id, side, state)) = order_info {
+            info!(
+                "[{}] {} order canceled: {} (order_id={}, was {:?}) - slot freed",
+                self.config.symbol, side, cl_ord_id, order_id, state
+            );
+        } else {
+            // Order not found - may have been force-cleared or already canceled
             debug!(
-                "[{}] Order canceled: {} ({})",
-                self.config.symbol, cl_ord_id, order_id
+                "[{}] Cancel confirmation for unknown order_id={} - already cleared?",
+                self.config.symbol, order_id
             );
         }
         self.clear_order_by_exchange_id(order_id);
@@ -613,7 +600,20 @@ impl OrderManager {
 
     /// Called when an order cancel is confirmed by client order ID.
     pub fn on_order_canceled_by_cl_ord_id(&mut self, cl_ord_id: &str) {
-        debug!("[{}] Order canceled: {}", self.config.symbol, cl_ord_id);
+        // Get info for logging before clearing
+        let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.state));
+
+        if let Some((side, state)) = order_info {
+            info!(
+                "[{}] {} order canceled: {} (was {:?}) - slot freed",
+                self.config.symbol, side, cl_ord_id, state
+            );
+        } else {
+            debug!(
+                "[{}] Cancel confirmation for unknown cl_ord_id={} - already cleared?",
+                self.config.symbol, cl_ord_id
+            );
+        }
         self.clear_order_by_cl_ord_id(cl_ord_id);
         self.stats.orders_canceled += 1;
     }
@@ -806,6 +806,8 @@ mod tests {
             half_spread_tick: 1.0,
             valid_for_trading: true,
             history_secs: 600.0,
+            bid_floored: false,
+            ask_floored: false,
         }
     }
 

@@ -65,11 +65,3 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
-
-[[example]]
-name = "test_auth"
-path = "examples/test_auth.rs"
-
-[[example]]
-name = "test_orders"
-path = "examples/test_orders.rs"

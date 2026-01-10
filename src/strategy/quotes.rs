@@ -258,6 +258,8 @@ mod tests {
             half_spread_tick: 50.0,
             valid_for_trading: true,
             history_secs: 600.0,
+            bid_floored: false,
+            ask_floored: false,
         }
     }
 

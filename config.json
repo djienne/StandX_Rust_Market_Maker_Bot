@@ -31,7 +31,7 @@
   },
   "order": {
     "enabled": true,
-    "reprice_threshold_bps": 2.0,
+    "reprice_threshold_bps": 1.0,
     "pending_timeout_secs": 60
   },
   "pnl_tracking": {

@@ -616,6 +616,63 @@ impl OrderWsClient {
         info!("Order WebSocket disconnected");
     }
 
+    // ========== Field Extraction Helpers ==========
+    // These handle multiple field name variants used by StandX API.
+
+    /// Extract client order ID from JSON data.
+    /// Handles: cl_ord_id, clOrdId, clientOrderId, client_order_id
+    #[inline]
+    fn extract_cl_ord_id(data: &serde_json::Value) -> Option<String> {
+        data.get("cl_ord_id")
+            .or_else(|| data.get("clOrdId"))
+            .or_else(|| data.get("clientOrderId"))
+            .or_else(|| data.get("client_order_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Extract exchange order ID from JSON data.
+    /// Handles: id, order_id
+    #[inline]
+    fn extract_order_id(data: &serde_json::Value) -> Option<i64> {
+        data.get("id")
+            .or_else(|| data.get("order_id"))
+            .and_then(|v| v.as_i64())
+    }
+
+    /// Extract fill quantity from JSON data.
+    /// Handles: fill_qty, fillQty
+    #[inline]
+    fn extract_fill_qty(data: &serde_json::Value) -> String {
+        data.get("fill_qty")
+            .or_else(|| data.get("fillQty"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0")
+            .to_string()
+    }
+
+    /// Extract fill price from JSON data.
+    /// Handles: fill_price, fillPrice
+    #[inline]
+    fn extract_fill_price(data: &serde_json::Value) -> String {
+        data.get("fill_price")
+            .or_else(|| data.get("fillPrice"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0")
+            .to_string()
+    }
+
+    /// Check if data has a client order ID field.
+    #[inline]
+    fn has_cl_ord_id(data: &serde_json::Value) -> bool {
+        data.get("cl_ord_id").is_some()
+            || data.get("clOrdId").is_some()
+            || data.get("clientOrderId").is_some()
+            || data.get("client_order_id").is_some()
+    }
+
+    // ========== Response Handlers ==========
+
     /// Handle a response from the server.
     #[inline]
     async fn handle_response(response: WsResponse, event_tx: &mpsc::Sender<OrderEvent>) {
@@ -635,47 +692,15 @@ impl OrderWsClient {
             }
             "order:cancel" => {
                 if let Some(data) = data {
-                    let order_id = data.get("id")
-                        .or_else(|| data.get("order_id"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-
-                    // Extract cl_ord_id if present (critical for matching orders that were never accepted)
-                    let cl_ord_id = data.get("cl_ord_id")
-                        .or_else(|| data.get("clOrdId"))
-                        .or_else(|| data.get("clientOrderId"))
-                        .or_else(|| data.get("client_order_id"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    // Check code to determine success or failure
-                    if code == 0 {
-                        let _ = event_tx.send(OrderEvent::OrderCanceled { order_id, cl_ord_id }).await;
-                    } else {
-                        let reason = response.message.clone()
-                            .unwrap_or_else(|| "Cancel failed".to_string());
-                        warn!("Cancel failed for order {}: {}", order_id, reason);
-                        let _ = event_tx.send(OrderEvent::CancelFailed { order_id, reason }).await;
-                    }
+                    Self::handle_cancel_response(data, code, &response.message, event_tx).await;
                 }
                 return;
             }
             "order:fill" | "order:filled" => {
                 if let Some(data) = data {
-                    let order_id = data.get("id")
-                        .or_else(|| data.get("order_id"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let fill_qty = data.get("fill_qty")
-                        .or_else(|| data.get("fillQty"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0")
-                        .to_string();
-                    let fill_price = data.get("fill_price")
-                        .or_else(|| data.get("fillPrice"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0")
-                        .to_string();
+                    let order_id = Self::extract_order_id(&data).unwrap_or(0);
+                    let fill_qty = Self::extract_fill_qty(&data);
+                    let fill_price = Self::extract_fill_price(&data);
                     let _ = event_tx.send(OrderEvent::OrderFilled { order_id, fill_qty, fill_price }).await;
                 }
                 return;
@@ -686,39 +711,14 @@ impl OrderWsClient {
         // Handle responses WITHOUT method field (StandX API style)
         if let Some(data) = data {
             // Check if this looks like an order response (has cl_ord_id)
-            let has_cl_ord_id = data.get("cl_ord_id").is_some()
-                || data.get("clOrdId").is_some()
-                || data.get("clientOrderId").is_some()
-                || data.get("client_order_id").is_some();
-
-            if has_cl_ord_id {
+            if Self::has_cl_ord_id(&data) {
                 Self::handle_order_response(data, code, &response.message, event_tx).await;
                 return;
             }
 
             // Check if this is a cancel response (has order_id)
-            let order_id = data.get("id")
-                .or_else(|| data.get("order_id"))
-                .and_then(|v| v.as_i64());
-
-            if let Some(order_id) = order_id {
-                // Extract cl_ord_id if present
-                let cl_ord_id = data.get("cl_ord_id")
-                    .or_else(|| data.get("clOrdId"))
-                    .or_else(|| data.get("clientOrderId"))
-                    .or_else(|| data.get("client_order_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // Check code to determine success or failure
-                if code == 0 {
-                    let _ = event_tx.send(OrderEvent::OrderCanceled { order_id, cl_ord_id }).await;
-                } else {
-                    let reason = response.message.clone()
-                        .unwrap_or_else(|| "Cancel failed".to_string());
-                    warn!("Cancel failed for order {}: {}", order_id, reason);
-                    let _ = event_tx.send(OrderEvent::CancelFailed { order_id, reason }).await;
-                }
+            if Self::extract_order_id(&data).is_some() {
+                Self::handle_cancel_response(data, code, &response.message, event_tx).await;
                 return;
             }
         }
@@ -730,7 +730,7 @@ impl OrderWsClient {
         }
     }
 
-    /// Handle order new/accepted response
+    /// Handle order new/accepted response.
     #[inline]
     async fn handle_order_response(
         data: serde_json::Value,
@@ -738,18 +738,8 @@ impl OrderWsClient {
         message: &Option<String>,
         event_tx: &mpsc::Sender<OrderEvent>,
     ) {
-        let cl_ord_id = data.get("cl_ord_id")
-            .or_else(|| data.get("clOrdId"))
-            .or_else(|| data.get("clientOrderId"))
-            .or_else(|| data.get("client_order_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let order_id = data.get("id")
-            .or_else(|| data.get("order_id"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let cl_ord_id = Self::extract_cl_ord_id(&data).unwrap_or_default();
+        let order_id = Self::extract_order_id(&data).unwrap_or(0);
 
         if code == 0 {
             info!("Order accepted: cl_ord_id={}, order_id={}", cl_ord_id, order_id);
@@ -758,6 +748,26 @@ impl OrderWsClient {
             let reason = message.clone().unwrap_or_default();
             warn!("Order rejected: cl_ord_id={}, reason={}", cl_ord_id, reason);
             let _ = event_tx.send(OrderEvent::OrderRejected { cl_ord_id, reason }).await;
+        }
+    }
+
+    /// Handle order cancel response.
+    #[inline]
+    async fn handle_cancel_response(
+        data: serde_json::Value,
+        code: i32,
+        message: &Option<String>,
+        event_tx: &mpsc::Sender<OrderEvent>,
+    ) {
+        let order_id = Self::extract_order_id(&data).unwrap_or(0);
+        let cl_ord_id = Self::extract_cl_ord_id(&data);
+
+        if code == 0 {
+            let _ = event_tx.send(OrderEvent::OrderCanceled { order_id, cl_ord_id }).await;
+        } else {
+            let reason = message.clone().unwrap_or_else(|| "Cancel failed".to_string());
+            warn!("Cancel failed for order {}: {}", order_id, reason);
+            let _ = event_tx.send(OrderEvent::CancelFailed { order_id, reason }).await;
         }
     }
 }

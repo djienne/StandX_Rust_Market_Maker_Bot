@@ -430,6 +430,7 @@ mod tests {
             looking_depth: 0.025,
             order_qty_dollar: 20.0,
             lot_size: 0.001,
+            min_half_spread_bps: 2.0,
         }
     }
 
