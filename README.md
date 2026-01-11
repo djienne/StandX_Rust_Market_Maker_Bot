@@ -190,8 +190,6 @@ standx-rs/
 ├── config.json           # Configuration file
 ├── .env.example          # Environment template
 ├── .env                  # API credentials (not in git)
-├── deploy.py             # Deploy to remote server
-├── archive.py            # Create source archive
 └── Cargo.toml
 ```
 
@@ -252,25 +250,6 @@ ask_price = fair_price + half_spread * (1 - skew * normalized_position)
 - **Circuit breaker**: Pauses trading after N consecutive rejections
 - **Open orders checker**: Background polling detects stale/imbalanced orders on exchange
 - **Auto-reconnect**: WebSocket reconnection with exponential backoff
-
-## Deployment
-
-### Deploy to Remote Server
-
-```bash
-# Edit deploy.py to set REMOTE_HOST and KEY_FILE
-python deploy.py
-```
-
-This uploads source code to the remote server. Build and run manually via SSH.
-
-### Create Source Archive
-
-```bash
-python archive.py
-```
-
-Creates `standx-rs.zip` excluding sensitive files (.env, .pem) and build artifacts.
 
 ## License
 
