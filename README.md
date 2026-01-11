@@ -141,7 +141,9 @@ Edit `config.json`:
 |-----------|-------------|---------|
 | `enabled` | Enable order placement | `false` |
 | `reprice_threshold_bps` | Min price change to reprice | `1.0` |
-| `pending_timeout_secs` | Order confirmation timeout | `5` |
+| `pending_timeout_secs` | Order confirmation timeout | `30` |
+| `max_live_age_secs` | Max order age before refresh | `60` |
+| `circuit_breaker_rejections` | Pause after N consecutive rejections (0=disabled) | `5` |
 
 ### PnL Tracking (`pnl_tracking` section)
 
@@ -182,6 +184,7 @@ standx-rs/
 │       ├── client.rs     # REST API client
 │       ├── order_ws.rs   # WebSocket order client
 │       ├── order_manager.rs  # Order state machine
+│       ├── order_checker.rs  # Open orders polling/stale detection
 │       ├── position.rs   # Position polling
 │       └── wallet_tracker.rs # PnL tracking with CSV
 ├── config.json           # Configuration file
@@ -245,7 +248,9 @@ ask_price = fair_price + half_spread * (1 - skew * normalized_position)
 - **POST-ONLY orders**: All orders are maker-only (no taker fees, no crossing)
 - **Position limits**: Stops quoting one side at ±max_position_dollar
 - **Graceful shutdown**: Cancels all live orders on Ctrl+C
-- **Order timeout**: Clears stuck orders after 5 seconds
+- **Order timeout**: Clears stuck orders after pending_timeout_secs
+- **Circuit breaker**: Pauses trading after N consecutive rejections
+- **Open orders checker**: Background polling detects stale/imbalanced orders on exchange
 - **Auto-reconnect**: WebSocket reconnection with exponential backoff
 
 ## Deployment

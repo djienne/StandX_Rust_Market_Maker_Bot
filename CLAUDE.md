@@ -82,8 +82,9 @@ Order manager tracks one bid and one ask order per symbol.
   - `sanity_check.rs`: Periodic REST API validation
 
 - `src/trading/`: Order execution and position management
-  - `order_manager.rs`: Synchronous order decision logic
-  - `order_ws.rs`: WebSocket order client with auto-reconnect
+  - `order_manager.rs`: Synchronous order decision logic (with pending prices, circuit breaker)
+  - `order_ws.rs`: WebSocket order client with auto-reconnect (tracks pending cancels)
+  - `order_checker.rs`: Background open orders polling and stale detection
   - `position.rs`: Background position polling
   - `auth.rs`: JWT authentication and signing
 
@@ -107,8 +108,19 @@ Credentials: `.env` file (WALLET_AD, PRIVATE_KEY)
 
 Key config sections:
 - `strategy`: Quote parameters (tick_size, vol_to_half_spread, skew, max_position_dollar)
-- `order`: Order management (enabled, reprice_threshold_bps, pending_timeout_secs)
+- `order`: Order management (enabled, reprice_threshold_bps, pending_timeout_secs, max_live_age_secs, circuit_breaker_rejections)
 - `position`: Position polling (enabled, poll_interval_secs)
+
+## Order Manager Features
+
+**Pending Prices**: When repricing (CancelAndReplace), the intended new price is stored and placed immediately after cancel confirms. This prevents stale prices due to confirmation delay.
+
+**Circuit Breaker**: Automatically pauses trading after N consecutive rejections (configurable via `circuit_breaker_rejections`). Call `reset_circuit_breaker()` to resume.
+
+**Open Orders Checker**: Background task polls exchange for open orders every 3s. Signals stale state when:
+- Exchange reports 0 orders but we think we have some
+- Orders are imbalanced (all on same side)
+- Orders exceed `max_order_age_secs` (2x max_live_age by default)
 
 ## Clock Sources
 
