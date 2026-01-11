@@ -1,7 +1,8 @@
 //! Open orders checker for detecting stale internal state.
 //!
 //! Polls the exchange for open orders and signals when internal state
-//! should be cleared (exchange has no orders but we think we do).
+//! should be cleared (exchange has no orders but we think we do, or
+//! orders are imbalanced - all on same side).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,6 +12,14 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::auth::AuthManager;
+
+/// Result of polling open orders.
+#[derive(Debug, Clone)]
+struct PollResult {
+    total: usize,
+    buys: usize,
+    sells: usize,
+}
 
 /// Signal sent when internal order state should be cleared.
 #[derive(Debug, Clone)]
@@ -97,30 +106,44 @@ impl OpenOrdersChecker {
             self.config.symbol, self.config.interval, self.config.debounce_count
         );
 
-        let mut consecutive_zero_count = 0u32;
+        let mut consecutive_stale_count = 0u32;
         let mut consecutive_errors = 0u32;
-        let mut last_order_count = 0usize;
+        let mut last_was_stale = false;
+        let mut last_stale_reason = String::new();
 
         while self.running.load(Ordering::Acquire) {
             match self.poll_open_orders().await {
-                Ok(order_count) => {
+                Ok(result) => {
                     consecutive_errors = 0;
 
-                    if order_count == 0 {
-                        consecutive_zero_count += 1;
+                    // Detect stale state: 0 orders OR imbalanced sides (all on same side)
+                    let (is_stale, stale_reason) = if result.total == 0 {
+                        (true, "0 orders".to_string())
+                    } else if result.total >= 2 && (result.buys == 0 || result.sells == 0) {
+                        // 2+ orders but all on same side (e.g., 2 buys, 0 sells)
+                        (true, format!("imbalanced: {} buys, {} sells", result.buys, result.sells))
+                    } else {
+                        (false, String::new())
+                    };
+
+                    if is_stale {
+                        consecutive_stale_count += 1;
 
                         // Only signal after debounce threshold
-                        if consecutive_zero_count >= self.config.debounce_count {
-                            // Only signal once per "no orders" period
-                            if last_order_count > 0 || consecutive_zero_count == self.config.debounce_count {
+                        if consecutive_stale_count >= self.config.debounce_count {
+                            // Only signal once per stale period (or when reason changes)
+                            if !last_was_stale
+                                || consecutive_stale_count == self.config.debounce_count
+                                || stale_reason != last_stale_reason
+                            {
                                 info!(
-                                    "[{}] Exchange has 0 open orders (confirmed {} times) - signaling clear",
-                                    self.config.symbol, consecutive_zero_count
+                                    "[{}] Stale state detected: {} (confirmed {} times) - signaling clear",
+                                    self.config.symbol, stale_reason, consecutive_stale_count
                                 );
 
                                 let signal = ClearOrdersSignal {
                                     symbol: self.config.symbol.clone(),
-                                    reason: format!("Exchange confirmed 0 orders ({} polls)", consecutive_zero_count),
+                                    reason: format!("{} ({} polls)", stale_reason, consecutive_stale_count),
                                 };
 
                                 if let Err(e) = self.signal_tx.send(signal).await {
@@ -129,22 +152,24 @@ impl OpenOrdersChecker {
                             }
                         } else {
                             debug!(
-                                "[{}] Exchange has 0 orders (count: {}/{})",
-                                self.config.symbol, consecutive_zero_count, self.config.debounce_count
+                                "[{}] Stale state: {} (count: {}/{})",
+                                self.config.symbol, stale_reason, consecutive_stale_count, self.config.debounce_count
                             );
                         }
+                        last_stale_reason = stale_reason;
                     } else {
-                        // Orders exist on exchange
-                        if consecutive_zero_count > 0 {
+                        // Normal state: has both buy and sell orders
+                        if consecutive_stale_count > 0 {
                             debug!(
-                                "[{}] Exchange has {} orders (resetting zero count from {})",
-                                self.config.symbol, order_count, consecutive_zero_count
+                                "[{}] Exchange has {} orders ({} buys, {} sells) - resetting stale count from {}",
+                                self.config.symbol, result.total, result.buys, result.sells, consecutive_stale_count
                             );
                         }
-                        consecutive_zero_count = 0;
+                        consecutive_stale_count = 0;
+                        last_stale_reason.clear();
                     }
 
-                    last_order_count = order_count;
+                    last_was_stale = is_stale;
                 }
                 Err(e) => {
                     consecutive_errors += 1;
@@ -170,7 +195,7 @@ impl OpenOrdersChecker {
     }
 
     /// Poll open orders from API.
-    async fn poll_open_orders(&self) -> Result<usize, String> {
+    async fn poll_open_orders(&self) -> Result<PollResult, String> {
         let mut auth = self.auth.lock().await;
 
         let open_orders = auth
@@ -178,7 +203,20 @@ impl OpenOrdersChecker {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(open_orders.len())
+        let buys = open_orders
+            .iter()
+            .filter(|o| o.side.eq_ignore_ascii_case("buy"))
+            .count();
+        let sells = open_orders
+            .iter()
+            .filter(|o| o.side.eq_ignore_ascii_case("sell"))
+            .count();
+
+        Ok(PollResult {
+            total: open_orders.len(),
+            buys,
+            sells,
+        })
     }
 }
 

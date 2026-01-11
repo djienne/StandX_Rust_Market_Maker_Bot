@@ -233,16 +233,16 @@ impl PositionPoller {
             .map_err(|e| e.to_string())?;
 
         // Find position for our symbol
-        let position = positions
-            .iter()
-            .find(|p| p.symbol == self.config.symbol)
-            .map(|p| {
-                p.qty.parse::<f64>().unwrap_or_else(|e| {
-                    tracing::warn!("[{}] Failed to parse position qty '{}': {}", self.config.symbol, p.qty, e);
-                    0.0
-                })
-            })
-            .unwrap_or(0.0);
+        // If symbol not found, assume zero position (new account or no trades yet)
+        // If qty parsing fails, return error to preserve previous position value
+        let position = match positions.iter().find(|p| p.symbol == self.config.symbol) {
+            Some(p) => {
+                p.qty.parse::<f64>().map_err(|e| {
+                    format!("Failed to parse position qty '{}': {}", p.qty, e)
+                })?
+            }
+            None => 0.0, // No position entry = zero position
+        };
 
         Ok(position)
     }

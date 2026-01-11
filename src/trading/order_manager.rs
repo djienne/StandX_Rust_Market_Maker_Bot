@@ -277,7 +277,8 @@ impl OrderManager {
     #[inline]
     pub fn on_quote(&mut self, quote: &Quote, current_time_ns: i64) -> Vec<OrderDecision> {
         // Early exit if shutting down or paused (atomic, no latency)
-        if self.shutdown.load(Ordering::Relaxed) || self.paused.load(Ordering::Relaxed) {
+        // Use Acquire ordering to ensure we see the Release store from shutdown()/pause()
+        if self.shutdown.load(Ordering::Acquire) || self.paused.load(Ordering::Acquire) {
             return vec![];
         }
 
@@ -286,10 +287,18 @@ impl OrderManager {
             return vec![];
         }
 
+        // Validate mid_price to prevent NaN/Inf from bypassing position limits
+        // (NaN comparisons always return false, which would skip all limit checks)
+        if !quote.mid_price.is_finite() || quote.mid_price <= 0.0 {
+            return vec![];
+        }
+
         // Calculate position in dollars (from poller - source of truth)
         let position_dollar = self.position.get() * quote.mid_price;
-        let at_max_long = position_dollar >= self.config.max_position_dollar;
-        let at_max_short = position_dollar <= -self.config.max_position_dollar;
+        // Use > and < (not >= and <=) so that at exactly the limit we can still
+        // place orders on the opposite side to rebalance position
+        let at_max_long = position_dollar > self.config.max_position_dollar;
+        let at_max_short = position_dollar < -self.config.max_position_dollar;
 
         let mut decisions = Vec::with_capacity(4);
 
@@ -307,7 +316,7 @@ impl OrderManager {
             // At max long - cancel any existing bid
             if bid.state != OrderState::Canceling {
                 debug!(
-                    "[{}] At max long position ({:.2} >= {:.2}), canceling bid",
+                    "[{}] At max long position ({:.2} > {:.2}), canceling bid",
                     self.config.symbol, position_dollar, self.config.max_position_dollar
                 );
                 decisions.push(OrderDecision::Cancel {
@@ -330,7 +339,7 @@ impl OrderManager {
             // At max short - cancel any existing ask
             if ask.state != OrderState::Canceling {
                 debug!(
-                    "[{}] At max short position ({:.2} <= -{:.2}), canceling ask",
+                    "[{}] At max short position ({:.2} < -{:.2}), canceling ask",
                     self.config.symbol, position_dollar, self.config.max_position_dollar
                 );
                 decisions.push(OrderDecision::Cancel {
@@ -395,7 +404,7 @@ impl OrderManager {
                 // Live order - check if reprice needed (only clone here if we need it)
                 if self.should_reprice(o.price, new_price) {
                     let cancel_id = o.cl_ord_id.clone(); // Only clone when actually repricing
-                    self.set_order_canceling(side);
+                    self.set_order_canceling(side, current_time_ns);
                     self.stats.reprices += 1;
                     Some(OrderDecision::CancelAndReplace {
                         cancel_id,
@@ -513,8 +522,12 @@ impl OrderManager {
         }
     }
 
-    /// Set order state to canceling.
-    fn set_order_canceling(&mut self, side: Side) {
+    /// Set order state to canceling and reset the timeout clock.
+    ///
+    /// Updating `sent_at_ns` when entering Canceling state ensures that:
+    /// 1. Timeout is measured from when cancel was initiated, not original order placement
+    /// 2. If cancel fails and we revert to Live, the timeout won't fire prematurely
+    fn set_order_canceling(&mut self, side: Side, current_time_ns: i64) {
         let order = match side {
             Side::Buy => &mut self.bid_order,
             Side::Sell => &mut self.ask_order,
@@ -522,6 +535,7 @@ impl OrderManager {
 
         if let Some(o) = order {
             o.state = OrderState::Canceling;
+            o.sent_at_ns = current_time_ns; // Reset timeout clock for cancel operation
         }
     }
 

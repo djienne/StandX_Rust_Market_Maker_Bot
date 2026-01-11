@@ -93,15 +93,18 @@ impl CurrentOrderbook {
         // Apply the update
         f(buffer);
 
-        // Increment sequence
-        self.update_sequence.fetch_add(1, Ordering::Release);
-
         // Swap write buffer with swap buffer
+        // This makes the updated buffer available to readers via swap_idx
         let old_swap = self.swap_idx.swap(write_idx as u8, Ordering::AcqRel);
         self.write_idx.store(old_swap, Ordering::Release);
 
         // Mark as having data
         self.has_data.store(1, Ordering::Release);
+
+        // Increment sequence AFTER swap completes to ensure readers see
+        // consistent data. If sequence was incremented before swap, a reader
+        // could see the new sequence but read stale buffer data.
+        self.update_sequence.fetch_add(1, Ordering::Release);
     }
 
     /// Update with a complete snapshot replacement.

@@ -928,10 +928,19 @@ async fn main() -> anyhow::Result<()> {
                     }
                     OrderEvent::MaxRetriesExceeded => {
                         error!("Order WebSocket max retries exceeded, initiating shutdown");
-                        // Cancel all orders via HTTP
+                        // Cancel all orders via HTTP - CRITICAL: must handle errors
                         if let Some(auth) = &shared_auth {
                             let mut auth_guard = auth.lock().await;
-                            let _ = auth_guard.cancel_all_orders(None).await;
+                            match auth_guard.cancel_all_orders(None).await {
+                                Ok(count) => {
+                                    info!("Canceled {} order(s) before shutdown", count);
+                                }
+                                Err(e) => {
+                                    // CRITICAL: Log prominently so operator knows orders may remain active
+                                    error!("CRITICAL: Failed to cancel orders before shutdown: {}", e);
+                                    error!("WARNING: Orders may remain active on exchange! Manual intervention required.");
+                                }
+                            }
                         }
                         // Stop the market data WebSocket and exit
                         client.stop();
@@ -998,11 +1007,32 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(ref mut rx) = clear_orders_rx {
                     while let Ok(signal) = rx.try_recv() {
                         info!(
-                            "[{}] Clearing internal order state: {}",
+                            "[{}] Stale state detected: {} - canceling all orders",
                             signal.symbol, signal.reason
                         );
+
+                        // 1. Clear internal state
                         if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
                             manager.clear_all_orders();
+                        }
+
+                        // 2. Cancel orders on exchange (spawn to avoid blocking)
+                        if let Some(auth) = &shared_auth {
+                            let auth_clone = Arc::clone(auth);
+                            let symbol = signal.symbol.clone();
+                            tokio::spawn(async move {
+                                let mut auth_guard = auth_clone.lock().await;
+                                match auth_guard.cancel_all_orders(Some(&symbol)).await {
+                                    Ok(count) => {
+                                        if count > 0 {
+                                            info!("[{}] Canceled {} stale order(s)", symbol, count);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[{}] Failed to cancel stale orders: {}", symbol, e);
+                                    }
+                                }
+                            });
                         }
                     }
                 }
