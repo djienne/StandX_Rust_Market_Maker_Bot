@@ -116,6 +116,12 @@ impl OpenOrdersChecker {
                 Ok(result) => {
                     consecutive_errors = 0;
 
+                    // Log poll result for debugging
+                    debug!(
+                        "[{}] Poll result: total={}, buys={}, sells={}",
+                        self.config.symbol, result.total, result.buys, result.sells
+                    );
+
                     // Detect stale state: 0 orders OR imbalanced sides (all on same side)
                     let (is_stale, stale_reason) = if result.total == 0 {
                         (true, "0 orders".to_string())

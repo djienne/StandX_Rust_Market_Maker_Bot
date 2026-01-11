@@ -5,6 +5,7 @@
 //! - Z-score of order book imbalance (alpha)
 //! - Position skew adjustment
 
+use tracing::{debug, info};
 use crate::config::StrategyConfig;
 use crate::types::OrderbookSnapshot;
 use super::rolling::RollingStats;
@@ -41,6 +42,8 @@ pub struct ObiStrategy {
     required_history_ns: u64,
     /// Total samples pushed to mid_price_chg_stats (not capped by window size)
     total_samples: usize,
+    /// Has logged the "valid for trading" milestone (log only once)
+    logged_valid_for_trading: bool,
 }
 
 /// Default required history for trading: 10 minutes in nanoseconds
@@ -71,6 +74,7 @@ impl ObiStrategy {
             latest_timestamp_ns: 0,
             required_history_ns: DEFAULT_REQUIRED_HISTORY_NS,
             total_samples: 0,
+            logged_valid_for_trading: false,
         }
     }
 
@@ -184,6 +188,14 @@ impl ObiStrategy {
             let mid_chg = mid_tick - prev_tick;
             self.mid_price_chg_stats.push(mid_chg);
             self.total_samples += 1;
+
+            // Log warmup milestones
+            if self.total_samples == 100 || self.total_samples == 500 || self.total_samples == MIN_SAMPLES_FOR_QUOTE {
+                debug!(
+                    "[{}] Warmup milestone: {} samples collected",
+                    snapshot.symbol, self.total_samples
+                );
+            }
         }
         self.prev_mid_tick = Some(mid_tick);
 
@@ -209,7 +221,13 @@ impl ObiStrategy {
             return None;
         }
 
-        // Mark as warmed up
+        // Mark as warmed up (log first time)
+        if !self.warmed_up {
+            debug!(
+                "[{}] Strategy warmed up: {} samples, ready to generate quotes",
+                snapshot.symbol, self.total_samples
+            );
+        }
         self.warmed_up = true;
 
         // Calculate volatility (scaled to per-second)
@@ -248,7 +266,7 @@ impl ObiStrategy {
 
     /// Calculate bid/ask quotes.
     #[inline]
-    fn calculate_quote(&self, snapshot: &OrderbookSnapshot, mid_price: f64) -> Option<Quote> {
+    fn calculate_quote(&mut self, snapshot: &OrderbookSnapshot, mid_price: f64) -> Option<Quote> {
         let best_bid = snapshot.best_bid_price()?;
         let best_ask = snapshot.best_ask_price()?;
 
@@ -320,6 +338,29 @@ impl ObiStrategy {
         let lot_size = self.config.lot_size;
         let quantity = ((order_qty / lot_size).round() * lot_size).max(lot_size);
 
+        // Log "valid for trading" milestone once (uses info! for visibility)
+        let valid_for_trading = self.is_valid_for_trading();
+        if valid_for_trading && !self.logged_valid_for_trading {
+            self.logged_valid_for_trading = true;
+            info!(
+                "[{}] Strategy now valid for trading (history={:.0}s, samples={})",
+                snapshot.symbol,
+                self.history_duration_secs(),
+                self.total_samples
+            );
+        }
+
+        // Log quote generation with key metrics
+        debug!(
+            "[{}] Quote: vol={:.4} alpha={:.3} bid_floor={} ask_floor={} spread={:.2}bps",
+            snapshot.symbol,
+            self.volatility,
+            self.alpha,
+            bid_floored,
+            ask_floored,
+            (ask_price - bid_price) / mid_price * 10000.0
+        );
+
         Some(Quote {
             symbol: snapshot.symbol.clone(),
             bid_price,
@@ -331,7 +372,7 @@ impl ObiStrategy {
             alpha: self.alpha,
             position: self.position,
             half_spread_tick,
-            valid_for_trading: self.is_valid_for_trading(),
+            valid_for_trading,
             history_secs: self.history_duration_secs(),
             bid_floored,
             ask_floored,
@@ -351,6 +392,7 @@ impl ObiStrategy {
         self.first_timestamp_ns = None;
         self.latest_timestamp_ns = 0;
         self.total_samples = 0;
+        self.logged_valid_for_trading = false;
     }
 }
 

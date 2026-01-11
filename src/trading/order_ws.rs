@@ -685,18 +685,21 @@ impl OrderWsClient {
         // Handle responses with explicit method field
         match method {
             "order:new" => {
+                debug!("Routing: order:new response (code={})", code);
                 if let Some(data) = data {
                     Self::handle_order_response(data, code, &response.message, event_tx).await;
                 }
                 return;
             }
             "order:cancel" => {
+                debug!("Routing: order:cancel response (code={})", code);
                 if let Some(data) = data {
                     Self::handle_cancel_response(data, code, &response.message, event_tx).await;
                 }
                 return;
             }
             "order:fill" | "order:filled" => {
+                debug!("Routing: order:fill response");
                 if let Some(data) = data {
                     let order_id = Self::extract_order_id(&data).unwrap_or(0);
                     let fill_qty = Self::extract_fill_qty(&data);
@@ -712,12 +715,14 @@ impl OrderWsClient {
         if let Some(data) = data {
             // Check if this looks like an order response (has cl_ord_id)
             if Self::has_cl_ord_id(&data) {
+                debug!("Routing: inferred order response from cl_ord_id (code={})", code);
                 Self::handle_order_response(data, code, &response.message, event_tx).await;
                 return;
             }
 
             // Check if this is a cancel response (has order_id)
             if Self::extract_order_id(&data).is_some() {
+                debug!("Routing: inferred cancel response from order_id (code={})", code);
                 Self::handle_cancel_response(data, code, &response.message, event_tx).await;
                 return;
             }
@@ -725,6 +730,7 @@ impl OrderWsClient {
 
         // Handle errors
         if code != 0 {
+            debug!("Routing: error response (code={})", code);
             let msg = response.message.unwrap_or_else(|| "Unknown error".to_string());
             let _ = event_tx.send(OrderEvent::Error(msg)).await;
         }

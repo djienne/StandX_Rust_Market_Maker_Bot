@@ -370,6 +370,10 @@ impl OrderManager {
             None => {
                 // No order on this side - place new one
                 let cl_ord_id = self.generate_cl_ord_id();
+                debug!(
+                    "[{}] NEW {} order: price={:.2}, qty={:.6}, id={}",
+                    self.config.symbol, side, new_price, qty, cl_ord_id
+                );
                 self.set_order_pending(side, cl_ord_id.clone(), new_price, qty, current_time_ns);
                 self.stats.orders_sent += 1;
                 Some(OrderDecision::Send {
@@ -403,6 +407,11 @@ impl OrderManager {
             Some(o) => {
                 // Live order - check if reprice needed (only clone here if we need it)
                 if self.should_reprice(o.price, new_price) {
+                    let change_bps = ((new_price - o.price) / o.price).abs() * 10_000.0;
+                    debug!(
+                        "[{}] REPRICE {} order: {:.2} -> {:.2} ({:.1}bps), id={}",
+                        self.config.symbol, side, o.price, new_price, change_bps, o.cl_ord_id
+                    );
                     let cancel_id = o.cl_ord_id.clone(); // Only clone when actually repricing
                     self.set_order_canceling(side, current_time_ns);
                     self.stats.reprices += 1;
