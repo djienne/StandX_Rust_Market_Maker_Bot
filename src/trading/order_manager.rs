@@ -491,7 +491,7 @@ impl OrderManager {
     /// the slot so new orders can be placed.
     #[inline]
     fn check_timeouts(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
-        let mut cancels = Vec::new();
+        let mut cancels = Vec::with_capacity(2); // At most 2 orders (bid + ask)
         let timeout_ns = self.config.pending_timeout_ns as i64;
         let timeout_secs = timeout_ns / 1_000_000_000;
 

@@ -121,6 +121,10 @@ pub struct RollingStats {
     sum: f64,
     /// Running sum of squared values: Σx²
     sum_sq: f64,
+    /// Cached standard deviation (avoids sqrt() on every zscore call)
+    cached_std: f64,
+    /// Cached mean (for zscore calculation)
+    cached_mean: f64,
 }
 
 impl RollingStats {
@@ -130,6 +134,8 @@ impl RollingStats {
             window: RollingWindow::new(capacity),
             sum: 0.0,
             sum_sq: 0.0,
+            cached_std: 0.0,
+            cached_mean: 0.0,
         }
     }
 
@@ -146,6 +152,18 @@ impl RollingStats {
         if let Some(old_val) = old_value {
             self.sum -= old_val;
             self.sum_sq -= old_val * old_val;
+        }
+
+        // Update cached statistics (avoids sqrt() on every zscore call)
+        let n = self.window.len();
+        if n >= 2 {
+            self.cached_mean = self.sum / n as f64;
+            let mean_sq = self.sum_sq / n as f64;
+            let variance = (mean_sq - self.cached_mean * self.cached_mean).max(0.0);
+            self.cached_std = variance.sqrt();
+        } else if n == 1 {
+            self.cached_mean = self.sum;
+            self.cached_std = 0.0;
         }
     }
 
@@ -178,14 +196,14 @@ impl RollingStats {
         self.variance().sqrt()
     }
 
-    /// Calculate z-score for a value.
+    /// Calculate z-score for a value using cached statistics.
+    /// This avoids the expensive sqrt() call on every quote.
     #[inline]
     pub fn zscore(&self, value: f64) -> f64 {
-        let std = self.std();
-        if std < 1e-10 {
+        if self.cached_std < 1e-10 {
             return 0.0;
         }
-        (value - self.mean()) / std
+        (value - self.cached_mean) / self.cached_std
     }
 
     /// Get the number of values in the window.
@@ -223,6 +241,8 @@ impl RollingStats {
         self.window.clear();
         self.sum = 0.0;
         self.sum_sq = 0.0;
+        self.cached_std = 0.0;
+        self.cached_mean = 0.0;
     }
 }
 

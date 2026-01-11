@@ -242,24 +242,30 @@ impl ObiStrategy {
     }
 
     /// Calculate order book imbalance within looking_depth of mid-price.
+    /// Uses simple loops instead of iterator chains for better hot path performance.
+    #[inline]
     fn calculate_imbalance(&self, snapshot: &OrderbookSnapshot, mid_price: f64) -> f64 {
         let depth_pct = self.config.looking_depth;
         let lower_bound = mid_price * (1.0 - depth_pct);
         let upper_bound = mid_price * (1.0 + depth_pct);
 
         // Sum bid quantities within range (bids are sorted descending by price)
-        let sum_bid_qty: f64 = snapshot.bids[..snapshot.bid_count as usize]
-            .iter()
-            .take_while(|level| level.price >= lower_bound)
-            .map(|level| level.quantity)
-            .sum();
+        let mut sum_bid_qty = 0.0;
+        for level in &snapshot.bids[..snapshot.bid_count as usize] {
+            if level.price < lower_bound {
+                break;
+            }
+            sum_bid_qty += level.quantity;
+        }
 
         // Sum ask quantities within range (asks are sorted ascending by price)
-        let sum_ask_qty: f64 = snapshot.asks[..snapshot.ask_count as usize]
-            .iter()
-            .take_while(|level| level.price <= upper_bound)
-            .map(|level| level.quantity)
-            .sum();
+        let mut sum_ask_qty = 0.0;
+        for level in &snapshot.asks[..snapshot.ask_count as usize] {
+            if level.price > upper_bound {
+                break;
+            }
+            sum_ask_qty += level.quantity;
+        }
 
         sum_bid_qty - sum_ask_qty
     }
@@ -271,7 +277,8 @@ impl ObiStrategy {
         let best_ask = snapshot.best_ask_price()?;
 
         // Calculate half-spread in ticks (priority: volatility > bps > fixed)
-        let half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility.is_finite() && self.volatility > 0.0 {
+        // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
+        let half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
             // Mode 1: Volatility-based
             self.volatility * self.config.vol_to_half_spread
         } else if self.config.half_spread_bps > 0.0 {
@@ -299,23 +306,20 @@ impl ObiStrategy {
         let ask_depth_tick_raw = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
 
         // Enforce minimum spread floor AFTER skew adjustment (in bps from mid)
-        let (bid_depth_tick, bid_floored) = if self.config.min_half_spread_bps > 0.0 {
-            let min_depth_tick = mid_price * (self.config.min_half_spread_bps / 10000.0) / self.config.tick_size;
-            if bid_depth_tick_raw < min_depth_tick {
-                (min_depth_tick, true)
-            } else {
-                (bid_depth_tick_raw, false)
-            }
+        // Pre-compute min_depth_tick once (avoids duplicate division)
+        let min_depth_tick = if self.config.min_half_spread_bps > 0.0 {
+            mid_price * (self.config.min_half_spread_bps / 10000.0) / self.config.tick_size
+        } else {
+            0.0
+        };
+
+        let (bid_depth_tick, bid_floored) = if min_depth_tick > 0.0 && bid_depth_tick_raw < min_depth_tick {
+            (min_depth_tick, true)
         } else {
             (bid_depth_tick_raw, false)
         };
-        let (ask_depth_tick, ask_floored) = if self.config.min_half_spread_bps > 0.0 {
-            let min_depth_tick = mid_price * (self.config.min_half_spread_bps / 10000.0) / self.config.tick_size;
-            if ask_depth_tick_raw < min_depth_tick {
-                (min_depth_tick, true)
-            } else {
-                (ask_depth_tick_raw, false)
-            }
+        let (ask_depth_tick, ask_floored) = if min_depth_tick > 0.0 && ask_depth_tick_raw < min_depth_tick {
+            (min_depth_tick, true)
         } else {
             (ask_depth_tick_raw, false)
         };

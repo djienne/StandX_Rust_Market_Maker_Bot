@@ -101,6 +101,15 @@ Order manager tracks one bid and one ask order per symbol.
 
 The `update()` method is the hot path - keep it under 5μs, avoid allocations.
 
+### Hot Path Optimizations
+
+The following optimizations are applied to minimize hot path latency:
+
+- **Cached statistics** (`rolling.rs`): `RollingStats` caches `std` and `mean` on each `push()` to avoid `sqrt()` on every `zscore()` call
+- **Simple loops** (`obi.rs`): `calculate_imbalance()` uses explicit for-loops instead of iterator chains
+- **Pre-computed values** (`obi.rs`): `min_depth_tick` calculated once per quote, not twice
+- **Pre-allocated vectors**: `Vec::with_capacity()` used where size is known (e.g., `check_timeouts()`)
+
 ## Configuration
 
 Main config file: `config.json`
