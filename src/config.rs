@@ -272,16 +272,29 @@ pub struct OrderConfig {
     #[serde(default = "default_pending_timeout_secs")]
     pub pending_timeout_secs: u64,
 
+    /// Maximum age for Live orders in seconds (default: 60)
+    /// Orders will be refreshed after this time even if price is within threshold.
+    /// Set to 0 to disable (orders stay until price changes).
+    #[serde(default = "default_max_live_age_secs")]
+    pub max_live_age_secs: u64,
+
     /// Maximum reconnection attempts for order WebSocket (default: 10)
     /// Set to 0 for unlimited retries
     #[serde(default = "default_max_reconnect_attempts")]
     pub max_reconnect_attempts: u32,
+
+    /// Circuit breaker: max consecutive rejections before pausing (default: 5)
+    /// Set to 0 to disable circuit breaker
+    #[serde(default = "default_circuit_breaker_rejections")]
+    pub circuit_breaker_rejections: u32,
 }
 
 fn default_order_enabled() -> bool { false } // Disabled by default for safety
 fn default_reprice_threshold_bps() -> f64 { 1.0 }
 fn default_pending_timeout_secs() -> u64 { 5 }
+fn default_max_live_age_secs() -> u64 { 60 }
 fn default_max_reconnect_attempts() -> u32 { 10 }
+fn default_circuit_breaker_rejections() -> u32 { 5 }
 
 impl Default for OrderConfig {
     fn default() -> Self {
@@ -289,7 +302,9 @@ impl Default for OrderConfig {
             enabled: default_order_enabled(),
             reprice_threshold_bps: default_reprice_threshold_bps(),
             pending_timeout_secs: default_pending_timeout_secs(),
+            max_live_age_secs: default_max_live_age_secs(),
             max_reconnect_attempts: default_max_reconnect_attempts(),
+            circuit_breaker_rejections: default_circuit_breaker_rejections(),
         }
     }
 }

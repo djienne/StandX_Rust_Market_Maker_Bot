@@ -205,9 +205,11 @@ impl App {
                 reprice_threshold_bps: config.order.reprice_threshold_bps,
                 max_position_dollar: config.strategy.max_position_dollar,
                 pending_timeout_ns: config.order.pending_timeout_secs * 1_000_000_000,
+                max_live_age_ns: config.order.max_live_age_secs * 1_000_000_000,
                 tick_size: config.strategy.tick_size,
                 lot_size: config.strategy.lot_size,
                 debug: config.debug,
+                circuit_breaker_rejections: config.order.circuit_breaker_rejections,
             };
             let order_manager = QuoteOrderManager::new(om_config, position);
             order_managers.insert(symbol.clone(), order_manager);
@@ -284,9 +286,23 @@ impl App {
             return;
         }
 
-        // Use the same timestamp source as order creation (StandX server time)
-        // This avoids clock drift issues between local system and StandX server
-        let current_time_ns = self.last_received_at_ns;
+        // Use system time for timeout checks to avoid false timeouts when
+        // orderbook messages are sparse. Clock drift is acceptable for 30s timeouts.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let current_time_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before UNIX epoch")
+            .as_nanos() as i64;
+
+        // Log clock drift periodically (every ~30s based on stats interval)
+        let drift_ms = (current_time_ns - self.last_received_at_ns) / 1_000_000;
+        if drift_ms.abs() > 5000 {
+            // Only log if drift > 5 seconds (significant)
+            debug!(
+                "Clock drift: system_time - server_time = {}ms",
+                drift_ms
+            );
+        }
 
         for (symbol, manager) in &mut self.order_managers {
             let timeout_decisions = manager.check_timeouts_now(current_time_ns);
@@ -400,8 +416,8 @@ impl App {
                         }
 
                         // Note: Timeout checking is now consolidated in the periodic 1-second timer
-                        // (check_order_timeouts). This removes duplicate checking that was here before.
-                        // The periodic timer uses the same StandX server timestamp for consistency.
+                        // (check_order_timeouts). Both order creation and timeout checks use system
+                        // time to avoid false timeouts when orderbook messages are sparse.
 
                         // Process quote if we got one
                         if let Some(quote) = quote_result {
@@ -412,7 +428,13 @@ impl App {
                             // Process quote through order manager if enabled
                             if self.config.order.enabled {
                                 if let Some(order_manager) = self.order_managers.get_mut(&data.symbol) {
-                                    let decisions = order_manager.on_quote(&quote, received_at);
+                                    // Use system time for order creation to match timeout checks
+                                    use std::time::{SystemTime, UNIX_EPOCH};
+                                    let system_time_ns = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .expect("System time before UNIX epoch")
+                                        .as_nanos() as i64;
+                                    let decisions = order_manager.on_quote(&quote, system_time_ns);
 
                                     // Send decisions to executor via channel
                                     if let Some(tx) = &self.order_tx {
@@ -537,9 +559,10 @@ async fn main() -> anyhow::Result<()> {
 
     if config.order.enabled {
         info!(
-            "Order management: ENABLED (reprice_threshold={}bps, pending_timeout={}s)",
+            "Order management: ENABLED (reprice_threshold={}bps, pending_timeout={}s, max_live_age={}s)",
             config.order.reprice_threshold_bps,
             config.order.pending_timeout_secs,
+            config.order.max_live_age_secs,
         );
     } else {
         info!("Order management: DISABLED (set order.enabled=true in config to enable)");
@@ -790,6 +813,7 @@ async fn main() -> anyhow::Result<()> {
                     interval: Duration::from_secs(3), // Poll every 3 seconds
                     symbol: symbol.clone(),
                     debounce_count: 2, // 2 consecutive zero polls = 6 seconds
+                    max_order_age_secs: config.order.max_live_age_secs * 2, // 2x max live age
                 };
                 let checker = OpenOrdersChecker::new(
                     Arc::clone(auth),
@@ -799,7 +823,8 @@ async fn main() -> anyhow::Result<()> {
                 order_checker_handle = Some(checker.start());
             }
             info!(
-                "Open orders checker started (interval: 3s, debounce: 2)"
+                "Open orders checker started (interval: 3s, debounce: 2, max_age: {}s)",
+                config.order.max_live_age_secs * 2
             );
         }
     }
@@ -865,18 +890,41 @@ async fn main() -> anyhow::Result<()> {
                     }
                     OrderEvent::OrderCanceled { order_id, cl_ord_id } => {
                         // First try matching by cl_ord_id (works for orders that were never accepted)
+                        let mut matched_symbol: Option<String> = None;
                         if let Some(ref cl_ord_id) = cl_ord_id {
                             if let Some(symbol) = QuoteOrderManager::extract_symbol_from_cl_ord_id(cl_ord_id) {
                                 if let Some(manager) = app.get_order_manager_mut(symbol) {
                                     manager.on_order_canceled_by_cl_ord_id(cl_ord_id);
-                                    continue;
+                                    matched_symbol = Some(symbol.to_string());
                                 }
                             }
                         }
                         // Fallback: scan all managers by order_id
-                        // This is acceptable: cancel events are infrequent
-                        for (_, manager) in app.order_managers_mut() {
-                            manager.on_order_canceled(order_id);
+                        if matched_symbol.is_none() {
+                            for (sym, manager) in app.order_managers_mut() {
+                                manager.on_order_canceled(order_id);
+                                matched_symbol = Some(sym.clone());
+                            }
+                        }
+
+                        // Check for pending replacement orders and execute immediately
+                        if let Some(symbol) = matched_symbol {
+                            if let Some(manager) = app.get_order_manager_mut(&symbol) {
+                                use std::time::{SystemTime, UNIX_EPOCH};
+                                let now_ns = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as i64;
+                                let pending_decisions = manager.check_pending_orders(now_ns);
+                                for decision in pending_decisions {
+                                    let symbol_arc: Arc<str> = Arc::from(symbol.as_str());
+                                    if let Some(ref order_tx) = app.order_tx {
+                                        if let Err(e) = order_tx.send((symbol_arc, decision)).await {
+                                            warn!("[{}] Failed to send pending order: {}", symbol, e);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     OrderEvent::CancelFailed { order_id, reason } => {

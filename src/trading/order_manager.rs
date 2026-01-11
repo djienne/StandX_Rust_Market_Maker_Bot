@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::strategy::Quote;
 use crate::trading::SharedPosition;
@@ -119,14 +119,21 @@ pub struct OrderManagerConfig {
     pub reprice_threshold_bps: f64,
     /// Maximum position in dollar value (from strategy config).
     pub max_position_dollar: f64,
-    /// Order timeout in nanoseconds (applies to Pending and Live states).
+    /// Order timeout in nanoseconds (applies to Pending and Canceling states).
     pub pending_timeout_ns: u64,
+    /// Maximum age for Live orders in nanoseconds before forcing refresh.
+    /// Even if price is within reprice threshold, orders older than this are repriced.
+    /// Set to 0 to disable (no max age for Live orders).
+    pub max_live_age_ns: u64,
     /// Tick size for price snapping.
     pub tick_size: f64,
     /// Lot size for quantity.
     pub lot_size: f64,
     /// Enable debug logging for order state tracking.
     pub debug: bool,
+    /// Maximum consecutive rejections before pausing trading (circuit breaker).
+    /// Set to 0 to disable.
+    pub circuit_breaker_rejections: u32,
 }
 
 impl Default for OrderManagerConfig {
@@ -136,9 +143,11 @@ impl Default for OrderManagerConfig {
             reprice_threshold_bps: 1.0,
             max_position_dollar: 500.0,
             pending_timeout_ns: 5_000_000_000, // 5 seconds
+            max_live_age_ns: 60_000_000_000,   // 60 seconds max age for Live orders
             tick_size: 0.01,
             lot_size: 0.001,
             debug: false,
+            circuit_breaker_rejections: 5,     // Pause after 5 consecutive rejections
         }
     }
 }
@@ -182,6 +191,17 @@ pub struct OrderManager {
 
     /// Last time we checked for timeouts (throttles hot path).
     last_timeout_check_ns: i64,
+
+    /// Pending bid price after cancel confirms (for CancelAndReplace).
+    /// Stores (price, qty) to place immediately when slot is cleared.
+    pending_bid_price: Option<(f64, f64)>,
+
+    /// Pending ask price after cancel confirms (for CancelAndReplace).
+    /// Stores (price, qty) to place immediately when slot is cleared.
+    pending_ask_price: Option<(f64, f64)>,
+
+    /// Consecutive rejection count for circuit breaker.
+    consecutive_rejections: u32,
 }
 
 impl OrderManager {
@@ -202,6 +222,9 @@ impl OrderManager {
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             last_timeout_check_ns: 0,
+            pending_bid_price: None,
+            pending_ask_price: None,
+            consecutive_rejections: 0,
         }
     }
 
@@ -405,23 +428,46 @@ impl OrderManager {
                 None
             }
             Some(o) => {
-                // Live order - check if reprice needed (only clone here if we need it)
-                if self.should_reprice(o.price, new_price) {
+                // Live order - check if reprice needed
+                let price_changed = self.should_reprice(o.price, new_price);
+                let age_ns = current_time_ns - o.sent_at_ns;
+                let order_too_old = self.config.max_live_age_ns > 0
+                    && age_ns > self.config.max_live_age_ns as i64;
+
+                if price_changed || order_too_old {
                     let change_bps = ((new_price - o.price) / o.price).abs() * 10_000.0;
-                    debug!(
-                        "[{}] REPRICE {} order: {:.2} -> {:.2} ({:.1}bps), id={}",
-                        self.config.symbol, side, o.price, new_price, change_bps, o.cl_ord_id
-                    );
+                    let age_secs = age_ns / 1_000_000_000;
+
+                    if order_too_old && !price_changed {
+                        debug!(
+                            "[{}] REFRESH {} order (age={}s > {}s): {:.2} -> {:.2} ({:.1}bps), id={}",
+                            self.config.symbol, side, age_secs,
+                            self.config.max_live_age_ns / 1_000_000_000,
+                            o.price, new_price, change_bps, o.cl_ord_id
+                        );
+                    } else {
+                        debug!(
+                            "[{}] REPRICE {} order: {:.2} -> {:.2} ({:.1}bps), id={}",
+                            self.config.symbol, side, o.price, new_price, change_bps, o.cl_ord_id
+                        );
+                    }
                     let cancel_id = o.cl_ord_id.clone(); // Only clone when actually repricing
                     self.set_order_canceling(side, current_time_ns);
                     self.stats.reprices += 1;
+
+                    // Store pending price for immediate placement after cancel confirms
+                    match side {
+                        Side::Buy => self.pending_bid_price = Some((new_price, qty)),
+                        Side::Sell => self.pending_ask_price = Some((new_price, qty)),
+                    }
+
                     Some(OrderDecision::CancelAndReplace {
                         cancel_id,
                         new_price,
                         qty,
                     })
                 } else {
-                    // Price within threshold - no action
+                    // Price within threshold and order not too old - no action
                     None
                 }
             }
@@ -449,57 +495,69 @@ impl OrderManager {
         let timeout_ns = self.config.pending_timeout_ns as i64;
         let timeout_secs = timeout_ns / 1_000_000_000;
 
-        // Check bid order - if older than timeout, clear and cancel
+        // Check bid order - only timeout Pending or Canceling orders
+        // Live orders should NOT timeout - they're valid on the exchange
         if let Some(order) = &self.bid_order {
-            let age_ns = current_time_ns - order.sent_at_ns;
-            let age_secs = age_ns / 1_000_000_000;
+            // Skip Live orders - they don't need timeout checking
+            if order.state == OrderState::Live {
+                // Live order is fine, no timeout needed
+            } else {
+                let age_ns = current_time_ns - order.sent_at_ns;
+                let age_secs = age_ns / 1_000_000_000;
 
-            // Debug: log every check when order exists and is getting old
-            if age_secs >= 50 {
-                info!(
-                    "[{}] Timeout check: {} order {} age={}s timeout={}s",
-                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
-                );
-            }
+                // Debug: log every check when order exists and is getting old
+                if age_secs >= 50 {
+                    info!(
+                        "[{}] Timeout check: {} order {} state={:?} age={}s timeout={}s",
+                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
+                    );
+                }
 
-            if age_ns > timeout_ns {
-                warn!(
-                    "[{}] {} order {} timed out after {}s (>{}s) - CLEARING SLOT",
-                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
-                );
-                cancels.push(OrderDecision::Cancel {
-                    cl_ord_id: order.cl_ord_id.clone(),
-                });
-                self.stats.timeouts += 1;
-                // Clear immediately
-                self.bid_order = None;
+                if age_ns > timeout_ns {
+                    warn!(
+                        "[{}] {} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
+                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
+                    );
+                    cancels.push(OrderDecision::Cancel {
+                        cl_ord_id: order.cl_ord_id.clone(),
+                    });
+                    self.stats.timeouts += 1;
+                    // Clear immediately
+                    self.bid_order = None;
+                }
             }
         }
 
-        // Check ask order - if older than timeout, clear and cancel
+        // Check ask order - only timeout Pending or Canceling orders
+        // Live orders should NOT timeout - they're valid on the exchange
         if let Some(order) = &self.ask_order {
-            let age_ns = current_time_ns - order.sent_at_ns;
-            let age_secs = age_ns / 1_000_000_000;
+            // Skip Live orders - they don't need timeout checking
+            if order.state == OrderState::Live {
+                // Live order is fine, no timeout needed
+            } else {
+                let age_ns = current_time_ns - order.sent_at_ns;
+                let age_secs = age_ns / 1_000_000_000;
 
-            // Debug: log every check when order exists and is getting old
-            if age_secs >= 50 {
-                info!(
-                    "[{}] Timeout check: {} order {} age={}s timeout={}s",
-                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
-                );
-            }
+                // Debug: log every check when order exists and is getting old
+                if age_secs >= 50 {
+                    info!(
+                        "[{}] Timeout check: {} order {} state={:?} age={}s timeout={}s",
+                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
+                    );
+                }
 
-            if age_ns > timeout_ns {
-                warn!(
-                    "[{}] {} order {} timed out after {}s (>{}s) - CLEARING SLOT",
-                    self.config.symbol, order.side, order.cl_ord_id, age_secs, timeout_secs
-                );
-                cancels.push(OrderDecision::Cancel {
-                    cl_ord_id: order.cl_ord_id.clone(),
-                });
-                self.stats.timeouts += 1;
-                // Clear immediately
-                self.ask_order = None;
+                if age_ns > timeout_ns {
+                    warn!(
+                        "[{}] {} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
+                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
+                    );
+                    cancels.push(OrderDecision::Cancel {
+                        cl_ord_id: order.cl_ord_id.clone(),
+                    });
+                    self.stats.timeouts += 1;
+                    // Clear immediately
+                    self.ask_order = None;
+                }
             }
         }
 
@@ -552,9 +610,13 @@ impl OrderManager {
 
     /// Called when an order is accepted by the exchange.
     pub fn on_order_accepted(&mut self, cl_ord_id: &str, order_id: i64) {
+        // Reset circuit breaker on successful acceptance
+        self.consecutive_rejections = 0;
+
         if let Some(order) = self.find_order_mut(cl_ord_id) {
             let side = order.side;
             let prev_state = order.state;
+            let sent_at_ns = order.sent_at_ns;
 
             // Always update order_id (needed for cancel matching)
             order.order_id = Some(order_id);
@@ -564,9 +626,18 @@ impl OrderManager {
             if prev_state == OrderState::Pending {
                 order.state = OrderState::Live;
                 self.stats.orders_accepted += 1;
+
+                // Calculate acceptance latency
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+                let latency_ms = (now_ns - sent_at_ns) / 1_000_000;
+
                 debug!(
-                    "[{}] {} order accepted: {} -> {}",
-                    self.config.symbol, side, cl_ord_id, order_id
+                    "[{}] {} order accepted: {} -> {} (latency={}ms)",
+                    self.config.symbol, side, cl_ord_id, order_id, latency_ms
                 );
             } else if prev_state == OrderState::Canceling {
                 // Order was already being canceled when acceptance arrived
@@ -591,6 +662,35 @@ impl OrderManager {
         );
         self.clear_order_by_cl_ord_id(cl_ord_id);
         self.stats.rejections += 1;
+
+        // Also clear pending price for this side to avoid placing stale orders
+        if let Some(s) = side {
+            self.clear_pending_price(s);
+        }
+
+        // Circuit breaker: pause trading after too many consecutive rejections
+        self.consecutive_rejections += 1;
+        if self.config.circuit_breaker_rejections > 0
+            && self.consecutive_rejections >= self.config.circuit_breaker_rejections
+        {
+            error!(
+                "[{}] CIRCUIT BREAKER: {} consecutive rejections - PAUSING trading",
+                self.config.symbol, self.consecutive_rejections
+            );
+            self.paused.store(true, Ordering::Release);
+        }
+    }
+
+    /// Reset circuit breaker and resume trading.
+    pub fn reset_circuit_breaker(&mut self) {
+        self.consecutive_rejections = 0;
+        self.paused.store(false, Ordering::Release);
+        info!("[{}] Circuit breaker reset, trading resumed", self.config.symbol);
+    }
+
+    /// Get consecutive rejection count.
+    pub fn consecutive_rejections(&self) -> u32 {
+        self.consecutive_rejections
     }
 
     /// Called when an order is canceled.
@@ -665,6 +765,71 @@ impl OrderManager {
                 debug!("[{}] Reverted ask order {} to Live state", self.config.symbol, order_id);
             }
         }
+    }
+
+    // ========== Pending Order Handling ==========
+
+    /// Check if we have pending prices to place after a slot was cleared.
+    ///
+    /// This implements immediate order placement after cancel confirms,
+    /// avoiding the race condition where price changes during cancel wait.
+    /// Returns decisions for immediate order placement.
+    pub fn check_pending_orders(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
+        let mut decisions = Vec::new();
+
+        // Check bid - only place if slot is empty
+        if self.bid_order.is_none() {
+            if let Some((price, qty)) = self.pending_bid_price.take() {
+                let cl_ord_id = self.generate_cl_ord_id();
+                debug!(
+                    "[{}] Placing pending BID: {:.2} x {:.6}, id={}",
+                    self.config.symbol, price, qty, cl_ord_id
+                );
+                self.set_order_pending(Side::Buy, cl_ord_id.clone(), price, qty, current_time_ns);
+                self.stats.orders_sent += 1;
+                decisions.push(OrderDecision::Send {
+                    side: Side::Buy,
+                    price,
+                    qty,
+                    cl_ord_id,
+                });
+            }
+        }
+
+        // Check ask - only place if slot is empty
+        if self.ask_order.is_none() {
+            if let Some((price, qty)) = self.pending_ask_price.take() {
+                let cl_ord_id = self.generate_cl_ord_id();
+                debug!(
+                    "[{}] Placing pending ASK: {:.2} x {:.6}, id={}",
+                    self.config.symbol, price, qty, cl_ord_id
+                );
+                self.set_order_pending(Side::Sell, cl_ord_id.clone(), price, qty, current_time_ns);
+                self.stats.orders_sent += 1;
+                decisions.push(OrderDecision::Send {
+                    side: Side::Sell,
+                    price,
+                    qty,
+                    cl_ord_id,
+                });
+            }
+        }
+
+        decisions
+    }
+
+    /// Clear pending price for a side (e.g., on rejection or timeout).
+    pub fn clear_pending_price(&mut self, side: Side) {
+        match side {
+            Side::Buy => self.pending_bid_price = None,
+            Side::Sell => self.pending_ask_price = None,
+        }
+    }
+
+    /// Clear all pending prices (e.g., on disconnect).
+    pub fn clear_all_pending_prices(&mut self) {
+        self.pending_bid_price = None;
+        self.pending_ask_price = None;
     }
 
     // ========== Order Lookup Helpers ==========

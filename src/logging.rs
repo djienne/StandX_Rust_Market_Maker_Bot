@@ -43,11 +43,14 @@ pub fn init(enabled: bool) {
 
     // Also initialize tracing if enabled
     if enabled {
-        use tracing_subscriber::FmtSubscriber;
-        use tracing::Level;
+        use tracing_subscriber::{fmt, EnvFilter};
 
-        let _ = FmtSubscriber::builder()
-            .with_max_level(Level::INFO)
+        // Use RUST_LOG env var if set, otherwise default to INFO level
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let _ = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
             .with_target(false)
             .with_thread_ids(false)
             .with_file(false)

@@ -157,6 +157,8 @@ pub struct OrderWsClient {
     message_counter: AtomicU64,
     /// Reconnection configuration
     reconnect_config: ReconnectConfig,
+    /// Pending cancel cl_ord_ids (to distinguish cancel confirmations from order acceptances)
+    pending_cancels: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl OrderWsClient {
@@ -172,6 +174,7 @@ impl OrderWsClient {
             session_id: format!("session_{}", chrono::Utc::now().timestamp_millis()),
             message_counter: AtomicU64::new(0),
             reconnect_config: ReconnectConfig::for_orders(), // Max 10 retries
+            pending_cancels: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -191,6 +194,7 @@ impl OrderWsClient {
             session_id: format!("session_{}", chrono::Utc::now().timestamp_millis()),
             message_counter: AtomicU64::new(0),
             reconnect_config,
+            pending_cancels: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -362,7 +366,7 @@ impl OrderWsClient {
                         Message::Text(text) => {
                             debug!("WS Received: {}", text);
                             if let Ok(response) = serde_json::from_str::<WsResponse>(&text) {
-                                Self::handle_response(response, tx).await;
+                                Self::handle_response(response, tx, &self.pending_cancels).await;
                             }
                         }
                         Message::Ping(_) => {
@@ -567,7 +571,17 @@ impl OrderWsClient {
 
     /// Cancel an order by client order ID.
     pub async fn cancel_order_by_client_id(&self, cl_ord_id: &str) -> Result<(), OrderWsError> {
+        // Track this cl_ord_id as pending cancel to distinguish from order acceptance
+        {
+            let mut pending = self.pending_cancels.lock().await;
+            pending.insert(cl_ord_id.to_string());
+        }
         self.send_cancel(json!({ "cl_ord_id": cl_ord_id })).await
+    }
+
+    /// Get reference to pending cancels set (for response handling).
+    pub fn pending_cancels(&self) -> Arc<Mutex<std::collections::HashSet<String>>> {
+        Arc::clone(&self.pending_cancels)
     }
 
     /// Internal helper to send a cancel request.
@@ -675,7 +689,11 @@ impl OrderWsClient {
 
     /// Handle a response from the server.
     #[inline]
-    async fn handle_response(response: WsResponse, event_tx: &mpsc::Sender<OrderEvent>) {
+    async fn handle_response(
+        response: WsResponse,
+        event_tx: &mpsc::Sender<OrderEvent>,
+        pending_cancels: &Arc<Mutex<std::collections::HashSet<String>>>,
+    ) {
         let method = response.method.as_deref().unwrap_or("");
         let code = response.code.unwrap_or(0);
 
@@ -694,6 +712,11 @@ impl OrderWsClient {
             "order:cancel" => {
                 debug!("Routing: order:cancel response (code={})", code);
                 if let Some(data) = data {
+                    // Remove from pending cancels
+                    if let Some(cl_ord_id) = Self::extract_cl_ord_id(&data) {
+                        let mut pending = pending_cancels.lock().await;
+                        pending.remove(&cl_ord_id);
+                    }
                     Self::handle_cancel_response(data, code, &response.message, event_tx).await;
                 }
                 return;
@@ -713,16 +736,38 @@ impl OrderWsClient {
 
         // Handle responses WITHOUT method field (StandX API style)
         if let Some(data) = data {
-            // Check if this looks like an order response (has cl_ord_id)
-            if Self::has_cl_ord_id(&data) {
-                debug!("Routing: inferred order response from cl_ord_id (code={})", code);
+            let cl_ord_id = Self::extract_cl_ord_id(&data);
+
+            // Check if this cl_ord_id is in our pending cancels list
+            let is_pending_cancel = if let Some(ref id) = cl_ord_id {
+                let pending = pending_cancels.lock().await;
+                pending.contains(id)
+            } else {
+                false
+            };
+
+            if is_pending_cancel {
+                // This is a cancel confirmation - remove from pending and fire event
+                if let Some(ref id) = cl_ord_id {
+                    let mut pending = pending_cancels.lock().await;
+                    pending.remove(id);
+                }
+                debug!("Routing: cancel confirmation from pending_cancels (code={})", code);
+                Self::handle_cancel_response(data, code, &response.message, event_tx).await;
+                return;
+            }
+
+            // Not a pending cancel - must be an order acceptance
+            if cl_ord_id.is_some() {
+                debug!("Routing: order acceptance (not in pending_cancels) (code={})", code);
                 Self::handle_order_response(data, code, &response.message, event_tx).await;
                 return;
             }
 
-            // Check if this is a cancel response (has order_id)
-            if Self::extract_order_id(&data).is_some() {
-                debug!("Routing: inferred cancel response from order_id (code={})", code);
+            // Fallback: has order_id without cl_ord_id → cancel response
+            let order_id = Self::extract_order_id(&data);
+            if order_id.is_some() {
+                debug!("Routing: inferred cancel response from order_id only (code={})", code);
                 Self::handle_cancel_response(data, code, &response.message, event_tx).await;
                 return;
             }

@@ -2,11 +2,12 @@
 //!
 //! Polls the exchange for open orders and signals when internal state
 //! should be cleared (exchange has no orders but we think we do, or
-//! orders are imbalanced - all on same side).
+//! orders are imbalanced - all on same side, or orders are too old).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -19,6 +20,10 @@ struct PollResult {
     total: usize,
     buys: usize,
     sells: usize,
+    /// Oldest order age in seconds (based on local tracking)
+    oldest_age_secs: Option<u64>,
+    /// Order IDs seen in this poll
+    order_ids: Vec<i64>,
 }
 
 /// Signal sent when internal order state should be cleared.
@@ -39,6 +44,9 @@ pub struct OpenOrdersCheckerConfig {
     pub symbol: String,
     /// Number of consecutive zero-order polls before signaling (debounce)
     pub debounce_count: u32,
+    /// Maximum order age in seconds before considering stale (0 = disabled)
+    /// Based on local tracking of when orders were first seen
+    pub max_order_age_secs: u64,
 }
 
 impl Default for OpenOrdersCheckerConfig {
@@ -47,6 +55,7 @@ impl Default for OpenOrdersCheckerConfig {
             interval: Duration::from_secs(3),
             symbol: "BTC-USD".to_string(),
             debounce_count: 2, // 2 consecutive polls = 6 seconds
+            max_order_age_secs: 120, // 2 minutes
         }
     }
 }
@@ -102,8 +111,9 @@ impl OpenOrdersChecker {
     /// Run the polling loop.
     async fn run(self) {
         info!(
-            "[{}] Open orders checker started (interval: {:?}, debounce: {})",
-            self.config.symbol, self.config.interval, self.config.debounce_count
+            "[{}] Open orders checker started (interval: {:?}, debounce: {}, max_age: {}s)",
+            self.config.symbol, self.config.interval, self.config.debounce_count,
+            self.config.max_order_age_secs
         );
 
         let mut consecutive_stale_count = 0u32;
@@ -111,23 +121,38 @@ impl OpenOrdersChecker {
         let mut last_was_stale = false;
         let mut last_stale_reason = String::new();
 
+        // Track when we first saw each order ID (for age detection)
+        let mut order_first_seen: HashMap<i64, Instant> = HashMap::new();
+
         while self.running.load(Ordering::Acquire) {
-            match self.poll_open_orders().await {
+            match self.poll_open_orders(&mut order_first_seen).await {
                 Ok(result) => {
                     consecutive_errors = 0;
 
                     // Log poll result for debugging
                     debug!(
-                        "[{}] Poll result: total={}, buys={}, sells={}",
-                        self.config.symbol, result.total, result.buys, result.sells
+                        "[{}] Poll result: total={}, buys={}, sells={}, oldest_age={:?}s",
+                        self.config.symbol, result.total, result.buys, result.sells,
+                        result.oldest_age_secs
                     );
 
-                    // Detect stale state: 0 orders OR imbalanced sides (all on same side)
+                    // Detect stale state: 0 orders, imbalanced sides, or orders too old
                     let (is_stale, stale_reason) = if result.total == 0 {
                         (true, "0 orders".to_string())
                     } else if result.total >= 2 && (result.buys == 0 || result.sells == 0) {
                         // 2+ orders but all on same side (e.g., 2 buys, 0 sells)
                         (true, format!("imbalanced: {} buys, {} sells", result.buys, result.sells))
+                    } else if self.config.max_order_age_secs > 0 {
+                        // Check for orders that are too old
+                        if let Some(oldest_age) = result.oldest_age_secs {
+                            if oldest_age > self.config.max_order_age_secs {
+                                (true, format!("order age {}s > {}s max", oldest_age, self.config.max_order_age_secs))
+                            } else {
+                                (false, String::new())
+                            }
+                        } else {
+                            (false, String::new())
+                        }
                     } else {
                         (false, String::new())
                     };
@@ -200,8 +225,11 @@ impl OpenOrdersChecker {
         info!("[{}] Open orders checker stopped", self.config.symbol);
     }
 
-    /// Poll open orders from API.
-    async fn poll_open_orders(&self) -> Result<PollResult, String> {
+    /// Poll open orders from API and track order ages.
+    async fn poll_open_orders(
+        &self,
+        order_first_seen: &mut HashMap<i64, Instant>,
+    ) -> Result<PollResult, String> {
         let mut auth = self.auth.lock().await;
 
         let open_orders = auth
@@ -218,10 +246,34 @@ impl OpenOrdersChecker {
             .filter(|o| o.side.eq_ignore_ascii_case("sell"))
             .count();
 
+        // Collect current order IDs
+        let current_ids: Vec<i64> = open_orders.iter().map(|o| o.id).collect();
+
+        // Track first-seen time for new orders
+        let now = Instant::now();
+        for &id in &current_ids {
+            order_first_seen.entry(id).or_insert(now);
+        }
+
+        // Remove orders no longer present
+        order_first_seen.retain(|id, _| current_ids.contains(id));
+
+        // Calculate oldest order age
+        let oldest_age_secs = if order_first_seen.is_empty() {
+            None
+        } else {
+            order_first_seen
+                .values()
+                .map(|first_seen| now.duration_since(*first_seen).as_secs())
+                .max()
+        };
+
         Ok(PollResult {
             total: open_orders.len(),
             buys,
             sells,
+            oldest_age_secs,
+            order_ids: current_ids,
         })
     }
 }
