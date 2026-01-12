@@ -66,6 +66,8 @@ pub struct LiveOrder {
     pub state: OrderState,
     /// Timestamp when order was sent (nanoseconds).
     pub sent_at_ns: i64,
+    /// Consecutive cancel failure count (for detecting stuck orders).
+    pub cancel_fail_count: u32,
 }
 
 /// Order decision from the hot path.
@@ -581,6 +583,7 @@ impl OrderManager {
             quantity,
             state: OrderState::Pending,
             sent_at_ns,
+            cancel_fail_count: 0,
         };
 
         match side {
@@ -612,6 +615,14 @@ impl OrderManager {
     pub fn on_order_accepted(&mut self, cl_ord_id: &str, order_id: i64) {
         // Reset circuit breaker on successful acceptance
         self.consecutive_rejections = 0;
+
+        // Warn if order_id is 0 or negative (potentially invalid)
+        if order_id <= 0 {
+            warn!(
+                "[{}] Order {} accepted with suspicious order_id={} - cancellation may fail",
+                self.config.symbol, cl_ord_id, order_id
+            );
+        }
 
         if let Some(order) = self.find_order_mut(cl_ord_id) {
             let side = order.side;
@@ -745,24 +756,62 @@ impl OrderManager {
     ///
     /// The order is still live on the exchange, so we revert from Canceling
     /// back to Live state to allow repricing on the next quote.
+    /// Maximum consecutive cancel failures before forcefully clearing the slot.
+    /// This prevents infinite cancel loops when order_id is invalid (e.g., 0).
+    const MAX_CANCEL_FAILURES: u32 = 3;
+
     pub fn on_cancel_failed(&mut self, order_id: i64, reason: &str) {
         warn!(
             "[{}] Cancel failed for order {}: {}",
             self.config.symbol, order_id, reason
         );
 
-        // Find the order and revert to Live state
+        // Find the order and handle the failure
         if let Some(order) = &mut self.bid_order {
             if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
-                order.state = OrderState::Live;
-                debug!("[{}] Reverted bid order {} to Live state", self.config.symbol, order_id);
+                order.cancel_fail_count += 1;
+
+                // If too many failures, forcefully clear the slot to break the loop
+                if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
+                    error!(
+                        "[{}] Bid order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
+                        self.config.symbol, order_id, Self::MAX_CANCEL_FAILURES,
+                        order_id, order.cl_ord_id
+                    );
+                    self.bid_order = None;
+                    self.pending_bid_price = None; // Clear pending price too
+                } else {
+                    // Revert to Live for retry
+                    order.state = OrderState::Live;
+                    debug!(
+                        "[{}] Reverted bid order {} to Live state (fail count: {})",
+                        self.config.symbol, order_id, order.cancel_fail_count
+                    );
+                }
                 return;
             }
         }
         if let Some(order) = &mut self.ask_order {
             if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
-                order.state = OrderState::Live;
-                debug!("[{}] Reverted ask order {} to Live state", self.config.symbol, order_id);
+                order.cancel_fail_count += 1;
+
+                // If too many failures, forcefully clear the slot to break the loop
+                if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
+                    error!(
+                        "[{}] Ask order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
+                        self.config.symbol, order_id, Self::MAX_CANCEL_FAILURES,
+                        order_id, order.cl_ord_id
+                    );
+                    self.ask_order = None;
+                    self.pending_ask_price = None; // Clear pending price too
+                } else {
+                    // Revert to Live for retry
+                    order.state = OrderState::Live;
+                    debug!(
+                        "[{}] Reverted ask order {} to Live state (fail count: {})",
+                        self.config.symbol, order_id, order.cancel_fail_count
+                    );
+                }
             }
         }
     }
