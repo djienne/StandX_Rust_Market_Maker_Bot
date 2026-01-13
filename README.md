@@ -123,17 +123,20 @@ Edit `config.json`:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `tick_size` | Price tick size | `0.01` |
+| `tick_size` | **FALLBACK** - only used if API fetch fails | `0.01` |
+| `lot_size` | **FALLBACK** - only used if API fetch fails | `0.0001` |
 | `vol_to_half_spread` | Volatility to half-spread multiplier | `8.0` |
 | `half_spread_bps` | Fixed half-spread in bps (if vol=0) | `0.0` |
 | `skew` | Position skew factor | `10.0` |
 | `max_position_dollar` | Max position size in USD | `420.0` |
 | `order_qty_dollar` | Order size in USD | `20.0` |
-| `c1_ticks` | Alpha (OBI) adjustment in ticks | `1600.0` |
+| `c1` | Alpha coefficient in price units (tick-size independent) | `0.0` |
+| `c1_ticks` | **DEPRECATED** - use `c1` instead. Falls back if `c1=0` | `160.0` |
 | `looking_depth` | OBI depth as fraction of mid | `0.025` |
-| `lot_size` | Minimum order quantity | `0.0001` |
 | `step_ns` | Rolling window step size (ns) | `100000000` |
 | `window_steps` | Number of steps in rolling window | `6000` |
+
+**Note:** `tick_size` and `lot_size` are automatically fetched from the exchange API on startup. The config values are only used as fallbacks if the API is unreachable.
 
 ### Order Management (`order` section)
 
@@ -160,6 +163,18 @@ Edit `config.json`:
 | `enabled` | Enable periodic REST API validation | `false` |
 | `interval_secs` | Check interval | `30` |
 | `drift_threshold_bps` | Drift threshold to trigger correction | `1.0` |
+
+### Symbol Info (`symbol_info` section)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `enabled` | Enable automatic tick/lot size detection from API | `true` |
+| `poll_interval_secs` | Polling interval to check for tick size changes | `30` |
+
+When `enabled`, the bot:
+1. Fetches `tick_size` and `lot_size` from the exchange API on startup
+2. Polls periodically to detect runtime changes (e.g., tick size updates)
+3. If tick size changes: pauses trading, cancels orders, resets strategy, resumes with new values
 
 ## Project Structure
 

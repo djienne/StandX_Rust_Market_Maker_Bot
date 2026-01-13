@@ -523,6 +523,7 @@ mod tests {
             half_spread_bps: 0.0,
             skew: 1.0,
             max_position_dollar: 500.0,
+            c1: 0.0, // Use c1_ticks fallback
             c1_ticks: 160.0,
             looking_depth: 0.025,
             order_qty_dollar: 20.0,

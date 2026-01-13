@@ -111,7 +111,8 @@ fn default_stale_timeout() -> u64 {
 /// OBI Strategy configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StrategyConfig {
-    /// Price tick size
+    /// FALLBACK tick size - only used if API fetch fails.
+    /// The actual tick_size is automatically fetched from the exchange API.
     #[serde(default = "default_tick_size")]
     pub tick_size: f64,
 
@@ -152,7 +153,13 @@ pub struct StrategyConfig {
     #[serde(default = "default_max_position_dollar")]
     pub max_position_dollar: f64,
 
-    /// Alpha coefficient in ticks (c1 = c1_ticks * tick_size)
+    /// Alpha coefficient in absolute price units (e.g., 3.6 means fair_price shifts by 3.6 per z-score).
+    /// This is tick-size independent. If set to 0, falls back to c1_ticks * tick_size.
+    #[serde(default)]
+    pub c1: f64,
+
+    /// DEPRECATED: Alpha coefficient in ticks. Use `c1` instead for tick-size independence.
+    /// Only used if `c1` is 0. Calculated as: c1 = c1_ticks * tick_size_fallback.
     #[serde(default = "default_c1_ticks")]
     pub c1_ticks: f64,
 
@@ -164,7 +171,8 @@ pub struct StrategyConfig {
     #[serde(default = "default_order_qty_dollar")]
     pub order_qty_dollar: f64,
 
-    /// Minimum lot size
+    /// FALLBACK lot size - only used if API fetch fails.
+    /// The actual lot_size is automatically fetched from the exchange API.
     #[serde(default = "default_lot_size")]
     pub lot_size: f64,
 }
@@ -195,6 +203,7 @@ impl Default for StrategyConfig {
             min_half_spread_bps: default_min_half_spread_bps(),
             skew: default_skew(),
             max_position_dollar: default_max_position_dollar(),
+            c1: 0.0, // 0 = use c1_ticks fallback
             c1_ticks: default_c1_ticks(),
             looking_depth: default_looking_depth(),
             order_qty_dollar: default_order_qty_dollar(),
@@ -204,10 +213,16 @@ impl Default for StrategyConfig {
 }
 
 impl StrategyConfig {
-    /// Get c1 in price units (c1_ticks * tick_size).
+    /// Get c1 in price units.
+    /// If `c1` is set (> 0), returns it directly.
+    /// Otherwise falls back to `c1_ticks * tick_size` (deprecated).
     #[inline]
     pub fn c1(&self) -> f64 {
-        self.c1_ticks * self.tick_size
+        if self.c1 > 0.0 {
+            self.c1
+        } else {
+            self.c1_ticks * self.tick_size
+        }
     }
 
     /// Get vol_scale for converting per-step std to per-second.
