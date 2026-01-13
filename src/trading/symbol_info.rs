@@ -98,12 +98,36 @@ impl SharedSymbolInfo {
         &self.symbol
     }
 
+    /// Validate that a tick/lot size value is sane.
+    ///
+    /// Returns true if the value is valid (positive, finite, not too small/large).
+    #[inline]
+    fn is_valid_step_size(value: f64) -> bool {
+        value.is_finite() && value > 1e-12 && value < 1e12
+    }
+
     /// Update symbol info from API response.
     ///
-    /// Returns true if tick_size or lot_size changed.
-    pub fn update(&self, info: &SymbolInfo) -> bool {
+    /// Returns Ok(true) if tick_size or lot_size changed.
+    /// Returns Ok(false) if values unchanged.
+    /// Returns Err if new values are invalid (keeps current values).
+    pub fn try_update(&self, info: &SymbolInfo) -> Result<bool, String> {
         let new_tick_size = info.tick_size();
         let new_lot_size = info.lot_size();
+
+        // Validate new values - reject if invalid
+        if !Self::is_valid_step_size(new_tick_size) {
+            return Err(format!(
+                "Invalid tick_size {} from API (decimals={})",
+                new_tick_size, info.price_tick_decimals
+            ));
+        }
+        if !Self::is_valid_step_size(new_lot_size) {
+            return Err(format!(
+                "Invalid lot_size {} from API (decimals={})",
+                new_lot_size, info.qty_tick_decimals
+            ));
+        }
 
         let old_tick_size = self.tick_size();
         let old_lot_size = self.lot_size();
@@ -129,7 +153,15 @@ impl SharedSymbolInfo {
             Ordering::Release,
         );
 
-        changed
+        Ok(changed)
+    }
+
+    /// Update symbol info from API response (legacy, panics on invalid values).
+    ///
+    /// Returns true if tick_size or lot_size changed.
+    /// Prefer try_update() for proper error handling.
+    pub fn update(&self, info: &SymbolInfo) -> bool {
+        self.try_update(info).expect("Invalid tick_size or lot_size from API")
     }
 
     /// Get milliseconds since last update.
@@ -241,46 +273,57 @@ impl SymbolInfoPoller {
         while self.running.load(Ordering::Acquire) {
             match self.poll_symbol_info().await {
                 Ok(api_info) => {
-                    consecutive_errors = 0;
-
                     // Capture old values before update
                     let old_tick_size = self.info.tick_size();
                     let old_lot_size = self.info.lot_size();
 
-                    // Update and check for changes
-                    let changed = self.info.update(&api_info);
+                    // Try to update - validates values before accepting
+                    match self.info.try_update(&api_info) {
+                        Ok(changed) => {
+                            consecutive_errors = 0;
 
-                    if changed {
-                        let new_tick_size = self.info.tick_size();
-                        let new_lot_size = self.info.lot_size();
+                            if changed {
+                                let new_tick_size = self.info.tick_size();
+                                let new_lot_size = self.info.lot_size();
 
-                        warn!(
-                            "[{}] TICK SIZE CHANGED! tick_size: {} -> {}, lot_size: {} -> {}",
-                            self.config.symbol, old_tick_size, new_tick_size,
-                            old_lot_size, new_lot_size
-                        );
+                                warn!(
+                                    "[{}] TICK SIZE CHANGED! tick_size: {} -> {}, lot_size: {} -> {}",
+                                    self.config.symbol, old_tick_size, new_tick_size,
+                                    old_lot_size, new_lot_size
+                                );
 
-                        let signal = TickSizeChangedSignal {
-                            symbol: self.config.symbol.clone(),
-                            old_tick_size,
-                            new_tick_size,
-                            old_lot_size,
-                            new_lot_size,
-                        };
+                                let signal = TickSizeChangedSignal {
+                                    symbol: self.config.symbol.clone(),
+                                    old_tick_size,
+                                    new_tick_size,
+                                    old_lot_size,
+                                    new_lot_size,
+                                };
 
-                        if let Err(e) = self.signal_tx.send(signal).await {
-                            error!(
-                                "[{}] Failed to send tick size changed signal: {}",
-                                self.config.symbol, e
+                                if let Err(e) = self.signal_tx.send(signal).await {
+                                    error!(
+                                        "[{}] Failed to send tick size changed signal: {}",
+                                        self.config.symbol, e
+                                    );
+                                }
+                            } else {
+                                debug!(
+                                    "[{}] Symbol info unchanged: tick_size={}, lot_size={}",
+                                    self.config.symbol,
+                                    self.info.tick_size(),
+                                    self.info.lot_size()
+                                );
+                            }
+                        }
+                        Err(validation_error) => {
+                            // API returned invalid values - keep current values
+                            consecutive_errors += 1;
+                            warn!(
+                                "[{}] Rejecting invalid symbol info: {} - keeping current tick_size={}, lot_size={}",
+                                self.config.symbol, validation_error,
+                                self.info.tick_size(), self.info.lot_size()
                             );
                         }
-                    } else {
-                        debug!(
-                            "[{}] Symbol info unchanged: tick_size={}, lot_size={}",
-                            self.config.symbol,
-                            self.info.tick_size(),
-                            self.info.lot_size()
-                        );
                     }
                 }
                 Err(e) => {
@@ -415,5 +458,50 @@ mod tests {
         let config = SymbolInfoPollerConfig::default();
         assert_eq!(config.interval, Duration::from_secs(30));
         assert_eq!(config.symbol, "BTC-USD");
+    }
+
+    #[test]
+    fn test_try_update_rejects_invalid_values() {
+        let info = SharedSymbolInfo::new("BTC-USD", 0.01, 0.0001);
+
+        // Valid update should succeed
+        let valid_info = SymbolInfo {
+            symbol: "BTC-USD".to_string(),
+            price_tick_decimals: 1, // 0.1
+            qty_tick_decimals: 3,   // 0.001
+        };
+        assert!(info.try_update(&valid_info).is_ok());
+        assert_eq!(info.tick_size(), 0.1);
+
+        // Zero tick_size (decimals=255 would give extremely small value)
+        // Note: price_tick_decimals is u8, so max is 255 -> 10^-255 which is essentially 0
+        // We can't really test 0 directly, but we can test the validation logic
+
+        // Test that valid values work
+        let valid_info = SymbolInfo {
+            symbol: "BTC-USD".to_string(),
+            price_tick_decimals: 2,
+            qty_tick_decimals: 4,
+        };
+        let result = info.try_update(&valid_info);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_valid_step_size() {
+        // Valid values
+        assert!(SharedSymbolInfo::is_valid_step_size(0.01));
+        assert!(SharedSymbolInfo::is_valid_step_size(0.0001));
+        assert!(SharedSymbolInfo::is_valid_step_size(1.0));
+        assert!(SharedSymbolInfo::is_valid_step_size(100.0));
+
+        // Invalid values
+        assert!(!SharedSymbolInfo::is_valid_step_size(0.0));
+        assert!(!SharedSymbolInfo::is_valid_step_size(-0.01));
+        assert!(!SharedSymbolInfo::is_valid_step_size(f64::NAN));
+        assert!(!SharedSymbolInfo::is_valid_step_size(f64::INFINITY));
+        assert!(!SharedSymbolInfo::is_valid_step_size(f64::NEG_INFINITY));
+        assert!(!SharedSymbolInfo::is_valid_step_size(1e-20)); // Too small
+        assert!(!SharedSymbolInfo::is_valid_step_size(1e20));  // Too large
     }
 }

@@ -613,12 +613,28 @@ async fn main() -> anyhow::Result<()> {
                 Ok(info) => {
                     let tick_size = info.tick_size();
                     let lot_size = info.lot_size();
-                    info!(
-                        "[{}] Fetched tick_size={} ({}dp), lot_size={} ({}dp) from API",
-                        symbol, tick_size, info.price_tick_decimals,
-                        lot_size, info.qty_tick_decimals
-                    );
-                    symbol_infos.insert(symbol.clone(), Arc::new(SharedSymbolInfo::from_api_response(&info)));
+
+                    // Validate fetched values - reject if invalid
+                    let tick_valid = tick_size.is_finite() && tick_size > 1e-12 && tick_size < 1e12;
+                    let lot_valid = lot_size.is_finite() && lot_size > 1e-12 && lot_size < 1e12;
+
+                    if tick_valid && lot_valid {
+                        info!(
+                            "[{}] Fetched tick_size={} ({}dp), lot_size={} ({}dp) from API",
+                            symbol, tick_size, info.price_tick_decimals,
+                            lot_size, info.qty_tick_decimals
+                        );
+                        symbol_infos.insert(symbol.clone(), Arc::new(SharedSymbolInfo::from_api_response(&info)));
+                    } else {
+                        warn!(
+                            "[{}] API returned invalid values (tick_size={}, lot_size={}) - using config fallback (tick_size={}, lot_size={})",
+                            symbol, tick_size, lot_size, config.strategy.tick_size, config.strategy.lot_size
+                        );
+                        symbol_infos.insert(
+                            symbol.clone(),
+                            Arc::new(SharedSymbolInfo::new(symbol, config.strategy.tick_size, config.strategy.lot_size))
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -774,9 +790,11 @@ async fn main() -> anyhow::Result<()> {
 
                 let executor_client = Arc::clone(&ws_client);
 
-                // Capture precision params for executor (avoids config access in async task)
-                let tick_size = app.config.strategy.tick_size;
-                let lot_size = app.config.strategy.lot_size;
+                // Clone symbol_infos for executor to read dynamic tick_size/lot_size
+                let executor_symbol_infos = app.symbol_infos().clone();
+                // Fallback values from config if symbol not in map
+                let fallback_tick_size = app.config.strategy.tick_size;
+                let fallback_lot_size = app.config.strategy.lot_size;
 
                 // Spawn order executor task
                 tokio::spawn(async move {
@@ -785,6 +803,12 @@ async fn main() -> anyhow::Result<()> {
                     while let Some((symbol, decision)) = order_rx.recv().await {
                         match decision {
                             OrderDecision::Send { side, price, qty, cl_ord_id } => {
+                                // Get current tick_size/lot_size from SharedSymbolInfo (dynamic)
+                                let (tick_size, lot_size) = executor_symbol_infos
+                                    .get(symbol.as_ref())
+                                    .map(|info| (info.tick_size(), info.lot_size()))
+                                    .unwrap_or((fallback_tick_size, fallback_lot_size));
+
                                 let req = match side {
                                     // Dereference Arc<str> to &str for Into<String>
                                     Side::Buy => NewOrderRequest::post_only_buy_with_precision(&*symbol, price, qty, tick_size, lot_size)
