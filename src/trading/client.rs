@@ -590,6 +590,7 @@ impl StandXClient {
     /// Query symbol info (public endpoint, no auth required).
     ///
     /// Returns tick size and lot size decimals for the given symbol.
+    /// Note: The API returns an array of all symbols, so we find the matching one.
     pub async fn query_symbol_info(&self, symbol: &str) -> Result<SymbolInfo, ClientError> {
         let url = format!("{}/api/query_symbol_info?symbol={}", self.perps_base_url, symbol);
 
@@ -605,9 +606,15 @@ impl StandXClient {
         }
 
         let text = response.text().await.map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
-        serde_json::from_str(&text).map_err(|e| {
+
+        // API returns an array of symbols, find the matching one
+        let symbols: Vec<SymbolInfo> = serde_json::from_str(&text).map_err(|e| {
             ClientError::InvalidResponse(format!("{}\nRaw response: {}", e, &text[..text.len().min(500)]))
-        })
+        })?;
+
+        symbols.into_iter()
+            .find(|s| s.symbol == symbol)
+            .ok_or_else(|| ClientError::InvalidResponse(format!("Symbol '{}' not found in API response", symbol)))
     }
 }
 
