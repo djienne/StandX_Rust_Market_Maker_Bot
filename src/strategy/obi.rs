@@ -5,8 +5,10 @@
 //! - Z-score of order book imbalance (alpha)
 //! - Position skew adjustment
 
+use std::sync::Arc;
 use tracing::{debug, info};
 use crate::config::StrategyConfig;
+use crate::trading::SharedSymbolInfo;
 use crate::types::OrderbookSnapshot;
 use super::rolling::RollingStats;
 use super::quotes::Quote;
@@ -16,6 +18,8 @@ use super::traits::QuoteStrategy;
 pub struct ObiStrategy {
     /// Strategy configuration
     config: StrategyConfig,
+    /// Shared symbol info for dynamic tick_size/lot_size (optional)
+    shared_info: Option<Arc<SharedSymbolInfo>>,
     /// Rolling window for mid-price changes (volatility)
     mid_price_chg_stats: RollingStats,
     /// Rolling window for imbalance (alpha)
@@ -61,6 +65,7 @@ impl ObiStrategy {
 
         Self {
             config,
+            shared_info: None,
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
             prev_mid_tick: None,
@@ -78,11 +83,57 @@ impl ObiStrategy {
         }
     }
 
+    /// Create a new OBI strategy with shared symbol info for dynamic tick_size/lot_size.
+    pub fn with_shared_info(
+        config: StrategyConfig,
+        shared_info: Arc<SharedSymbolInfo>,
+        required_history_minutes: u64,
+    ) -> Self {
+        let window_steps = config.window_steps;
+
+        Self {
+            config,
+            shared_info: Some(shared_info),
+            mid_price_chg_stats: RollingStats::new(window_steps),
+            imbalance_stats: RollingStats::new(window_steps),
+            prev_mid_tick: None,
+            position: 0.0,
+            step_count: 0,
+            last_update_step: 0,
+            volatility: 0.0,
+            alpha: 0.0,
+            warmed_up: false,
+            first_timestamp_ns: None,
+            latest_timestamp_ns: 0,
+            required_history_ns: required_history_minutes * 60 * 1_000_000_000,
+            total_samples: 0,
+            logged_valid_for_trading: false,
+        }
+    }
+
     /// Create a new OBI strategy with custom required history duration.
     pub fn with_required_history(config: StrategyConfig, required_history_minutes: u64) -> Self {
         let mut strategy = Self::new(config);
         strategy.required_history_ns = required_history_minutes * 60 * 1_000_000_000;
         strategy
+    }
+
+    /// Get the current tick size (from SharedSymbolInfo if available, else from config).
+    #[inline]
+    pub fn tick_size(&self) -> f64 {
+        self.shared_info
+            .as_ref()
+            .map(|info| info.tick_size())
+            .unwrap_or(self.config.tick_size)
+    }
+
+    /// Get the current lot size (from SharedSymbolInfo if available, else from config).
+    #[inline]
+    pub fn lot_size(&self) -> f64 {
+        self.shared_info
+            .as_ref()
+            .map(|info| info.lot_size())
+            .unwrap_or(self.config.lot_size)
     }
 
     /// Set the current position.
@@ -181,7 +232,7 @@ impl ObiStrategy {
 
         // Get mid-price
         let mid_price = snapshot.mid_price()?;
-        let mid_tick = mid_price / self.config.tick_size;
+        let mid_tick = mid_price / self.tick_size();
 
         // Calculate mid-price change
         if let Some(prev_tick) = self.prev_mid_tick {
@@ -278,15 +329,16 @@ impl ObiStrategy {
 
         // Calculate half-spread in ticks (priority: volatility > bps > fixed)
         // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
+        let tick_size = self.tick_size();
         let half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
             // Mode 1: Volatility-based
             self.volatility * self.config.vol_to_half_spread
         } else if self.config.half_spread_bps > 0.0 {
             // Mode 2: BPS-based
-            mid_price * (self.config.half_spread_bps / 10000.0) / self.config.tick_size
+            mid_price * (self.config.half_spread_bps / 10000.0) / tick_size
         } else if self.config.half_spread > 0.0 {
             // Mode 3: Fixed price
-            self.config.half_spread / self.config.tick_size
+            self.config.half_spread / tick_size
         } else {
             // Fallback: use minimum spread
             1.0
@@ -308,7 +360,7 @@ impl ObiStrategy {
         // Enforce minimum spread floor AFTER skew adjustment (in bps from mid)
         // Pre-compute min_depth_tick once (avoids duplicate division)
         let min_depth_tick = if self.config.min_half_spread_bps > 0.0 {
-            mid_price * (self.config.min_half_spread_bps / 10000.0) / self.config.tick_size
+            mid_price * (self.config.min_half_spread_bps / 10000.0) / tick_size
         } else {
             0.0
         };
@@ -325,21 +377,20 @@ impl ObiStrategy {
         };
 
         // Calculate raw quote prices
-        let raw_bid = fair_price - bid_depth_tick * self.config.tick_size;
-        let raw_ask = fair_price + ask_depth_tick * self.config.tick_size;
+        let raw_bid = fair_price - bid_depth_tick * tick_size;
+        let raw_ask = fair_price + ask_depth_tick * tick_size;
 
         // Clamp to BBO (never cross the spread)
         let clamped_bid = raw_bid.min(best_bid);
         let clamped_ask = raw_ask.max(best_ask);
 
         // Snap to tick grid
-        let tick = self.config.tick_size;
-        let bid_price = (clamped_bid / tick).floor() * tick;
-        let ask_price = (clamped_ask / tick).ceil() * tick;
+        let bid_price = (clamped_bid / tick_size).floor() * tick_size;
+        let ask_price = (clamped_ask / tick_size).ceil() * tick_size;
 
         // Calculate quantity (round to lot_size, ensure minimum)
         let order_qty = self.config.order_qty_dollar / mid_price;
-        let lot_size = self.config.lot_size;
+        let lot_size = self.lot_size();
         let quantity = ((order_qty / lot_size).round() * lot_size).max(lot_size);
 
         // Log "valid for trading" milestone once (uses info! for visibility)

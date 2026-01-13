@@ -13,15 +13,16 @@ use tracing::{debug, error, info, warn};
 
 use standx_orderbook::{
     Config, OrderbookStore, WsClientBuilder, WsEvent, StandXMessage,
-    ObiStrategy, QuoteFormatter, init_logging,
+    ObiStrategy, QuoteFormatter, init_logging, QuoteStrategy,
     AuthManager, SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle,
     QuoteOrderManager, OrderManagerConfig, OrderDecision, Side,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OrderbookSanityChecker, SanityCheckerConfig, SanityCheckerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
+    SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
 use standx_orderbook::trading::TradingStats;
-use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest};
+use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest, StandXClient};
 
 /// Statistics tracker for monitoring throughput and rates.
 /// Extracted from App to reduce struct bloat and separate concerns.
@@ -154,6 +155,8 @@ struct App {
     strategies: HashMap<String, ObiStrategy>,
     /// Shared position per symbol (for lock-free reads)
     positions: HashMap<String, Arc<SharedPosition>>,
+    /// Shared symbol info per symbol (for dynamic tick_size/lot_size)
+    symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
     /// Order managers per symbol
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
@@ -178,8 +181,8 @@ struct App {
 }
 
 impl App {
-    /// Create a new application.
-    fn new(config: Config) -> Self {
+    /// Create a new application with shared symbol info for dynamic tick_size/lot_size.
+    fn new(config: Config, symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>) -> Self {
         let store = Arc::new(OrderbookStore::new(
             &config.symbols,
             config.history_buffer_size,
@@ -193,11 +196,28 @@ impl App {
         let mut symbol_arcs = HashMap::new();
 
         for symbol in &config.symbols {
-            let strategy = ObiStrategy::with_required_history(config.strategy.clone(), config.history_minutes);
+            // Create strategy with shared symbol info if available
+            let strategy = if let Some(shared_info) = symbol_infos.get(symbol) {
+                ObiStrategy::with_shared_info(
+                    config.strategy.clone(),
+                    Arc::clone(shared_info),
+                    config.history_minutes,
+                )
+            } else {
+                // Fallback to config-based tick_size
+                ObiStrategy::with_required_history(config.strategy.clone(), config.history_minutes)
+            };
             strategies.insert(symbol.clone(), strategy);
 
             let position = Arc::new(SharedPosition::new(symbol.clone()));
             positions.insert(symbol.clone(), Arc::clone(&position));
+
+            // Get tick_size and lot_size from SharedSymbolInfo if available, else from config
+            let (tick_size, lot_size) = if let Some(info) = symbol_infos.get(symbol) {
+                (info.tick_size(), info.lot_size())
+            } else {
+                (config.strategy.tick_size, config.strategy.lot_size)
+            };
 
             // Create order manager config from strategy and order configs
             let om_config = OrderManagerConfig {
@@ -206,8 +226,8 @@ impl App {
                 max_position_dollar: config.strategy.max_position_dollar,
                 pending_timeout_ns: config.order.pending_timeout_secs * 1_000_000_000,
                 max_live_age_ns: config.order.max_live_age_secs * 1_000_000_000,
-                tick_size: config.strategy.tick_size,
-                lot_size: config.strategy.lot_size,
+                tick_size,
+                lot_size,
                 debug: config.debug,
                 circuit_breaker_rejections: config.order.circuit_breaker_rejections,
             };
@@ -218,8 +238,10 @@ impl App {
             symbol_arcs.insert(symbol.clone(), Arc::from(symbol.as_str()));
         }
 
-        // Determine price precision from tick_size
-        let tick_size = config.strategy.tick_size;
+        // Determine price precision from tick_size (use first symbol's info if available)
+        let tick_size = symbol_infos.values().next()
+            .map(|info| info.tick_size())
+            .unwrap_or(config.strategy.tick_size);
         let price_precision = if tick_size >= 1.0 {
             0
         } else {
@@ -231,12 +253,26 @@ impl App {
             store,
             strategies,
             positions,
+            symbol_infos,
             order_managers,
             order_tx: None,
             symbol_arcs,
             quote_formatter: QuoteFormatter::new(price_precision, 4),
             stats: StatsTracker::new(),
             last_received_at_ns: 0,
+        }
+    }
+
+    /// Get symbol infos map for poller setup.
+    fn symbol_infos(&self) -> &HashMap<String, Arc<SharedSymbolInfo>> {
+        &self.symbol_infos
+    }
+
+    /// Reset strategy for a symbol (clears rolling stats, re-enters warmup).
+    fn reset_strategy(&mut self, symbol: &str) {
+        if let Some(strategy) = self.strategies.get_mut(symbol) {
+            strategy.reset();
+            info!("[{}] Strategy reset - re-entering warmup period", symbol);
         }
     }
 
@@ -568,8 +604,47 @@ async fn main() -> anyhow::Result<()> {
         info!("Order management: DISABLED (set order.enabled=true in config to enable)");
     }
 
-    // Create application
-    let mut app = App::new(config.clone());
+    // Fetch symbol info from API if enabled (tick_size auto-detection)
+    let mut symbol_infos: HashMap<String, Arc<SharedSymbolInfo>> = HashMap::new();
+    if config.symbol_info.enabled {
+        let client = StandXClient::new();
+        for symbol in &config.symbols {
+            match client.query_symbol_info(symbol).await {
+                Ok(info) => {
+                    let tick_size = info.tick_size();
+                    let lot_size = info.lot_size();
+                    info!(
+                        "[{}] Fetched tick_size={} ({}dp), lot_size={} ({}dp) from API",
+                        symbol, tick_size, info.price_tick_decimals,
+                        lot_size, info.qty_tick_decimals
+                    );
+                    symbol_infos.insert(symbol.clone(), Arc::new(SharedSymbolInfo::from_api_response(&info)));
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] Failed to fetch symbol info: {} - using config values (tick_size={}, lot_size={})",
+                        symbol, e, config.strategy.tick_size, config.strategy.lot_size
+                    );
+                    // Create SharedSymbolInfo with config values as fallback
+                    symbol_infos.insert(
+                        symbol.clone(),
+                        Arc::new(SharedSymbolInfo::new(symbol, config.strategy.tick_size, config.strategy.lot_size))
+                    );
+                }
+            }
+        }
+    } else {
+        info!("Symbol info auto-detection disabled - using config values");
+        for symbol in &config.symbols {
+            symbol_infos.insert(
+                symbol.clone(),
+                Arc::new(SharedSymbolInfo::new(symbol, config.strategy.tick_size, config.strategy.lot_size))
+            );
+        }
+    }
+
+    // Create application with symbol info
+    let mut app = App::new(config.clone(), symbol_infos);
 
     // Create shared auth manager if any feature needs it
     // IMPORTANT: Use a SINGLE AuthManager for all features to ensure consistent ed25519 keypair
@@ -829,6 +904,33 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Start symbol info poller for tick size change detection
+    let mut symbol_info_handles: Vec<SymbolInfoPollerHandle> = Vec::new();
+    let mut tick_size_changed_rx: Option<mpsc::Receiver<TickSizeChangedSignal>> = None;
+    if config.symbol_info.enabled {
+        // Create channel for tick size change signals
+        let (tx, rx) = mpsc::channel::<TickSizeChangedSignal>(10);
+        tick_size_changed_rx = Some(rx);
+
+        // Start poller for each symbol
+        for (symbol, shared_info) in app.symbol_infos() {
+            let poller_config = SymbolInfoPollerConfig {
+                interval: Duration::from_secs(config.symbol_info.poll_interval_secs),
+                symbol: symbol.clone(),
+            };
+            let poller = SymbolInfoPoller::new(
+                Arc::clone(shared_info),
+                poller_config,
+                tx.clone(),
+            );
+            symbol_info_handles.push(poller.start());
+        }
+        info!(
+            "Symbol info poller started (interval: {}s)",
+            config.symbol_info.poll_interval_secs
+        );
+    }
+
     // Create WebSocket client for market data
     let client = WsClientBuilder::new()
         .config(config.websocket.clone())
@@ -1048,6 +1150,54 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
 
+            // Handle tick size change signal (CRITICAL: must stop trading, reset, restart)
+            Some(signal) = async {
+                tick_size_changed_rx.as_mut().unwrap().recv().await
+            }, if tick_size_changed_rx.is_some() => {
+                warn!(
+                    "[{}] TICK SIZE CHANGED: {} -> {} (lot_size: {} -> {}) - STOPPING TRADING",
+                    signal.symbol,
+                    signal.old_tick_size, signal.new_tick_size,
+                    signal.old_lot_size, signal.new_lot_size
+                );
+
+                // 1. Pause order manager immediately (atomic, prevents new orders)
+                if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
+                    manager.pause();
+                }
+
+                // 2. Clear internal order state
+                if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
+                    manager.clear_all_orders();
+                }
+
+                // 3. Cancel all orders on exchange via HTTP
+                if let Some(auth) = &shared_auth {
+                    let mut auth_guard = auth.lock().await;
+                    match auth_guard.cancel_all_orders(Some(&signal.symbol)).await {
+                        Ok(count) => {
+                            info!("[{}] Canceled {} order(s) due to tick size change", signal.symbol, count);
+                        }
+                        Err(e) => {
+                            error!("[{}] Failed to cancel orders on tick size change: {}", signal.symbol, e);
+                        }
+                    }
+                }
+
+                // 4. Reset strategy (clears rolling stats, re-enters warmup)
+                app.reset_strategy(&signal.symbol);
+
+                // 5. Resume order manager (will wait for strategy warmup before trading)
+                if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
+                    manager.resume();
+                }
+
+                info!(
+                    "[{}] Trading resumed with new tick_size={}, lot_size={} - awaiting warmup",
+                    signal.symbol, signal.new_tick_size, signal.new_lot_size
+                );
+            }
+
             // Periodic tasks: timeout checking and stats logging (runs every 1 second)
             _ = periodic_interval.tick() => {
                 // Check for clear order signals from OpenOrdersChecker (non-blocking)
@@ -1104,6 +1254,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = order_checker_handle {
         info!("Stopping open orders checker...");
         handle.stop();
+    }
+
+    // Stop symbol info pollers
+    if !symbol_info_handles.is_empty() {
+        info!("Stopping {} symbol info poller(s)...", symbol_info_handles.len());
+        for handle in symbol_info_handles {
+            handle.stop();
+        }
     }
 
     // Final stats

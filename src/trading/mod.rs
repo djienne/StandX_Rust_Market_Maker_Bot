@@ -37,6 +37,7 @@ pub mod order_manager;
 pub mod order_ws;
 pub mod orders;
 pub mod position;
+pub mod symbol_info;
 pub mod wallet_tracker;
 
 pub use auth::{AuthManager, AuthToken, Credentials, AuthError, Authenticated};
@@ -56,6 +57,8 @@ pub use orders::{
 pub use position::{SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle};
 pub use wallet_tracker::{WalletTracker, WalletTrackerConfig, WalletTrackerHandle};
 pub use order_checker::{OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal};
+pub use symbol_info::{SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal};
+pub use client::SymbolInfo;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

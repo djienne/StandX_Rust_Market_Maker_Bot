@@ -91,7 +91,7 @@ pub mod types;
 pub mod websocket;
 
 // Re-export commonly used types
-pub use config::{Config, ConfigError, WebSocketConfig, StrategyConfig, PositionConfig, OrderConfig, WalletConfig, SanityCheckConfig};
+pub use config::{Config, ConfigError, WebSocketConfig, StrategyConfig, PositionConfig, OrderConfig, WalletConfig, SanityCheckConfig, SymbolInfoConfig};
 pub use logging::{init as init_logging, is_enabled as logging_enabled, logger};
 pub use orderbook::{
     CurrentOrderbook, OrderbookHistory, OrderbookManager, OrderbookStore,
@@ -104,6 +104,7 @@ pub use trading::{
     QuoteOrderManager, OrderManagerConfig, OrderDecision, LiveOrder, OrderState, Side, OrderManagerStats,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
+    SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
 pub use types::{OrderbookSnapshot, PriceLevel, Symbol, MAX_LEVELS};
 pub use websocket::{

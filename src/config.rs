@@ -369,6 +369,30 @@ impl Default for SanityCheckConfig {
     }
 }
 
+/// Symbol info (tick size) polling configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SymbolInfoConfig {
+    /// Enable automatic tick size detection from API
+    #[serde(default = "default_symbol_info_enabled")]
+    pub enabled: bool,
+
+    /// Polling interval in seconds to check for tick size changes
+    #[serde(default = "default_symbol_info_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_symbol_info_enabled() -> bool { true } // Enabled by default
+fn default_symbol_info_interval() -> u64 { 30 }
+
+impl Default for SymbolInfoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_symbol_info_enabled(),
+            poll_interval_secs: default_symbol_info_interval(),
+        }
+    }
+}
+
 /// Main application configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -423,6 +447,10 @@ pub struct Config {
     /// Orderbook sanity check configuration
     #[serde(default)]
     pub orderbook_sanity_check: SanityCheckConfig,
+
+    /// Symbol info (tick size) polling configuration
+    #[serde(default)]
+    pub symbol_info: SymbolInfoConfig,
 }
 
 fn default_symbols() -> Vec<String> {
@@ -465,6 +493,7 @@ impl Default for Config {
             order: OrderConfig::default(),
             pnl_tracking: WalletConfig::default(),
             orderbook_sanity_check: SanityCheckConfig::default(),
+            symbol_info: SymbolInfoConfig::default(),
         }
     }
 }

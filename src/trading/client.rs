@@ -77,6 +77,30 @@ pub struct DepthBookResponse {
     pub bids: Vec<[String; 2]>,
 }
 
+/// Symbol info from query_symbol_info endpoint (public, no auth).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SymbolInfo {
+    pub symbol: String,
+    /// Number of decimal places for price (e.g., 2 means tick_size = 0.01)
+    pub price_tick_decimals: u8,
+    /// Number of decimal places for quantity (e.g., 3 means lot_size = 0.001)
+    pub qty_tick_decimals: u8,
+}
+
+impl SymbolInfo {
+    /// Convert price_tick_decimals to tick_size (e.g., 2 -> 0.01)
+    #[inline]
+    pub fn tick_size(&self) -> f64 {
+        10.0_f64.powi(-(self.price_tick_decimals as i32))
+    }
+
+    /// Convert qty_tick_decimals to lot_size (e.g., 3 -> 0.001)
+    #[inline]
+    pub fn lot_size(&self) -> f64 {
+        10.0_f64.powi(-(self.qty_tick_decimals as i32))
+    }
+}
+
 /// Request for placing a new order.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewOrderRequest {
@@ -545,6 +569,29 @@ impl StandXClient {
     /// Query orderbook depth (public endpoint, no auth required).
     pub async fn query_depth_book(&self, symbol: &str) -> Result<DepthBookResponse, ClientError> {
         let url = format!("{}/api/query_depth_book?symbol={}", self.perps_base_url, symbol);
+
+        let response = self.http
+            .get(&url)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(ClientError::ApiError(format!("{}: {}", status, text)));
+        }
+
+        let text = response.text().await.map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| {
+            ClientError::InvalidResponse(format!("{}\nRaw response: {}", e, &text[..text.len().min(500)]))
+        })
+    }
+
+    /// Query symbol info (public endpoint, no auth required).
+    ///
+    /// Returns tick size and lot size decimals for the given symbol.
+    pub async fn query_symbol_info(&self, symbol: &str) -> Result<SymbolInfo, ClientError> {
+        let url = format!("{}/api/query_symbol_info?symbol={}", self.perps_base_url, symbol);
 
         let response = self.http
             .get(&url)
