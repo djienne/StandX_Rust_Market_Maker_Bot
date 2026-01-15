@@ -302,6 +302,11 @@ pub struct OrderConfig {
     /// Set to 0 to disable circuit breaker
     #[serde(default = "default_circuit_breaker_rejections")]
     pub circuit_breaker_rejections: u32,
+
+    /// Circuit breaker auto-recovery: resume trading after N seconds (default: 300 = 5 minutes)
+    /// Set to 0 to disable auto-recovery (manual reset required)
+    #[serde(default = "default_circuit_breaker_recovery_secs")]
+    pub circuit_breaker_recovery_secs: u64,
 }
 
 fn default_order_enabled() -> bool { false } // Disabled by default for safety
@@ -310,6 +315,7 @@ fn default_pending_timeout_secs() -> u64 { 5 }
 fn default_max_live_age_secs() -> u64 { 60 }
 fn default_max_reconnect_attempts() -> u32 { 10 }
 fn default_circuit_breaker_rejections() -> u32 { 5 }
+fn default_circuit_breaker_recovery_secs() -> u64 { 300 } // 5 minutes default
 
 impl Default for OrderConfig {
     fn default() -> Self {
@@ -320,6 +326,7 @@ impl Default for OrderConfig {
             max_live_age_secs: default_max_live_age_secs(),
             max_reconnect_attempts: default_max_reconnect_attempts(),
             circuit_breaker_rejections: default_circuit_breaker_rejections(),
+            circuit_breaker_recovery_secs: default_circuit_breaker_recovery_secs(),
         }
     }
 }

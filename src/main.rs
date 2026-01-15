@@ -62,6 +62,8 @@ impl StatsTracker {
         store: &OrderbookStore,
         strategies: &HashMap<String, ObiStrategy>,
         order_managers: &HashMap<String, QuoteOrderManager>,
+        order_ws_connected: bool,
+        order_ws_authenticated: bool,
     ) {
         // 0 means disabled (as documented)
         if config.stats_interval_secs == 0 {
@@ -101,30 +103,76 @@ impl StatsTracker {
         let order_rate = self.order_decision_count as f64 / elapsed.as_secs_f64();
 
         if config.order.enabled {
+            // Build WebSocket state string
+            let ws_state = if order_ws_authenticated {
+                "WS: connected+auth"
+            } else if order_ws_connected {
+                "WS: connected (auth pending)"
+            } else {
+                "WS: DISCONNECTED"
+            };
+
             info!(
-                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} orders ({:.1}/sec)",
+                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} orders ({:.1}/sec) | {}",
                 self.message_count,
                 rate,
                 self.quote_count,
                 quote_rate,
                 self.order_decision_count,
                 order_rate,
+                ws_state,
             );
 
             // Log order manager stats
             for (symbol, manager) in order_managers {
                 let stats = manager.stats();
-                if stats.orders_sent > 0 {
-                    info!(
-                        "[{}] Orders: sent={} accepted={} canceled={} rejected={} reprices={} timeouts={}",
-                        symbol,
-                        stats.orders_sent,
-                        stats.orders_accepted,
-                        stats.orders_canceled,
-                        stats.rejections,
-                        stats.reprices,
-                        stats.timeouts,
-                    );
+                let paused = manager.is_paused();
+                let rejections = manager.consecutive_rejections();
+
+                // Build status string
+                let status = if paused {
+                    if rejections > 0 {
+                        format!("PAUSED (circuit breaker: {} rejections)", rejections)
+                    } else {
+                        "PAUSED (WS disconnected)".to_string()
+                    }
+                } else {
+                    "TRADING".to_string()
+                };
+
+                // Build live orders string
+                let bid_info = manager.bid_order()
+                    .map(|o| format!("bid@{:.2}", o.price))
+                    .unwrap_or_else(|| "no bid".to_string());
+                let ask_info = manager.ask_order()
+                    .map(|o| format!("ask@{:.2}", o.price))
+                    .unwrap_or_else(|| "no ask".to_string());
+
+                // Always log status even if no orders sent (to catch silent stops)
+                info!(
+                    "[{}] Status: {} | Live: {}, {} | Orders: sent={} accepted={} rejected={} timeouts={}",
+                    symbol,
+                    status,
+                    bid_info,
+                    ask_info,
+                    stats.orders_sent,
+                    stats.orders_accepted,
+                    stats.rejections,
+                    stats.timeouts,
+                );
+
+                // Health warning: log if no orders sent for a long time while not paused
+                // This helps catch silent failures where trading stopped without obvious error
+                const IDLE_WARNING_SECS: u64 = 300; // 5 minutes
+                if !paused {
+                    if let Some(idle_secs) = manager.seconds_since_last_order() {
+                        if idle_secs > IDLE_WARNING_SECS {
+                            warn!(
+                                "[{}] HEALTH WARNING: No orders sent for {} seconds while not paused!",
+                                symbol, idle_secs
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -178,6 +226,10 @@ struct App {
     /// - `order_manager.rs:189`: session_prefix uses local `chrono::Utc::now()` (for uniqueness only)
     /// - `position.rs:52-57`: staleness check uses local `SystemTime::now()` (acceptable for staleness)
     last_received_at_ns: i64,
+    /// Order WebSocket connection state (for stats logging)
+    order_ws_connected: bool,
+    /// Order WebSocket authenticated state (for stats logging)
+    order_ws_authenticated: bool,
 }
 
 impl App {
@@ -260,6 +312,8 @@ impl App {
             quote_formatter: QuoteFormatter::new(price_precision, 4),
             stats: StatsTracker::new(),
             last_received_at_ns: 0,
+            order_ws_connected: false,
+            order_ws_authenticated: false,
         }
     }
 
@@ -356,6 +410,17 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Check circuit breaker auto-recovery for all order managers.
+    fn check_circuit_breaker_recovery(&mut self) {
+        if !self.config.order.enabled || self.config.order.circuit_breaker_recovery_secs == 0 {
+            return;
+        }
+
+        for (_, manager) in &mut self.order_managers {
+            manager.check_circuit_breaker_recovery(self.config.order.circuit_breaker_recovery_secs);
         }
     }
 
@@ -545,6 +610,8 @@ impl App {
             &self.store,
             &self.strategies,
             &self.order_managers,
+            self.order_ws_connected,
+            self.order_ws_authenticated,
         );
     }
 }
@@ -1061,9 +1128,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                     OrderEvent::Connected => {
                         info!("Order WebSocket connected");
+                        app.order_ws_connected = true;
                     }
                     OrderEvent::Authenticated => {
                         info!("Order WebSocket authenticated, resuming trading");
+                        app.order_ws_authenticated = true;
                         // Resume all order managers
                         for (_, manager) in app.order_managers_mut() {
                             manager.resume();
@@ -1071,6 +1140,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     OrderEvent::Disconnected(reason) => {
                         warn!("Order WebSocket disconnected: {}", reason);
+                        app.order_ws_connected = false;
+                        app.order_ws_authenticated = false;
 
                         // 1. Pause all order managers IMMEDIATELY (atomic, no latency)
                         for (_, manager) in app.order_managers_mut() {
@@ -1261,6 +1332,10 @@ async fn main() -> anyhow::Result<()> {
 
                 // Check pending order timeouts (independent of market data)
                 app.check_order_timeouts();
+
+                // Check circuit breaker auto-recovery
+                app.check_circuit_breaker_recovery();
+
                 app.log_stats();
             }
         }

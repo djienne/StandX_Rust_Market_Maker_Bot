@@ -204,6 +204,12 @@ pub struct OrderManager {
 
     /// Consecutive rejection count for circuit breaker.
     consecutive_rejections: u32,
+
+    /// Timestamp when circuit breaker was triggered (Unix millis, 0 if not triggered).
+    circuit_breaker_triggered_at_ms: u64,
+
+    /// Timestamp when last order was sent (Unix millis, 0 if never).
+    last_order_sent_at_ms: u64,
 }
 
 impl OrderManager {
@@ -227,6 +233,8 @@ impl OrderManager {
             pending_bid_price: None,
             pending_ask_price: None,
             consecutive_rejections: 0,
+            circuit_breaker_triggered_at_ms: 0,
+            last_order_sent_at_ms: 0,
         }
     }
 
@@ -401,6 +409,10 @@ impl OrderManager {
                 );
                 self.set_order_pending(side, cl_ord_id.clone(), new_price, qty, current_time_ns);
                 self.stats.orders_sent += 1;
+                self.last_order_sent_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
                 Some(OrderDecision::Send {
                     side,
                     price: new_price,
@@ -689,19 +701,70 @@ impl OrderManager {
                 self.config.symbol, self.consecutive_rejections
             );
             self.paused.store(true, Ordering::Release);
+            // Record when circuit breaker was triggered
+            self.circuit_breaker_triggered_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
         }
     }
 
     /// Reset circuit breaker and resume trading.
     pub fn reset_circuit_breaker(&mut self) {
         self.consecutive_rejections = 0;
+        self.circuit_breaker_triggered_at_ms = 0;
         self.paused.store(false, Ordering::Release);
         info!("[{}] Circuit breaker reset, trading resumed", self.config.symbol);
+    }
+
+    /// Check if circuit breaker should auto-recover.
+    /// Returns true if recovery occurred.
+    pub fn check_circuit_breaker_recovery(&mut self, recovery_secs: u64) -> bool {
+        // Only check if circuit breaker is active and auto-recovery is enabled
+        if recovery_secs == 0 || self.circuit_breaker_triggered_at_ms == 0 {
+            return false;
+        }
+
+        // Don't recover if not actually paused (could be WS disconnect)
+        if !self.paused.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let elapsed_secs = (now_ms - self.circuit_breaker_triggered_at_ms) / 1000;
+
+        if elapsed_secs >= recovery_secs {
+            warn!(
+                "[{}] CIRCUIT BREAKER AUTO-RECOVERY: {} seconds elapsed, resuming trading",
+                self.config.symbol, elapsed_secs
+            );
+            self.reset_circuit_breaker();
+            return true;
+        }
+
+        false
     }
 
     /// Get consecutive rejection count.
     pub fn consecutive_rejections(&self) -> u32 {
         self.consecutive_rejections
+    }
+
+    /// Get seconds since last order was sent.
+    /// Returns None if no order has ever been sent.
+    pub fn seconds_since_last_order(&self) -> Option<u64> {
+        if self.last_order_sent_at_ms == 0 {
+            return None;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        Some((now_ms - self.last_order_sent_at_ms) / 1000)
     }
 
     /// Called when an order is canceled.
@@ -836,6 +899,10 @@ impl OrderManager {
                 );
                 self.set_order_pending(Side::Buy, cl_ord_id.clone(), price, qty, current_time_ns);
                 self.stats.orders_sent += 1;
+                self.last_order_sent_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
                 decisions.push(OrderDecision::Send {
                     side: Side::Buy,
                     price,
@@ -855,6 +922,10 @@ impl OrderManager {
                 );
                 self.set_order_pending(Side::Sell, cl_ord_id.clone(), price, qty, current_time_ns);
                 self.stats.orders_sent += 1;
+                self.last_order_sent_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
                 decisions.push(OrderDecision::Send {
                     side: Side::Sell,
                     price,
