@@ -44,7 +44,8 @@ High-performance market making system for the StandX perpetual futures exchange,
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.70+ (for local development)
+- Docker & Docker Compose (for deployment)
 - StandX API credentials (set in `.env`)
 
 ### Setup
@@ -58,9 +59,24 @@ cargo build --release
 cp .env.example .env
 # Edit .env with your wallet address and private key
 
-# Run
+# Run locally
 cargo run --release
 ```
+
+### Docker Deployment
+
+```bash
+# Configure deployment settings in .env
+# Then deploy to remote server
+./deploy.sh
+```
+
+The deploy script will:
+1. Sync code to the remote server
+2. Build the Docker image
+3. Stop existing container (gracefully cancels orders)
+4. Start new container
+5. Show logs (Ctrl+C to exit, container keeps running)
 
 ### Environment Variables
 
@@ -70,6 +86,10 @@ Copy `.env.example` to `.env` and configure:
 |----------|-------------|
 | `WALLET_AD` | Your wallet address (0x...) |
 | `PRIVATE_KEY` | Your private key (without 0x prefix) |
+| `DEPLOY_USER` | SSH username for deployment |
+| `DEPLOY_HOST` | Server IP/hostname for deployment |
+| `DEPLOY_SSH_KEY` | Path to SSH private key |
+| `DEPLOY_DIR` | Remote directory (default: ~/standx-bot) |
 
 ### Configuration
 

@@ -1,0 +1,17 @@
+services:
+  market-maker:
+    build: .
+    image: standx-mm:latest
+    container_name: standx-market-maker
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Config file (read-only)
+      - ./config.json:/app/config.json:ro
+      # Data directory for wallet_history.csv persistence
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
