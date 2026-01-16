@@ -313,7 +313,7 @@ fn default_order_enabled() -> bool { false } // Disabled by default for safety
 fn default_reprice_threshold_bps() -> f64 { 1.0 }
 fn default_pending_timeout_secs() -> u64 { 5 }
 fn default_max_live_age_secs() -> u64 { 60 }
-fn default_max_reconnect_attempts() -> u32 { 10 }
+fn default_max_reconnect_attempts() -> u32 { 0 } // 0 = unlimited retries
 fn default_circuit_breaker_rejections() -> u32 { 5 }
 fn default_circuit_breaker_recovery_secs() -> u64 { 300 } // 5 minutes default
 

@@ -147,6 +147,8 @@ Edit `config.json`:
 | `pending_timeout_secs` | Order confirmation timeout | `30` |
 | `max_live_age_secs` | Max order age before refresh | `60` |
 | `circuit_breaker_rejections` | Pause after N consecutive rejections (0=disabled) | `5` |
+| `circuit_breaker_recovery_secs` | Auto-resume trading after N seconds (0=manual reset required) | `300` |
+| `max_reconnect_attempts` | Max WebSocket reconnect attempts (0=unlimited) | `0` |
 
 ### PnL Tracking (`pnl_tracking` section)
 
@@ -264,7 +266,7 @@ ask_price = fair_price + half_spread * (1 - skew * normalized_position)
 - **Order timeout**: Clears stuck orders after pending_timeout_secs
 - **Circuit breaker**: Pauses trading after N consecutive rejections
 - **Open orders checker**: Background polling detects stale/imbalanced orders on exchange
-- **Auto-reconnect**: WebSocket reconnection with exponential backoff
+- **Auto-reconnect**: WebSocket reconnection with exponential backoff (retries indefinitely by default)
 
 ## License
 
