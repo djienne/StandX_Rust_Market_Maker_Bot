@@ -32,7 +32,7 @@ impl SymbolOrderbook {
     ///
     /// # Arguments
     ///
-    /// * `symbol` - Trading symbol (e.g., "BTC-USD")
+    /// * `symbol` - Trading symbol (e.g., "TEST-USD")
     /// * `history_capacity` - Number of historical snapshots to store
     /// * `retention_minutes` - How long to retain historical data
     pub fn new(symbol: &str, history_capacity: usize, retention_minutes: u64) -> Self {
@@ -222,9 +222,9 @@ mod tests {
 
     #[test]
     fn test_symbol_orderbook() {
-        let ob = SymbolOrderbook::new("BTC-USD", 1000, 10);
+        let ob = SymbolOrderbook::new("TEST-USD", 1000, 10);
 
-        let mut snapshot = OrderbookSnapshot::new(crate::types::Symbol::new("BTC-USD"));
+        let mut snapshot = OrderbookSnapshot::new(crate::types::Symbol::new("TEST-USD"));
         snapshot.set_bids(&[(100.0, 1.0)], 20);
         snapshot.set_asks(&[(101.0, 1.0)], 20);
 
@@ -238,13 +238,13 @@ mod tests {
     #[test]
     fn test_orderbook_store() {
         let store = OrderbookStore::new(
-            &["BTC-USD".to_string(), "ETH-USD".to_string()],
+            &["TEST-USD".to_string(), "ETH-USD".to_string()],
             1000,
             10,
         );
 
         assert_eq!(store.len(), 2);
-        assert!(store.get("BTC-USD").is_some());
+        assert!(store.get("TEST-USD").is_some());
         assert!(store.get("ETH-USD").is_some());
         assert!(store.get("SOL-USD").is_none());
     }

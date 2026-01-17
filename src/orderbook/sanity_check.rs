@@ -186,17 +186,37 @@ impl OrderbookSanityChecker {
         }
     }
 
+    #[inline]
+    fn best_bid_from_levels(&self, levels: &[[String; 2]]) -> f64 {
+        let mut best = 0.0;
+        for [price_str, _] in levels {
+            if let Ok(price) = fast_float::parse::<f64, _>(price_str) {
+                if price > best {
+                    best = price;
+                }
+            }
+        }
+        best
+    }
+
+    #[inline]
+    fn best_ask_from_levels(&self, levels: &[[String; 2]]) -> f64 {
+        let mut best: Option<f64> = None;
+        for [price_str, _] in levels {
+            if let Ok(price) = fast_float::parse::<f64, _>(price_str) {
+                if price > 0.0 {
+                    best = Some(best.map_or(price, |current| current.min(price)));
+                }
+            }
+        }
+        best.unwrap_or(0.0)
+    }
+
     /// Calculate drift in basis points for bid and ask.
     fn calculate_drift(&self, ws_book: &OrderbookSnapshot, rest_book: &DepthBookResponse) -> (f64, f64) {
-        // Parse REST best bid/ask
-        // Note: REST API returns bids sorted ASCENDING, so last() = best (highest) bid
-        let rest_bid = rest_book.bids.last()
-            .and_then(|[p, _]| p.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        // REST API returns asks sorted ASCENDING, so first() = best (lowest) ask
-        let rest_ask = rest_book.asks.first()
-            .and_then(|[p, _]| p.parse::<f64>().ok())
-            .unwrap_or(0.0);
+        // Parse REST best bid/ask without assuming ordering.
+        let rest_bid = self.best_bid_from_levels(&rest_book.bids);
+        let rest_ask = self.best_ask_from_levels(&rest_book.asks);
 
         // Get WS best bid/ask
         let ws_bid = ws_book.best_bid_price().unwrap_or(0.0);

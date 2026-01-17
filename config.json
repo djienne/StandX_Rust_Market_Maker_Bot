@@ -15,18 +15,18 @@
     "stale_timeout_secs": 60
   },
   "strategy": {
-    "order_qty_dollar": 20.0,
+    "order_qty_dollar": 100.0,
     "tick_size": 0.01,
     "lot_size": 0.0001,
     "step_ns": 100000000,
     "window_steps": 6000,
     "update_interval_steps": 1,
-    "vol_to_half_spread": 20.0,
+    "vol_to_half_spread": 32.0,
     "half_spread": 0.0,
     "half_spread_bps": 0.0,
-    "skew": 26.0,
-    "max_position_dollar": 400.0,
-    "c1_ticks": 360.0,
+    "skew": 5.0,
+    "max_position_dollar": 399.0,
+    "c1_ticks": 605.0,
     "looking_depth": 0.025
   },
   "order": {

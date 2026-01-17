@@ -26,7 +26,7 @@
 //! let mut rx = order_client.connect().await?;
 //!
 //! // Place a limit order
-//! let order = NewOrderRequest::limit_buy("BTC-USD", 90000.0, 0.001);
+//! let order = NewOrderRequest::limit_buy("TEST-USD", 90000.0, 0.001);
 //! let cl_ord_id = order_client.place_order(&order).await?;
 //! ```
 

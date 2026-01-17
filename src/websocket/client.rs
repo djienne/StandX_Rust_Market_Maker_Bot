@@ -315,7 +315,7 @@ impl WsClientBuilder {
         Self {
             url: default_config.url.clone(),
             reconnect_config: default_config.to_reconnect_config(),
-            symbols: vec!["BTC-USD".to_string()],
+            symbols: vec!["TEST-USD".to_string()],
         }
     }
 
@@ -388,7 +388,7 @@ mod tests {
     fn test_builder() {
         let client = WsClientBuilder::new()
             .url("wss://test.example.com/ws")
-            .symbols(vec!["BTC-USD".to_string(), "ETH-USD".to_string()])
+            .symbols(vec!["TEST-USD".to_string(), "ETH-USD".to_string()])
             .reconnect_delay(10)
             .build();
 

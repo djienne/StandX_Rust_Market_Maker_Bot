@@ -246,7 +246,7 @@ mod tests {
 
     fn sample_quote() -> Quote {
         Quote {
-            symbol: Symbol::new("BTC-USD"),
+            symbol: Symbol::new("TEST-USD"),
             bid_price: 99999.50,
             ask_price: 100000.50,
             quantity: 0.001,
@@ -290,7 +290,7 @@ mod tests {
         let formatter = QuoteFormatter::default();
         let output = formatter.format_oneline(&quote);
 
-        assert!(output.contains("BTC-USD"));
+        assert!(output.contains("TEST-USD"));
         assert!(output.contains("bid="));
         assert!(output.contains("ask="));
         assert!(output.contains("bp"));
@@ -302,7 +302,7 @@ mod tests {
         let formatter = QuoteFormatter::default();
         let output = formatter.format_multiline(&quote);
 
-        assert!(output.contains("BTC-USD"));
+        assert!(output.contains("TEST-USD"));
         assert!(output.contains("mid="));
         assert!(output.contains("Quote:"));
         assert!(output.contains("Size:"));

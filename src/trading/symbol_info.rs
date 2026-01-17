@@ -206,7 +206,7 @@ impl Default for SymbolInfoPollerConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(30),
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
         }
     }
 }
@@ -384,8 +384,8 @@ mod tests {
 
     #[test]
     fn test_shared_symbol_info_new() {
-        let info = SharedSymbolInfo::new("BTC-USD", 0.01, 0.0001);
-        assert_eq!(info.symbol(), "BTC-USD");
+        let info = SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001);
+        assert_eq!(info.symbol(), "TEST-USD");
         assert_eq!(info.tick_size(), 0.01);
         assert_eq!(info.lot_size(), 0.0001);
         assert_eq!(info.price_tick_decimals(), 2);
@@ -409,12 +409,12 @@ mod tests {
 
     #[test]
     fn test_shared_symbol_info_update() {
-        let info = SharedSymbolInfo::new("BTC-USD", 0.01, 0.0001);
+        let info = SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001);
         assert_eq!(info.generation(), 0);
 
         // Same values - no change
         let api_info = SymbolInfo {
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             price_tick_decimals: 2,
             qty_tick_decimals: 4,
         };
@@ -424,7 +424,7 @@ mod tests {
 
         // Different tick_size - should detect change
         let api_info = SymbolInfo {
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             price_tick_decimals: 1, // 0.1 instead of 0.01
             qty_tick_decimals: 4,
         };
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_atomic_operations() {
-        let info = Arc::new(SharedSymbolInfo::new("BTC-USD", 0.01, 0.0001));
+        let info = Arc::new(SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001));
 
         // Simulate concurrent reads
         let info_clone = Arc::clone(&info);
@@ -457,16 +457,16 @@ mod tests {
     fn test_poller_config_default() {
         let config = SymbolInfoPollerConfig::default();
         assert_eq!(config.interval, Duration::from_secs(30));
-        assert_eq!(config.symbol, "BTC-USD");
+        assert_eq!(config.symbol, "TEST-USD");
     }
 
     #[test]
     fn test_try_update_rejects_invalid_values() {
-        let info = SharedSymbolInfo::new("BTC-USD", 0.01, 0.0001);
+        let info = SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001);
 
         // Valid update should succeed
         let valid_info = SymbolInfo {
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             price_tick_decimals: 1, // 0.1
             qty_tick_decimals: 3,   // 0.001
         };
@@ -479,7 +479,7 @@ mod tests {
 
         // Test that valid values work
         let valid_info = SymbolInfo {
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             price_tick_decimals: 2,
             qty_tick_decimals: 4,
         };

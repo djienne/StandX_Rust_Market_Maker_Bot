@@ -377,13 +377,13 @@ mod tests {
 
     #[test]
     fn test_order_request_validation() {
-        let valid = OrderRequest::limit_buy("BTC-USD", 50000.0, 0.1);
+        let valid = OrderRequest::limit_buy("TEST-USD", 50000.0, 0.1);
         assert!(valid.validate().is_ok());
 
-        let no_qty = OrderRequest::limit_buy("BTC-USD", 50000.0, 0.0);
+        let no_qty = OrderRequest::limit_buy("TEST-USD", 50000.0, 0.0);
         assert!(no_qty.validate().is_err());
 
-        let market_no_price = OrderRequest::market_buy("BTC-USD", 0.1);
+        let market_no_price = OrderRequest::market_buy("TEST-USD", 0.1);
         assert!(market_no_price.validate().is_ok());
     }
 

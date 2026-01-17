@@ -96,7 +96,7 @@ impl Default for PositionPollerConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(2),
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             stale_threshold: Duration::from_secs(10),
         }
     }
@@ -273,9 +273,9 @@ mod tests {
 
     #[test]
     fn test_shared_position() {
-        let pos = SharedPosition::new("BTC-USD");
+        let pos = SharedPosition::new("TEST-USD");
         assert_eq!(pos.get(), 0.0);
-        assert_eq!(pos.symbol(), "BTC-USD");
+        assert_eq!(pos.symbol(), "TEST-USD");
 
         pos.set(1.5);
         assert_eq!(pos.get(), 1.5);
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_atomic_operations() {
-        let pos = Arc::new(SharedPosition::new("BTC-USD"));
+        let pos = Arc::new(SharedPosition::new("TEST-USD"));
 
         // Simulate concurrent reads
         let pos_clone = Arc::clone(&pos);

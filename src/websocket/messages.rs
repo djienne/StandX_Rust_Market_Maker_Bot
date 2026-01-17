@@ -297,7 +297,7 @@ mod tests {
             "seq": 1,
             "channel": "depth_book",
             "data": {
-                "symbol": "BTC-USD",
+                "symbol": "TEST-USD",
                 "asks": [["101.00", "1.0"], ["102.00", "2.0"]],
                 "bids": [["100.00", "1.0"], ["99.00", "2.0"]],
                 "sequence": 12345,
@@ -308,7 +308,7 @@ mod tests {
         let msg = StandXMessage::parse_str(json).unwrap();
         match msg {
             StandXMessage::DepthBook(data) => {
-                assert_eq!(data.symbol, "BTC-USD");
+                assert_eq!(data.symbol, "TEST-USD");
                 assert_eq!(data.asks.len(), 2);
                 assert_eq!(data.bids.len(), 2);
                 assert_eq!(data.sequence, Some(12345));
@@ -327,7 +327,7 @@ mod tests {
             "seq": 1,
             "channel": "public_trade",
             "data": {
-                "symbol": "BTC-USD",
+                "symbol": "TEST-USD",
                 "price": "121720.18",
                 "qty": "0.01",
                 "quote_qty": "1217.2018",
@@ -339,7 +339,7 @@ mod tests {
         let msg = StandXMessage::parse_str(json).unwrap();
         match msg {
             StandXMessage::Trade(data) => {
-                assert_eq!(data.symbol, "BTC-USD");
+                assert_eq!(data.symbol, "TEST-USD");
                 assert_eq!(data.price, "121720.18");
                 assert!(data.is_buyer_taker);
             }
@@ -366,8 +366,8 @@ mod tests {
 
     #[test]
     fn test_subscribe_message() {
-        let msg = subscribe_message("depth_book", "BTC-USD");
+        let msg = subscribe_message("depth_book", "TEST-USD");
         assert!(msg.contains("depth_book"));
-        assert!(msg.contains("BTC-USD"));
+        assert!(msg.contains("TEST-USD"));
     }
 }

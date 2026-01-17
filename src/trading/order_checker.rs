@@ -53,7 +53,7 @@ impl Default for OpenOrdersCheckerConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(3),
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             debounce_count: 2, // 2 consecutive polls = 6 seconds
             max_order_age_secs: 120, // 2 minutes
         }

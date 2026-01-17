@@ -141,7 +141,7 @@ pub struct OrderManagerConfig {
 impl Default for OrderManagerConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTC-USD".to_string(),
+            symbol: "TEST-USD".to_string(),
             reprice_threshold_bps: 1.0,
             max_position_dollar: 500.0,
             pending_timeout_ns: 5_000_000_000, // 5 seconds
@@ -1097,12 +1097,12 @@ mod tests {
     use super::*;
 
     fn create_test_position() -> Arc<SharedPosition> {
-        Arc::new(SharedPosition::new("BTC-USD".to_string()))
+        Arc::new(SharedPosition::new("TEST-USD".to_string()))
     }
 
     fn create_test_quote(bid: f64, ask: f64, qty: f64) -> Quote {
         Quote {
-            symbol: "BTC-USD".into(),
+            symbol: "TEST-USD".into(),
             bid_price: bid,
             ask_price: ask,
             quantity: qty,

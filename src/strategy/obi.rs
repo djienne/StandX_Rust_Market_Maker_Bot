@@ -354,27 +354,8 @@ impl ObiStrategy {
         // Adjust half-spread based on position
         // When long (positive position), increase bid depth (push bid down)
         // When short (negative position), increase ask depth (push ask up)
-        let bid_depth_tick_raw = (half_spread_tick * (1.0 + self.config.skew * clamped_position)).max(0.0);
-        let ask_depth_tick_raw = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
-
-        // Enforce minimum spread floor AFTER skew adjustment (in bps from mid)
-        // Pre-compute min_depth_tick once (avoids duplicate division)
-        let min_depth_tick = if self.config.min_half_spread_bps > 0.0 {
-            mid_price * (self.config.min_half_spread_bps / 10000.0) / tick_size
-        } else {
-            0.0
-        };
-
-        let (bid_depth_tick, bid_floored) = if min_depth_tick > 0.0 && bid_depth_tick_raw < min_depth_tick {
-            (min_depth_tick, true)
-        } else {
-            (bid_depth_tick_raw, false)
-        };
-        let (ask_depth_tick, ask_floored) = if min_depth_tick > 0.0 && ask_depth_tick_raw < min_depth_tick {
-            (min_depth_tick, true)
-        } else {
-            (ask_depth_tick_raw, false)
-        };
+        let bid_depth_tick = (half_spread_tick * (1.0 + self.config.skew * clamped_position)).max(0.0);
+        let ask_depth_tick = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
 
         // Calculate raw quote prices
         let raw_bid = fair_price - bid_depth_tick * tick_size;
@@ -384,9 +365,35 @@ impl ObiStrategy {
         let clamped_bid = raw_bid.min(best_bid);
         let clamped_ask = raw_ask.max(best_ask);
 
+        // Apply floor AFTER BBO clamping
+        // Floor ensures minimum distance from mid_price
+        // If bid is too close (above mid - floor), push it down
+        // If ask is too close (below mid + floor), push it up
+        let (floored_bid, bid_floored) = if self.config.min_half_spread_bps > 0.0 {
+            let min_bid = mid_price * (1.0 - self.config.min_half_spread_bps / 10000.0);
+            if clamped_bid > min_bid {
+                (min_bid, true)
+            } else {
+                (clamped_bid, false)
+            }
+        } else {
+            (clamped_bid, false)
+        };
+
+        let (floored_ask, ask_floored) = if self.config.min_half_spread_bps > 0.0 {
+            let min_ask = mid_price * (1.0 + self.config.min_half_spread_bps / 10000.0);
+            if clamped_ask < min_ask {
+                (min_ask, true)
+            } else {
+                (clamped_ask, false)
+            }
+        } else {
+            (clamped_ask, false)
+        };
+
         // Snap to tick grid
-        let bid_price = (clamped_bid / tick_size).floor() * tick_size;
-        let ask_price = (clamped_ask / tick_size).ceil() * tick_size;
+        let bid_price = (floored_bid / tick_size).floor() * tick_size;
+        let ask_price = (floored_ask / tick_size).ceil() * tick_size;
 
         // Calculate quantity (round to lot_size, ensure minimum)
         let order_qty = self.config.order_qty_dollar / mid_price;
@@ -533,7 +540,7 @@ mod tests {
     }
 
     fn create_snapshot(best_bid: f64, best_ask: f64) -> OrderbookSnapshot {
-        let mut snapshot = OrderbookSnapshot::new(Symbol::new("BTC-USD"));
+        let mut snapshot = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
 
         // Add bid and ask levels
         let bids = vec![
@@ -623,7 +630,7 @@ mod tests {
         let strategy = ObiStrategy::new(config);
 
         // Create snapshot with more bids than asks
-        let mut snapshot = OrderbookSnapshot::new(Symbol::new("BTC-USD"));
+        let mut snapshot = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
         let bids = vec![
             (99.99, 10.0),  // Large bid
             (99.98, 5.0),

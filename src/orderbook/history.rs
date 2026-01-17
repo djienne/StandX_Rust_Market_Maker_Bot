@@ -292,7 +292,7 @@ mod tests {
         assert!(history.is_empty());
         assert!(history.latest().is_none());
 
-        let mut snapshot = OrderbookSnapshot::new(Symbol::new("BTC-USD"));
+        let mut snapshot = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
         snapshot.sequence = 1;
         snapshot.timestamp_ns = 1000;
         history.push(snapshot);
@@ -310,7 +310,7 @@ mod tests {
 
         // Write more than capacity
         for i in 0..25 {
-            let mut snapshot = OrderbookSnapshot::new(Symbol::new("BTC-USD"));
+            let mut snapshot = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
             snapshot.sequence = i;
             history.push(snapshot);
         }
@@ -327,7 +327,7 @@ mod tests {
     fn test_symbol_filter() {
         let history = OrderbookHistory::new(100, 10);
 
-        let mut btc = OrderbookSnapshot::new(Symbol::new("BTC-USD"));
+        let mut btc = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
         btc.sequence = 1;
         history.push(btc);
 
@@ -335,7 +335,7 @@ mod tests {
         eth.sequence = 2;
         history.push(eth);
 
-        let latest_btc = history.latest_for_symbol(&Symbol::new("BTC-USD")).unwrap();
+        let latest_btc = history.latest_for_symbol(&Symbol::new("TEST-USD")).unwrap();
         assert_eq!(latest_btc.sequence, 1);
 
         let latest_eth = history.latest_for_symbol(&Symbol::new("ETH-USD")).unwrap();

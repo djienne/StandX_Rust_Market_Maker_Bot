@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_triple_buffer_basic() {
-        let ob = CurrentOrderbook::new(Symbol::new("BTC-USD"));
+        let ob = CurrentOrderbook::new(Symbol::new("TEST-USD"));
 
         // Initially no data
         assert!(!ob.has_data());
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_triple_buffer_updates() {
-        let ob = CurrentOrderbook::new(Symbol::new("BTC-USD"));
+        let ob = CurrentOrderbook::new(Symbol::new("TEST-USD"));
 
         // Multiple updates
         for i in 0..10 {
@@ -316,11 +316,11 @@ mod tests {
 
     #[test]
     fn test_orderbook_manager() {
-        let manager = OrderbookManager::new(&["BTC-USD".to_string(), "ETH-USD".to_string()]);
+        let manager = OrderbookManager::new(&["TEST-USD".to_string(), "ETH-USD".to_string()]);
 
         assert_eq!(manager.len(), 2);
 
-        let btc = manager.get("BTC-USD").unwrap();
+        let btc = manager.get("TEST-USD").unwrap();
         btc.update(|s| {
             s.bids[0] = PriceLevel::new(50000.0, 1.0);
             s.bid_count = 1;
@@ -332,7 +332,7 @@ mod tests {
             s.bid_count = 1;
         });
 
-        assert_eq!(manager.get("BTC-USD").unwrap().best_bid(), Some(50000.0));
+        assert_eq!(manager.get("TEST-USD").unwrap().best_bid(), Some(50000.0));
         assert_eq!(manager.get("ETH-USD").unwrap().best_bid(), Some(3000.0));
         assert!(manager.get("SOL-USD").is_none());
     }

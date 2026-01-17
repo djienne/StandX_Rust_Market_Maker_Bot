@@ -11,6 +11,13 @@ use std::fmt;
 /// This is a compile-time constant to enable fixed-size arrays.
 pub const MAX_LEVELS: usize = 50;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriceOrder {
+    Ascending,
+    Descending,
+    Unknown,
+}
+
 /// A single price level in the orderbook.
 ///
 /// Uses f64 for performance. For applications requiring exact decimal
@@ -123,7 +130,7 @@ impl AsRef<str> for Symbol {
 /// - Sequence number for consistency checks
 #[derive(Clone)]
 pub struct OrderbookSnapshot {
-    /// Trading symbol (e.g., "BTC-USD")
+    /// Trading symbol (e.g., "TEST-USD")
     pub symbol: Symbol,
 
     /// Server timestamp in nanoseconds since Unix epoch
@@ -398,28 +405,108 @@ impl OrderbookSnapshot {
         }
     }
 
+    #[inline]
+    fn detect_price_order(levels: &[(String, String)]) -> PriceOrder {
+        let mut prev: Option<f64> = None;
+        let mut direction = PriceOrder::Unknown;
+
+        for (price_str, _) in levels.iter() {
+            let price = match fast_float::parse::<f64, _>(price_str) {
+                Ok(price) if price > 0.0 => price,
+                _ => continue,
+            };
+
+            if let Some(prev_price) = prev {
+                if direction == PriceOrder::Unknown {
+                    if price > prev_price {
+                        direction = PriceOrder::Ascending;
+                    } else if price < prev_price {
+                        direction = PriceOrder::Descending;
+                    }
+                } else if (direction == PriceOrder::Ascending && price < prev_price)
+                    || (direction == PriceOrder::Descending && price > prev_price)
+                {
+                    return PriceOrder::Unknown;
+                }
+            }
+
+            prev = Some(price);
+        }
+
+        direction
+    }
+
     /// Set bid levels directly from string slices, parsing in-place.
     ///
     /// This avoids intermediate Vec allocation by parsing directly into fixed arrays.
-    /// IMPORTANT: WebSocket sends bids in ASCENDING order (lowest first, best/highest last).
-    /// We iterate in REVERSE to get the best (highest price) bids first.
+    /// Detects ascending vs descending input ordering to keep best levels
+    /// even if the feed flips its sort direction.
     /// Sorts bids descending (best bid first) to ensure correctness.
     #[inline]
     pub fn set_bids_from_strings(&mut self, levels: &[(String, String)], max_levels: usize) {
+        let order = Self::detect_price_order(levels);
         let mut count = 0;
         let limit = max_levels.min(MAX_LEVELS);
-        // Iterate in REVERSE: bids arrive in ascending order, so best bids are at the END
-        for (price_str, qty_str) in levels.iter().rev() {
-            if count >= limit {
-                break;
+        match order {
+            PriceOrder::Ascending => {
+                // Bids arrive low->high, so iterate in reverse to get best bids first.
+                for (price_str, qty_str) in levels.iter().rev() {
+                    if count >= limit {
+                        break;
+                    }
+                    if let (Ok(price), Ok(qty)) = (
+                        fast_float::parse::<f64, _>(price_str),
+                        fast_float::parse::<f64, _>(qty_str),
+                    ) {
+                        if price > 0.0 && qty > 0.0 {
+                            self.bids[count] = PriceLevel::new(price, qty);
+                            count += 1;
+                        }
+                    }
+                }
             }
-            if let (Ok(price), Ok(qty)) = (
-                fast_float::parse::<f64, _>(price_str),
-                fast_float::parse::<f64, _>(qty_str),
-            ) {
-                if price > 0.0 && qty > 0.0 {
-                    self.bids[count] = PriceLevel::new(price, qty);
-                    count += 1;
+            PriceOrder::Descending => {
+                // Bids arrive high->low, so iterate in order to keep best bids.
+                for (price_str, qty_str) in levels.iter() {
+                    if count >= limit {
+                        break;
+                    }
+                    if let (Ok(price), Ok(qty)) = (
+                        fast_float::parse::<f64, _>(price_str),
+                        fast_float::parse::<f64, _>(qty_str),
+                    ) {
+                        if price > 0.0 && qty > 0.0 {
+                            self.bids[count] = PriceLevel::new(price, qty);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            PriceOrder::Unknown => {
+                for (price_str, qty_str) in levels.iter() {
+                    if let (Ok(price), Ok(qty)) = (
+                        fast_float::parse::<f64, _>(price_str),
+                        fast_float::parse::<f64, _>(qty_str),
+                    ) {
+                        if price > 0.0 && qty > 0.0 {
+                            if count < limit {
+                                self.bids[count] = PriceLevel::new(price, qty);
+                                count += 1;
+                            } else if limit > 0 {
+                                let mut worst_idx = 0;
+                                let mut worst_price = self.bids[0].price;
+                                for i in 1..count {
+                                    if self.bids[i].price < worst_price {
+                                        worst_price = self.bids[i].price;
+                                        worst_idx = i;
+                                    }
+                                }
+                                if price > worst_price {
+                                    self.bids[worst_idx] = PriceLevel::new(price, qty);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -439,22 +526,72 @@ impl OrderbookSnapshot {
     /// Set ask levels directly from string slices, parsing in-place.
     ///
     /// This avoids intermediate Vec allocation by parsing directly into fixed arrays.
+    /// Detects ascending vs descending input ordering to keep best levels
+    /// even if the feed flips its sort direction.
     /// Sorts asks ascending (best ask first) to ensure correctness.
     #[inline]
     pub fn set_asks_from_strings(&mut self, levels: &[(String, String)], max_levels: usize) {
+        let order = Self::detect_price_order(levels);
         let mut count = 0;
         let limit = max_levels.min(MAX_LEVELS);
-        for (price_str, qty_str) in levels.iter() {
-            if count >= limit {
-                break;
+        match order {
+            PriceOrder::Ascending => {
+                for (price_str, qty_str) in levels.iter() {
+                    if count >= limit {
+                        break;
+                    }
+                    if let (Ok(price), Ok(qty)) = (
+                        fast_float::parse::<f64, _>(price_str),
+                        fast_float::parse::<f64, _>(qty_str),
+                    ) {
+                        if price > 0.0 && qty > 0.0 {
+                            self.asks[count] = PriceLevel::new(price, qty);
+                            count += 1;
+                        }
+                    }
+                }
             }
-            if let (Ok(price), Ok(qty)) = (
-                fast_float::parse::<f64, _>(price_str),
-                fast_float::parse::<f64, _>(qty_str),
-            ) {
-                if price > 0.0 && qty > 0.0 {
-                    self.asks[count] = PriceLevel::new(price, qty);
-                    count += 1;
+            PriceOrder::Descending => {
+                for (price_str, qty_str) in levels.iter().rev() {
+                    if count >= limit {
+                        break;
+                    }
+                    if let (Ok(price), Ok(qty)) = (
+                        fast_float::parse::<f64, _>(price_str),
+                        fast_float::parse::<f64, _>(qty_str),
+                    ) {
+                        if price > 0.0 && qty > 0.0 {
+                            self.asks[count] = PriceLevel::new(price, qty);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            PriceOrder::Unknown => {
+                for (price_str, qty_str) in levels.iter() {
+                    if let (Ok(price), Ok(qty)) = (
+                        fast_float::parse::<f64, _>(price_str),
+                        fast_float::parse::<f64, _>(qty_str),
+                    ) {
+                        if price > 0.0 && qty > 0.0 {
+                            if count < limit {
+                                self.asks[count] = PriceLevel::new(price, qty);
+                                count += 1;
+                            } else if limit > 0 {
+                                let mut worst_idx = 0;
+                                let mut worst_price = self.asks[0].price;
+                                for i in 1..count {
+                                    if self.asks[i].price > worst_price {
+                                        worst_price = self.asks[i].price;
+                                        worst_idx = i;
+                                    }
+                                }
+                                if price < worst_price {
+                                    self.asks[worst_idx] = PriceLevel::new(price, qty);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -490,6 +627,8 @@ impl fmt::Debug for OrderbookSnapshot {
 mod tests {
     use super::*;
 
+    const TEST_SYMBOL: &str = "TST-USD";
+
     #[test]
     fn test_price_level() {
         let level = PriceLevel::new(100.0, 1.5);
@@ -502,8 +641,8 @@ mod tests {
 
     #[test]
     fn test_symbol() {
-        let symbol = Symbol::new("BTC-USD");
-        assert_eq!(symbol.as_str(), "BTC-USD");
+        let symbol = Symbol::new(TEST_SYMBOL);
+        assert_eq!(symbol.as_str(), TEST_SYMBOL);
         assert_eq!(symbol.len(), 7);
 
         // Test truncation
@@ -513,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_orderbook_snapshot() {
-        let mut ob = OrderbookSnapshot::new(Symbol::new("BTC-USD"));
+        let mut ob = OrderbookSnapshot::new(Symbol::new(TEST_SYMBOL));
 
         ob.set_bids(&[(100.0, 1.0), (99.0, 2.0), (98.0, 3.0)], 20);
         ob.set_asks(&[(101.0, 1.0), (102.0, 2.0), (103.0, 3.0)], 20);
@@ -523,5 +662,73 @@ mod tests {
         assert_eq!(ob.spread(), Some(1.0));
         assert_eq!(ob.mid_price(), Some(100.5));
         assert!(ob.is_valid());
+    }
+
+    #[test]
+    fn test_set_bids_from_strings_descending() {
+        let mut ob = OrderbookSnapshot::new(Symbol::new(TEST_SYMBOL));
+        let bids = vec![
+            ("100.0".to_string(), "1.0".to_string()),
+            ("99.0".to_string(), "1.0".to_string()),
+            ("98.0".to_string(), "1.0".to_string()),
+        ];
+
+        ob.set_bids_from_strings(&bids, 2);
+
+        let bid_levels = ob.bid_levels();
+        assert_eq!(bid_levels.len(), 2);
+        assert_eq!(bid_levels[0].price, 100.0);
+        assert_eq!(bid_levels[1].price, 99.0);
+    }
+
+    #[test]
+    fn test_set_asks_from_strings_descending() {
+        let mut ob = OrderbookSnapshot::new(Symbol::new(TEST_SYMBOL));
+        let asks = vec![
+            ("103.0".to_string(), "1.0".to_string()),
+            ("102.0".to_string(), "1.0".to_string()),
+            ("101.0".to_string(), "1.0".to_string()),
+        ];
+
+        ob.set_asks_from_strings(&asks, 2);
+
+        let ask_levels = ob.ask_levels();
+        assert_eq!(ask_levels.len(), 2);
+        assert_eq!(ask_levels[0].price, 101.0);
+        assert_eq!(ask_levels[1].price, 102.0);
+    }
+
+    #[test]
+    fn test_set_bids_from_strings_unsorted() {
+        let mut ob = OrderbookSnapshot::new(Symbol::new(TEST_SYMBOL));
+        let bids = vec![
+            ("99.0".to_string(), "1.0".to_string()),
+            ("101.0".to_string(), "1.0".to_string()),
+            ("100.0".to_string(), "1.0".to_string()),
+        ];
+
+        ob.set_bids_from_strings(&bids, 2);
+
+        let bid_levels = ob.bid_levels();
+        assert_eq!(bid_levels.len(), 2);
+        assert_eq!(bid_levels[0].price, 101.0);
+        assert_eq!(bid_levels[1].price, 100.0);
+    }
+
+    #[test]
+    fn test_set_asks_from_strings_unsorted() {
+        let mut ob = OrderbookSnapshot::new(Symbol::new(TEST_SYMBOL));
+        let asks = vec![
+            ("102.0".to_string(), "1.0".to_string()),
+            ("100.0".to_string(), "1.0".to_string()),
+            ("101.0".to_string(), "1.0".to_string()),
+        ];
+
+        ob.set_asks_from_strings(&asks, 2);
+
+        let ask_levels = ob.ask_levels();
+        assert_eq!(ask_levels.len(), 2);
+        assert_eq!(ask_levels[0].price, 100.0);
+        assert_eq!(ask_levels[1].price, 101.0);
     }
 }

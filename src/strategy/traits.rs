@@ -67,7 +67,7 @@ pub trait QuoteStrategy {
 
     /// Set the current position for skew calculation.
     ///
-    /// Position is in base asset units (e.g., BTC for BTC-USD).
+    /// Position is in base asset units (e.g., BTC for TEST-USD).
     /// - Positive = long position
     /// - Negative = short position
     ///

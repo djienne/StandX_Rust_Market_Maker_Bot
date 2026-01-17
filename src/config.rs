@@ -476,7 +476,7 @@ pub struct Config {
 }
 
 fn default_symbols() -> Vec<String> {
-    vec!["BTC-USD".to_string()]
+    vec!["TEST-USD".to_string()]
 }
 
 fn default_orderbook_levels() -> usize {
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.symbols, vec!["BTC-USD"]);
+        assert_eq!(config.symbols, vec!["TEST-USD"]);
         assert_eq!(config.orderbook_levels, 20);
         assert_eq!(config.history_minutes, 10);
         assert!(config.validate().is_ok());
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn test_parse_config() {
         let json = r#"{
-            "symbols": ["BTC-USD", "ETH-USD"],
+            "symbols": ["TEST-USD", "ETH-USD"],
             "orderbook_levels": 10,
             "history_minutes": 5
         }"#;
