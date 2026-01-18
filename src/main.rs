@@ -35,6 +35,8 @@ struct StatsTracker {
     order_decision_count: u64,
     /// Last stats log time
     last_stats_time: std::time::Instant,
+    /// Last position log time
+    last_position_log: std::time::Instant,
     /// Shared trading stats for volume/price tracking (used by WalletTracker)
     trading_stats: Arc<TradingStats>,
 }
@@ -46,6 +48,7 @@ impl StatsTracker {
             quote_count: 0,
             order_decision_count: 0,
             last_stats_time: std::time::Instant::now(),
+            last_position_log: std::time::Instant::now(),
             trading_stats: Arc::new(TradingStats::default()),
         }
     }
@@ -62,6 +65,7 @@ impl StatsTracker {
         store: &OrderbookStore,
         strategies: &HashMap<String, ObiStrategy>,
         order_managers: &HashMap<String, QuoteOrderManager>,
+        positions: &HashMap<String, Arc<SharedPosition>>,
         order_ws_connected: bool,
         order_ws_authenticated: bool,
     ) {
@@ -184,6 +188,15 @@ impl StatsTracker {
                 quote_rate,
                 stats.iter().map(|s| s.history_count).sum::<usize>(),
             );
+        }
+
+        if self.last_position_log.elapsed() >= Duration::from_secs(60) {
+            for (symbol, pos) in positions {
+                let value = pos.get();
+                let age_ms = pos.age_ms();
+                info!("[{}] Position: {:.4} (age={}ms)", symbol, value, age_ms);
+            }
+            self.last_position_log = std::time::Instant::now();
         }
 
         self.message_count = 0;
@@ -610,6 +623,7 @@ impl App {
             &self.store,
             &self.strategies,
             &self.order_managers,
+            &self.positions,
             self.order_ws_connected,
             self.order_ws_authenticated,
         );
@@ -671,59 +685,41 @@ async fn main() -> anyhow::Result<()> {
         info!("Order management: DISABLED (set order.enabled=true in config to enable)");
     }
 
-    // Fetch symbol info from API if enabled (tick_size auto-detection)
+    // Fetch symbol info from API (tick_size/lot_size auto-detection).
+    // If we cannot determine these automatically, we refuse to run.
+    if !config.symbol_info.enabled {
+        anyhow::bail!("symbol_info.enabled must be true to auto-detect tick_size/lot_size");
+    }
+
     let mut symbol_infos: HashMap<String, Arc<SharedSymbolInfo>> = HashMap::new();
-    if config.symbol_info.enabled {
-        let client = StandXClient::new();
-        for symbol in &config.symbols {
-            match client.query_symbol_info(symbol).await {
-                Ok(info) => {
-                    let tick_size = info.tick_size();
-                    let lot_size = info.lot_size();
+    let client = StandXClient::new();
+    for symbol in &config.symbols {
+        let info = client.query_symbol_info(symbol).await.map_err(|e| {
+            anyhow::anyhow!("[{}] Failed to fetch symbol info: {}", symbol, e)
+        })?;
 
-                    // Validate fetched values - reject if invalid
-                    let tick_valid = tick_size.is_finite() && tick_size > 1e-12 && tick_size < 1e12;
-                    let lot_valid = lot_size.is_finite() && lot_size > 1e-12 && lot_size < 1e12;
+        let tick_size = info.tick_size();
+        let lot_size = info.lot_size();
 
-                    if tick_valid && lot_valid {
-                        info!(
-                            "[{}] Fetched tick_size={} ({}dp), lot_size={} ({}dp) from API",
-                            symbol, tick_size, info.price_tick_decimals,
-                            lot_size, info.qty_tick_decimals
-                        );
-                        symbol_infos.insert(symbol.clone(), Arc::new(SharedSymbolInfo::from_api_response(&info)));
-                    } else {
-                        warn!(
-                            "[{}] API returned invalid values (tick_size={}, lot_size={}) - using config fallback (tick_size={}, lot_size={})",
-                            symbol, tick_size, lot_size, config.strategy.tick_size, config.strategy.lot_size
-                        );
-                        symbol_infos.insert(
-                            symbol.clone(),
-                            Arc::new(SharedSymbolInfo::new(symbol, config.strategy.tick_size, config.strategy.lot_size))
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "[{}] Failed to fetch symbol info: {} - using config values (tick_size={}, lot_size={})",
-                        symbol, e, config.strategy.tick_size, config.strategy.lot_size
-                    );
-                    // Create SharedSymbolInfo with config values as fallback
-                    symbol_infos.insert(
-                        symbol.clone(),
-                        Arc::new(SharedSymbolInfo::new(symbol, config.strategy.tick_size, config.strategy.lot_size))
-                    );
-                }
-            }
-        }
-    } else {
-        info!("Symbol info auto-detection disabled - using config values");
-        for symbol in &config.symbols {
-            symbol_infos.insert(
-                symbol.clone(),
-                Arc::new(SharedSymbolInfo::new(symbol, config.strategy.tick_size, config.strategy.lot_size))
+        // Validate fetched values - reject if invalid
+        let tick_valid = tick_size.is_finite() && tick_size > 1e-12 && tick_size < 1e12;
+        let lot_valid = lot_size.is_finite() && lot_size > 1e-12 && lot_size < 1e12;
+
+        if !tick_valid || !lot_valid {
+            anyhow::bail!(
+                "[{}] API returned invalid values (tick_size={}, lot_size={})",
+                symbol,
+                tick_size,
+                lot_size
             );
         }
+
+        info!(
+            "[{}] Fetched tick_size={} ({}dp), lot_size={} ({}dp) from API",
+            symbol, tick_size, info.price_tick_decimals,
+            lot_size, info.qty_tick_decimals
+        );
+        symbol_infos.insert(symbol.clone(), Arc::new(SharedSymbolInfo::from_api_response(&info)));
     }
 
     // Create application with symbol info
