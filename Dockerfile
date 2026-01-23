@@ -12,17 +12,19 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests first for better layer caching
 COPY Cargo.toml Cargo.lock ./
 
-# Copy source code
-COPY src ./src
+# Create dummy src to build dependencies (faster rebuilds)
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && rm -rf src
 
-# Build release binary
-RUN cargo build --release
+# Copy actual source and rebuild
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
@@ -40,5 +42,5 @@ RUN mkdir -p /app/data && chown -R appuser:appuser /app
 
 USER appuser
 
-# Default command - config path can be overridden
-CMD ["./standx-orderbook", "/app/config.json"]
+# Default command
+CMD ["./standx-orderbook"]
