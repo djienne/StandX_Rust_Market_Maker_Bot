@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "High-performance market maker for StandX perpetual futures exchange"
 authors = ["StandX Trading"]
+default-run = "standx-orderbook"
 
 [dependencies]
 # Async runtime

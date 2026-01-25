@@ -87,6 +87,33 @@ pub struct SymbolInfo {
     pub qty_tick_decimals: u8,
 }
 
+/// Position config from query_position_config endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PositionConfig {
+    pub symbol: String,
+    /// Leverage as string from API (e.g., "1", "10")
+    #[serde(deserialize_with = "deserialize_string_to_i32")]
+    pub leverage: i32,
+    pub margin_mode: String,
+}
+
+/// Deserialize a string like "1" or "10" to i32.
+fn deserialize_string_to_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: String = serde::Deserialize::deserialize(deserializer)?;
+    s.parse::<i32>().map_err(|e| D::Error::custom(format!("invalid leverage: {}", e)))
+}
+
+/// Request for changing leverage.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeLeverageRequest {
+    pub symbol: String,
+    pub leverage: i32,
+}
+
 impl SymbolInfo {
     /// Convert price_tick_decimals to tick_size (e.g., 2 -> 0.01)
     #[inline]
@@ -615,6 +642,66 @@ impl StandXClient {
         symbols.into_iter()
             .find(|s| s.symbol == symbol)
             .ok_or_else(|| ClientError::InvalidResponse(format!("Symbol '{}' not found in API response", symbol)))
+    }
+
+    /// Query position config (leverage, margin mode).
+    pub async fn query_position_config(
+        &self,
+        token: &str,
+        symbol: &str,
+    ) -> Result<PositionConfig, ClientError> {
+        let url = format!("{}/api/query_position_config?symbol={}", self.perps_base_url, symbol);
+
+        let response = self.http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(ClientError::ApiError(format!("{}: {}", status, text)));
+        }
+
+        let text = response.text().await.map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| {
+            ClientError::InvalidResponse(format!("{}\nRaw response: {}", e, &text[..text.len().min(500)]))
+        })
+    }
+
+    /// Change leverage - requires signature.
+    pub async fn change_leverage(
+        &self,
+        token: &str,
+        request_id: &str,
+        timestamp_ms: u64,
+        signature: &str,
+        body: &ChangeLeverageRequest,
+    ) -> Result<OrderResponse, ClientError> {
+        let url = format!("{}/api/change_leverage", self.perps_base_url);
+
+        let response = self.http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("x-request-sign-version", "v1")
+            .header("x-request-id", request_id)
+            .header("x-request-timestamp", timestamp_ms.to_string())
+            .header("x-request-signature", signature)
+            .json(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(ClientError::ApiError(format!("{}: {}", status, text)));
+        }
+
+        let text = response.text().await.map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| {
+            ClientError::InvalidResponse(format!("{}\nRaw response: {}", e, &text[..text.len().min(500)]))
+        })
     }
 }
 

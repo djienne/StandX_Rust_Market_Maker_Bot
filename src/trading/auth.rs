@@ -482,6 +482,68 @@ impl AuthManager {
             .map_err(Into::into)
     }
 
+    /// Query current leverage for a symbol.
+    pub async fn query_leverage(&mut self, symbol: &str) -> Result<i32, AuthError> {
+        // Proactive refresh
+        let token = self.ensure_valid_token().await?.to_string();
+
+        // Try request
+        match self.client.query_position_config(&token, symbol).await {
+            Ok(config) => Ok(config.leverage),
+            Err(ClientError::ApiError(e)) if e.contains("401") || e.contains("unauthorized") => {
+                // Retry on auth error
+                self.authenticate().await?;
+                let new_token = self.token.as_ref().unwrap().token.clone();
+                let config = self.client.query_position_config(&new_token, symbol).await?;
+                Ok(config.leverage)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set leverage for a symbol. Returns Ok if successful.
+    pub async fn set_leverage(&mut self, symbol: &str, leverage: i32) -> Result<(), AuthError> {
+        // Ensure valid token
+        let token = self.ensure_valid_token().await?.to_string();
+
+        // Build request body
+        let body = super::client::ChangeLeverageRequest {
+            symbol: symbol.to_string(),
+            leverage,
+        };
+
+        // Sign the request
+        let body_json = serde_json::to_string(&body)
+            .map_err(|e| AuthError::SignatureError(e.to_string()))?;
+        let (request_id, timestamp_ms, signature) = self.sign_request(&body_json)?;
+
+        // Send request
+        let response = self.client.change_leverage(&token, &request_id, timestamp_ms, &signature, &body)
+            .await?;
+
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(AuthError::NetworkError(format!(
+                "Failed to set leverage: {} (code={})",
+                response.message, response.code
+            )))
+        }
+    }
+
+    /// Ensure leverage is set to target value. Queries current, changes if needed.
+    ///
+    /// Returns Ok(()) if leverage is already at target or was successfully changed.
+    pub async fn ensure_leverage(&mut self, symbol: &str, target: i32) -> Result<(), AuthError> {
+        let current = self.query_leverage(symbol).await?;
+
+        if current == target {
+            return Ok(());
+        }
+
+        self.set_leverage(symbol, target).await
+    }
+
     /// Sign a request body for authenticated API calls.
     ///
     /// # Returns

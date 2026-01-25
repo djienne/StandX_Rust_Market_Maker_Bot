@@ -437,6 +437,18 @@ impl App {
         }
     }
 
+    /// Check safety pause auto-recovery for all order managers.
+    /// This is separate from circuit breaker recovery and handles the >2 orders case.
+    fn check_safety_pause_recovery(&mut self, recovery_secs: u64) {
+        if !self.config.order.enabled || recovery_secs == 0 {
+            return;
+        }
+
+        for (_, manager) in &mut self.order_managers {
+            manager.check_safety_pause_recovery(recovery_secs);
+        }
+    }
+
     /// Shutdown all order managers and get orders to cancel.
     fn shutdown_order_managers(&mut self) -> Vec<String> {
         let mut all_orders = Vec::new();
@@ -762,6 +774,35 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Ensure leverage is set to 1x for all symbols before trading
+    if config.order.enabled {
+        if let Some(ref auth) = shared_auth {
+            for symbol in &config.symbols {
+                let mut auth_guard = auth.lock().await;
+                match auth_guard.query_leverage(symbol).await {
+                    Ok(current) => {
+                        if current != 1 {
+                            info!("[{}] Leverage is {}x, changing to 1x...", symbol, current);
+                            match auth_guard.set_leverage(symbol, 1).await {
+                                Ok(()) => {
+                                    info!("[{}] Leverage set to 1x", symbol);
+                                }
+                                Err(e) => {
+                                    error!("[{}] Failed to set leverage to 1x: {}", symbol, e);
+                                }
+                            }
+                        } else {
+                            info!("[{}] Leverage verified at 1x", symbol);
+                        }
+                    }
+                    Err(e) => {
+                        error!("[{}] Failed to query leverage: {}", symbol, e);
+                    }
+                }
+            }
+        }
+    }
 
     // Start position polling if enabled and auth is available
     let mut position_handles: Vec<PositionPollerHandle> = Vec::new();
@@ -1295,14 +1336,25 @@ async fn main() -> anyhow::Result<()> {
                 // This is O(1) try_recv - zero latency impact on hot path
                 if let Some(ref mut rx) = clear_orders_rx {
                     while let Ok(signal) = rx.try_recv() {
-                        info!(
-                            "[{}] Stale state detected: {} - canceling all orders",
-                            signal.symbol, signal.reason
-                        );
+                        if signal.pause_trading {
+                            // CRITICAL: >2 orders detected - this is a safety limit violation
+                            error!(
+                                "[{}] SAFETY LIMIT: {} - PAUSING TRADING",
+                                signal.symbol, signal.reason
+                            );
+                        } else {
+                            info!(
+                                "[{}] Stale state detected: {} - canceling all orders",
+                                signal.symbol, signal.reason
+                            );
+                        }
 
-                        // 1. Clear internal state
+                        // 1. Clear internal state and trigger safety pause if needed
                         if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
                             manager.clear_all_orders();
+                            if signal.pause_trading {
+                                manager.trigger_safety_pause(&signal.reason);
+                            }
                         }
 
                         // 2. Cancel orders on exchange (spawn to avoid blocking)
@@ -1331,6 +1383,9 @@ async fn main() -> anyhow::Result<()> {
 
                 // Check circuit breaker auto-recovery
                 app.check_circuit_breaker_recovery();
+
+                // Check safety pause auto-recovery (separate from circuit breaker)
+                app.check_safety_pause_recovery(config.order.safety_pause_recovery_secs);
 
                 app.log_stats();
             }
