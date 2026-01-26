@@ -136,3 +136,37 @@ Key config sections:
 The codebase uses StandX server time (`received_at` from orderbook messages) for order timeout checking to avoid clock drift issues. Local system time is only used for:
 - Session prefix uniqueness (order IDs)
 - Position staleness checks (acceptable tolerance)
+
+## Docker Deployment
+
+### Quick Start
+
+```bash
+# 1. Setup credentials
+cp .env.example .env
+# Edit .env with WALLET_AD and PRIVATE_KEY
+
+# 2. Test connection (no real orders)
+docker compose --profile test up bot-test
+
+# 3. Production (after setting order.enabled=true in config.json)
+docker compose up -d
+docker compose logs -f bot
+```
+
+### Commands
+
+```bash
+docker compose up -d              # Start in background
+docker compose down               # Stop (cancels all orders)
+docker compose logs -f bot        # Follow logs
+docker compose restart bot        # Restart after config change
+docker compose --profile test up bot-test   # Test mode
+```
+
+### Files
+
+- `Dockerfile`: Multi-stage build (Rust 1.85, ~50MB runtime image)
+- `docker-compose.yml`: Production (`bot`) and test (`bot-test`) services
+- `config.test.json`: Test config with `order.enabled=false`
+- `data/`: PnL history CSV (persisted across restarts)
