@@ -302,7 +302,6 @@ impl App {
             let om_config = OrderManagerConfig {
                 symbol: symbol.clone(),
                 reprice_threshold_bps: config.order.reprice_threshold_bps,
-                max_position_dollar: config.strategy.max_position_dollar,
                 pending_timeout_ns: config.order.pending_timeout_secs * 1_000_000_000,
                 max_live_age_ns: config.order.max_live_age_secs * 1_000_000_000,
                 tick_size,
@@ -311,7 +310,7 @@ impl App {
                 circuit_breaker_rejections: config.order.circuit_breaker_rejections,
                 num_levels: config.strategy.order_levels,
             };
-            let order_manager = QuoteOrderManager::new(om_config, position);
+            let order_manager = QuoteOrderManager::new(om_config, position, Arc::clone(&shared_equity));
             order_managers.insert(symbol.clone(), order_manager);
 
             // Pre-allocate Arc<str> for hot path (avoids allocation per decision)

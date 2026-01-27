@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::strategy::Quote;
-use crate::trading::SharedPosition;
+use crate::trading::{SharedEquity, SharedPosition};
 
 /// Maximum number of order levels supported (2 bids + 2 asks).
 /// Must match MAX_ORDER_LEVELS in strategy/quotes.rs
@@ -128,8 +128,6 @@ pub struct OrderManagerConfig {
     pub symbol: String,
     /// Reprice threshold in basis points (default: 1.0).
     pub reprice_threshold_bps: f64,
-    /// Maximum position in dollar value (from strategy config).
-    pub max_position_dollar: f64,
     /// Order timeout in nanoseconds (applies to Pending and Canceling states).
     pub pending_timeout_ns: u64,
     /// Maximum age for Live orders in nanoseconds before forcing refresh.
@@ -154,7 +152,6 @@ impl Default for OrderManagerConfig {
         Self {
             symbol: "TEST-USD".to_string(),
             reprice_threshold_bps: 1.0,
-            max_position_dollar: 500.0,
             pending_timeout_ns: 5_000_000_000, // 5 seconds
             max_live_age_ns: 60_000_000_000,   // 60 seconds max age for Live orders
             tick_size: 0.01,
@@ -188,6 +185,9 @@ pub struct OrderManager {
 
     /// Shared position from poller (lock-free reads).
     position: Arc<SharedPosition>,
+
+    /// Shared equity for max_position_dollar (lock-free reads, ~1ns).
+    shared_equity: Arc<SharedEquity>,
 
     /// Client order ID counter.
     cl_ord_id_counter: AtomicU64,
@@ -232,7 +232,11 @@ pub struct OrderManager {
 
 impl OrderManager {
     /// Create a new order manager.
-    pub fn new(config: OrderManagerConfig, position: Arc<SharedPosition>) -> Self {
+    pub fn new(
+        config: OrderManagerConfig,
+        position: Arc<SharedPosition>,
+        shared_equity: Arc<SharedEquity>,
+    ) -> Self {
         // Generate session prefix including symbol for O(1) lookup by symbol in event handlers
         // Format: mm_<symbol>_<timestamp>
         let session_prefix = format!("mm_{}_{}", config.symbol, chrono::Utc::now().timestamp_millis() % 1_000_000);
@@ -242,6 +246,7 @@ impl OrderManager {
             bid_orders: [None, None],
             ask_orders: [None, None],
             position,
+            shared_equity,
             cl_ord_id_counter: AtomicU64::new(1),
             session_prefix,
             stats: OrderManagerStats::default(),
@@ -370,10 +375,15 @@ impl OrderManager {
 
         // Calculate position in dollars (from poller - source of truth)
         let position_dollar = self.position.get() * quote.mid_price;
+
+        // Get max_position from SharedEquity (lock-free read, ~1ns)
+        // If equity not initialized (max_position = 0), don't enforce limits
+        let max_position = self.shared_equity.max_position_dollar();
+
         // Use > and < (not >= and <=) so that at exactly the limit we can still
         // place orders on the opposite side to rebalance position
-        let at_max_long = position_dollar > self.config.max_position_dollar;
-        let at_max_short = position_dollar < -self.config.max_position_dollar;
+        let at_max_long = max_position > 0.0 && position_dollar > max_position;
+        let at_max_short = max_position > 0.0 && position_dollar < -max_position;
 
         // Use the minimum of configured levels and quote levels
         let num_levels = self.config.num_levels.min(quote.num_levels);
@@ -399,7 +409,7 @@ impl OrderManager {
                     if bid.state != OrderState::Canceling {
                         debug!(
                             "[{}] At max long position ({:.2} > {:.2}), canceling bid L{}",
-                            self.config.symbol, position_dollar, self.config.max_position_dollar, level
+                            self.config.symbol, position_dollar, max_position, level
                         );
                         decisions.push(OrderDecision::Cancel {
                             cl_ord_id: bid.cl_ord_id.clone(),
@@ -425,7 +435,7 @@ impl OrderManager {
                     if ask.state != OrderState::Canceling {
                         debug!(
                             "[{}] At max short position ({:.2} < -{:.2}), canceling ask L{}",
-                            self.config.symbol, position_dollar, self.config.max_position_dollar, level
+                            self.config.symbol, position_dollar, max_position, level
                         );
                         decisions.push(OrderDecision::Cancel {
                             cl_ord_id: ask.cl_ord_id.clone(),
@@ -1277,6 +1287,21 @@ mod tests {
         Arc::new(SharedPosition::new("TEST-USD".to_string()))
     }
 
+    /// Create SharedEquity with a given max_position_dollar.
+    /// Uses reverse formula: equity = max_position / 0.9 (since max_pos = equity * 0.9)
+    fn create_test_equity(max_position_dollar: f64) -> Arc<SharedEquity> {
+        let equity = Arc::new(SharedEquity::new(1, 10.0));
+        // Reverse the formula: max_pos = equity * 0.9 => equity = max_pos / 0.9
+        let raw_equity = max_position_dollar / 0.9;
+        equity.set_equity(raw_equity);
+        equity
+    }
+
+    /// Create SharedEquity with default high limit (won't trigger position limits in tests).
+    fn create_test_equity_high_limit() -> Arc<SharedEquity> {
+        create_test_equity(100_000_000.0) // $100M max position
+    }
+
     fn create_test_quote(bid: f64, ask: f64, qty: f64) -> Quote {
         Quote {
             symbol: "TEST-USD".into(),
@@ -1320,8 +1345,9 @@ mod tests {
     #[test]
     fn test_new_order_manager() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let config = OrderManagerConfig::default();
-        let manager = OrderManager::new(config, position);
+        let manager = OrderManager::new(config, position, equity);
 
         assert!(manager.bid_order().is_none());
         assert!(manager.ask_order().is_none());
@@ -1331,8 +1357,9 @@ mod tests {
     #[test]
     fn test_initial_order_placement() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         let quote = create_test_quote(99000.0, 101000.0, 0.001);
         let decisions = manager.on_quote(&quote, 1_000_000_000);
@@ -1350,9 +1377,10 @@ mod tests {
     #[test]
     fn test_no_reprice_within_threshold() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let mut config = OrderManagerConfig::default();
         config.reprice_threshold_bps = 10.0; // 10 bps threshold
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
         let quote = create_test_quote(100000.0, 100010.0, 0.001);
@@ -1378,9 +1406,10 @@ mod tests {
     #[test]
     fn test_reprice_beyond_threshold() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let mut config = OrderManagerConfig::default();
         config.reprice_threshold_bps = 1.0; // 1 bps threshold
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
         let quote = create_test_quote(100000.0, 100100.0, 0.001);
@@ -1406,9 +1435,10 @@ mod tests {
         let position = create_test_position();
         position.set(0.005); // 0.005 BTC position
 
-        let mut config = OrderManagerConfig::default();
-        config.max_position_dollar = 500.0; // $500 max
-        let mut manager = OrderManager::new(config, position);
+        // Set max_position to $500 via SharedEquity
+        let equity = create_test_equity(500.0);
+        let config = OrderManagerConfig::default();
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Quote at $100,000 means position = $500 (at max)
         let quote = create_test_quote(100000.0, 100100.0, 0.001);
@@ -1422,8 +1452,9 @@ mod tests {
     #[test]
     fn test_shutdown() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
         let quote = create_test_quote(100000.0, 100100.0, 0.001);
@@ -1441,9 +1472,10 @@ mod tests {
     #[test]
     fn test_two_level_order_placement() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let mut config = OrderManagerConfig::default();
         config.num_levels = 2; // Enable 2 levels
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Create a 2-level quote
         let quote = create_test_quote_2_levels(99000.0, 101000.0, 0.001);
@@ -1476,10 +1508,11 @@ mod tests {
         let position = create_test_position();
         position.set(0.006); // 0.006 BTC position = $600 at $100k
 
+        // Set max_position to $500 via SharedEquity
+        let equity = create_test_equity(500.0);
         let mut config = OrderManagerConfig::default();
         config.num_levels = 2;
-        config.max_position_dollar = 500.0; // $500 max
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // First place orders (simulating already having orders)
         let quote = create_test_quote_2_levels(100000.0, 100100.0, 0.001);

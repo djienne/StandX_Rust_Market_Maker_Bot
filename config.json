@@ -24,7 +24,6 @@
     "half_spread_bps": 0.0,
     "min_half_spread_bps": 1.0,
     "skew": 1.0,
-    "max_position_dollar": 1970.0,
     "c1_ticks": 605.0,
     "looking_depth": 0.025,
     "order_levels": 2,

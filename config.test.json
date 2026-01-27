@@ -25,7 +25,6 @@
     "half_spread": 0.0,
     "half_spread_bps": 0.0,
     "skew": 26.0,
-    "max_position_dollar": 400.0,
     "c1_ticks": 360.0,
     "looking_depth": 0.025
   },

@@ -359,8 +359,17 @@ impl ObiStrategy {
         // Calculate fair price (mid + alpha adjustment)
         let fair_price = mid_price + self.config.c1() * self.alpha;
 
+        // Get max_position_dollar from SharedEquity (lock-free read, ~1ns)
+        // If not initialized, use f64::MAX (no normalization effect)
+        let max_position_dollar = self
+            .shared_equity
+            .as_ref()
+            .map(|eq| eq.max_position_dollar())
+            .filter(|&v| v > 0.0)
+            .unwrap_or(f64::MAX);
+
         // Calculate position skew (normalized to [-1, 1])
-        let normalized_position = (self.position * mid_price) / self.config.max_position_dollar;
+        let normalized_position = (self.position * mid_price) / max_position_dollar;
         let clamped_position = normalized_position.clamp(-1.0, 1.0);
 
         // Number of levels to generate (1 or 2)
@@ -575,7 +584,6 @@ mod tests {
             half_spread: 0.0,
             half_spread_bps: 0.0,
             skew: 1.0,
-            max_position_dollar: 500.0,
             c1: 0.0, // Use c1_ticks fallback
             c1_ticks: 160.0,
             looking_depth: 0.025,

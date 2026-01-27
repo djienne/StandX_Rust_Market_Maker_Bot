@@ -149,10 +149,6 @@ pub struct StrategyConfig {
     #[serde(default = "default_skew")]
     pub skew: f64,
 
-    /// Maximum position in dollar value for normalization
-    #[serde(default = "default_max_position_dollar")]
-    pub max_position_dollar: f64,
-
     /// Alpha coefficient in absolute price units (e.g., 3.6 means fair_price shifts by 3.6 per z-score).
     /// This is tick-size independent. If set to 0, falls back to c1_ticks * tick_size.
     #[serde(default)]
@@ -197,7 +193,6 @@ fn default_window_steps() -> usize { 6000 }
 fn default_update_interval_steps() -> usize { 1 }  // Update on every message
 fn default_vol_to_half_spread() -> f64 { 8.0 }
 fn default_skew() -> f64 { 1.0 }
-fn default_max_position_dollar() -> f64 { 500.0 }
 fn default_c1_ticks() -> f64 { 160.0 }
 fn default_looking_depth() -> f64 { 0.025 }
 fn default_min_order_qty_dollar() -> f64 { 10.0 }
@@ -218,7 +213,6 @@ impl Default for StrategyConfig {
             half_spread_bps: 0.0,
             min_half_spread_bps: default_min_half_spread_bps(),
             skew: default_skew(),
-            max_position_dollar: default_max_position_dollar(),
             c1: 0.0, // 0 = use c1_ticks fallback
             c1_ticks: default_c1_ticks(),
             looking_depth: default_looking_depth(),
@@ -604,12 +598,6 @@ impl Config {
         if self.strategy.looking_depth <= 0.0 || self.strategy.looking_depth >= 1.0 {
             return Err(ConfigError::ValidationError(
                 "strategy.looking_depth must be between 0 and 1".to_string()
-            ));
-        }
-
-        if self.strategy.max_position_dollar <= 0.0 {
-            return Err(ConfigError::ValidationError(
-                "strategy.max_position_dollar must be positive".to_string()
             ));
         }
 
