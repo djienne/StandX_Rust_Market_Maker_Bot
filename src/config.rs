@@ -167,9 +167,11 @@ pub struct StrategyConfig {
     #[serde(default = "default_looking_depth")]
     pub looking_depth: f64,
 
-    /// Order quantity in dollar value
-    #[serde(default = "default_order_qty_dollar")]
-    pub order_qty_dollar: f64,
+    /// Minimum order quantity in dollar value.
+    /// Acts as a floor to prevent dust orders when equity is very low.
+    /// Default: 10.0
+    #[serde(default = "default_min_order_qty_dollar")]
+    pub min_order_qty_dollar: f64,
 
     /// FALLBACK lot size - only used if API fetch fails.
     /// The actual lot_size is automatically fetched from the exchange API.
@@ -198,7 +200,7 @@ fn default_skew() -> f64 { 1.0 }
 fn default_max_position_dollar() -> f64 { 500.0 }
 fn default_c1_ticks() -> f64 { 160.0 }
 fn default_looking_depth() -> f64 { 0.025 }
-fn default_order_qty_dollar() -> f64 { 100.0 }
+fn default_min_order_qty_dollar() -> f64 { 10.0 }
 fn default_lot_size() -> f64 { 0.001 }
 fn default_min_half_spread_bps() -> f64 { 2.0 }
 fn default_order_levels() -> usize { 1 }
@@ -220,7 +222,7 @@ impl Default for StrategyConfig {
             c1: 0.0, // 0 = use c1_ticks fallback
             c1_ticks: default_c1_ticks(),
             looking_depth: default_looking_depth(),
-            order_qty_dollar: default_order_qty_dollar(),
+            min_order_qty_dollar: default_min_order_qty_dollar(),
             lot_size: default_lot_size(),
             order_levels: default_order_levels(),
             spread_level_multiplier: default_spread_level_multiplier(),

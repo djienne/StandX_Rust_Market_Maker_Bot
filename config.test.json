@@ -15,7 +15,7 @@
     "stale_timeout_secs": 60
   },
   "strategy": {
-    "order_qty_dollar": 20.0,
+    "min_order_qty_dollar": 10.0,
     "tick_size": 0.01,
     "lot_size": 0.0001,
     "step_ns": 100000000,

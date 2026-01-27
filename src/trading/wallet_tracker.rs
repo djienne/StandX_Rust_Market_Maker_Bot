@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::auth::AuthManager;
+use super::equity::SharedEquity;
 use super::position::SharedPosition;
 use super::TradingStats;
 
@@ -60,6 +61,8 @@ pub struct WalletTracker {
     position: Arc<SharedPosition>,
     /// Trading stats (for volume tracking and mid price)
     trading_stats: Arc<TradingStats>,
+    /// Shared equity for hot path order sizing
+    shared_equity: Arc<SharedEquity>,
 }
 
 impl WalletTracker {
@@ -69,6 +72,7 @@ impl WalletTracker {
         config: WalletTrackerConfig,
         position: Arc<SharedPosition>,
         trading_stats: Arc<TradingStats>,
+        shared_equity: Arc<SharedEquity>,
     ) -> Self {
         Self {
             auth,
@@ -77,6 +81,7 @@ impl WalletTracker {
             reference_equity: None,
             position,
             trading_stats,
+            shared_equity,
         }
     }
 
@@ -151,6 +156,19 @@ impl WalletTracker {
         if self.reference_equity.is_none() && equity > 0.0 {
             self.reference_equity = Some(equity);
             info!("Wallet tracker: reference equity set to ${:.2}", equity);
+        }
+
+        // Update shared equity for hot path order sizing
+        if equity > 0.0 {
+            let was_initialized = self.shared_equity.is_initialized();
+            self.shared_equity.set_equity(equity);
+            let order_qty = self.shared_equity.order_qty_dollar();
+            if !was_initialized {
+                info!(
+                    "Order sizing: equity=${:.2} -> ${:.2}/order",
+                    equity, order_qty
+                );
+            }
         }
 
         // Calculate PnL %

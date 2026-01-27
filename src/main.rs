@@ -21,6 +21,7 @@ use standx_orderbook::{
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
+use standx_orderbook::trading::SharedEquity;
 use standx_orderbook::trading::TradingStats;
 use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest, StandXClient};
 
@@ -218,6 +219,8 @@ struct App {
     positions: HashMap<String, Arc<SharedPosition>>,
     /// Shared symbol info per symbol (for dynamic tick_size/lot_size)
     symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
+    /// Shared equity for automatic order sizing (lock-free reads)
+    shared_equity: Arc<SharedEquity>,
     /// Order managers per symbol
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
@@ -254,6 +257,12 @@ impl App {
             config.history_minutes,
         ));
 
+        // Create SharedEquity for automatic order sizing
+        let shared_equity = Arc::new(SharedEquity::new(
+            config.strategy.order_levels,
+            config.strategy.min_order_qty_dollar,
+        ));
+
         // Create OBI strategy, shared position, order manager, and Arc<str> for each symbol
         let mut strategies = HashMap::new();
         let mut positions = HashMap::new();
@@ -261,16 +270,21 @@ impl App {
         let mut symbol_arcs = HashMap::new();
 
         for symbol in &config.symbols {
-            // Create strategy with shared symbol info if available
+            // Create strategy with shared symbol info and shared equity
             let strategy = if let Some(shared_info) = symbol_infos.get(symbol) {
                 ObiStrategy::with_shared_info(
                     config.strategy.clone(),
                     Arc::clone(shared_info),
+                    Arc::clone(&shared_equity),
                     config.history_minutes,
                 )
             } else {
-                // Fallback to config-based tick_size
-                ObiStrategy::with_required_history(config.strategy.clone(), config.history_minutes)
+                // Fallback to config-based tick_size (still uses shared_equity)
+                ObiStrategy::with_required_history(
+                    config.strategy.clone(),
+                    Arc::clone(&shared_equity),
+                    config.history_minutes,
+                )
             };
             strategies.insert(symbol.clone(), strategy);
 
@@ -320,6 +334,7 @@ impl App {
             strategies,
             positions,
             symbol_infos,
+            shared_equity,
             order_managers,
             order_tx: None,
             symbol_arcs,
@@ -357,6 +372,11 @@ impl App {
     /// Get trading stats for wallet tracker.
     fn trading_stats(&self) -> Arc<TradingStats> {
         self.stats.trading_stats()
+    }
+
+    /// Get shared equity for wallet tracker.
+    fn shared_equity(&self) -> Arc<SharedEquity> {
+        Arc::clone(&self.shared_equity)
     }
 
     /// Get pre-allocated Arc<str> for a symbol (hot path optimization).
@@ -980,7 +1000,8 @@ async fn main() -> anyhow::Result<()> {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(SharedPosition::new("unknown".to_string())));
             let trading_stats = app.trading_stats();
-            let tracker = WalletTracker::new(Arc::clone(auth), tracker_config, position, trading_stats);
+            let shared_equity = app.shared_equity();
+            let tracker = WalletTracker::new(Arc::clone(auth), tracker_config, position, trading_stats, shared_equity);
             wallet_handle = Some(tracker.start());
             info!(
                 "PnL tracker started (interval: {}s, csv: {})",
