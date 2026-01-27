@@ -321,16 +321,18 @@ impl ObiStrategy {
         sum_bid_qty - sum_ask_qty
     }
 
-    /// Calculate bid/ask quotes.
+    /// Calculate bid/ask quotes for multiple levels.
     #[inline]
     fn calculate_quote(&mut self, snapshot: &OrderbookSnapshot, mid_price: f64) -> Option<Quote> {
+        use super::quotes::MAX_ORDER_LEVELS;
+
         let best_bid = snapshot.best_bid_price()?;
         let best_ask = snapshot.best_ask_price()?;
 
-        // Calculate half-spread in ticks (priority: volatility > bps > fixed)
+        // Calculate base half-spread in ticks (priority: volatility > bps > fixed)
         // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
         let tick_size = self.tick_size();
-        let half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
+        let base_half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
             // Mode 1: Volatility-based
             self.volatility * self.config.vol_to_half_spread
         } else if self.config.half_spread_bps > 0.0 {
@@ -351,89 +353,110 @@ impl ObiStrategy {
         let normalized_position = (self.position * mid_price) / self.config.max_position_dollar;
         let clamped_position = normalized_position.clamp(-1.0, 1.0);
 
-        // Adjust half-spread based on position
-        // When long (positive position), increase bid depth (push bid down)
-        // When short (negative position), increase ask depth (push ask up)
-        let bid_depth_tick = (half_spread_tick * (1.0 + self.config.skew * clamped_position)).max(0.0);
-        let ask_depth_tick = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
+        // Number of levels to generate (1 or 2)
+        let num_levels = self.config.order_levels.min(MAX_ORDER_LEVELS);
 
-        // Calculate raw quote prices
-        let raw_bid = fair_price - bid_depth_tick * tick_size;
-        let raw_ask = fair_price + ask_depth_tick * tick_size;
+        // Spread multipliers: level 0 = 1.0x, level 1 = spread_level_multiplier
+        let multipliers = [1.0, self.config.spread_level_multiplier];
 
-        // Clamp to BBO (never cross the spread)
-        let clamped_bid = raw_bid.min(best_bid);
-        let clamped_ask = raw_ask.max(best_ask);
+        // Calculate prices for each level
+        let mut bid_prices = [0.0; MAX_ORDER_LEVELS];
+        let mut ask_prices = [0.0; MAX_ORDER_LEVELS];
+        let mut bid_floored = [false; MAX_ORDER_LEVELS];
+        let mut ask_floored = [false; MAX_ORDER_LEVELS];
 
-        // Apply floor AFTER BBO clamping
-        // Floor ensures minimum distance from mid_price
-        // If bid is too close (above mid - floor), push it down
-        // If ask is too close (below mid + floor), push it up
-        let (floored_bid, bid_floored) = if self.config.min_half_spread_bps > 0.0 {
-            let min_bid = mid_price * (1.0 - self.config.min_half_spread_bps / 10000.0);
-            if clamped_bid > min_bid {
-                (min_bid, true)
+        for level in 0..num_levels {
+            let half_spread_tick = base_half_spread_tick * multipliers[level];
+
+            // Adjust half-spread based on position
+            // When long (positive position), increase bid depth (push bid down)
+            // When short (negative position), increase ask depth (push ask up)
+            let bid_depth_tick = (half_spread_tick * (1.0 + self.config.skew * clamped_position)).max(0.0);
+            let ask_depth_tick = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
+
+            // Calculate raw quote prices
+            let raw_bid = fair_price - bid_depth_tick * tick_size;
+            let raw_ask = fair_price + ask_depth_tick * tick_size;
+
+            // Clamp to BBO (never cross the spread)
+            let clamped_bid = raw_bid.min(best_bid);
+            let clamped_ask = raw_ask.max(best_ask);
+
+            // Apply floor AFTER BBO clamping
+            // Floor ensures minimum distance from mid_price
+            let (floored_bid, bid_floor_applied) = if self.config.min_half_spread_bps > 0.0 {
+                // For outer levels, scale the minimum floor by the multiplier
+                let level_min_bps = self.config.min_half_spread_bps * multipliers[level];
+                let min_bid = mid_price * (1.0 - level_min_bps / 10000.0);
+                if clamped_bid > min_bid {
+                    (min_bid, true)
+                } else {
+                    (clamped_bid, false)
+                }
             } else {
                 (clamped_bid, false)
-            }
-        } else {
-            (clamped_bid, false)
-        };
+            };
 
-        let (floored_ask, ask_floored) = if self.config.min_half_spread_bps > 0.0 {
-            let min_ask = mid_price * (1.0 + self.config.min_half_spread_bps / 10000.0);
-            if clamped_ask < min_ask {
-                (min_ask, true)
+            let (floored_ask, ask_floor_applied) = if self.config.min_half_spread_bps > 0.0 {
+                let level_min_bps = self.config.min_half_spread_bps * multipliers[level];
+                let min_ask = mid_price * (1.0 + level_min_bps / 10000.0);
+                if clamped_ask < min_ask {
+                    (min_ask, true)
+                } else {
+                    (clamped_ask, false)
+                }
             } else {
                 (clamped_ask, false)
-            }
-        } else {
-            (clamped_ask, false)
-        };
+            };
 
-        // Snap to tick grid
-        let bid_price = (floored_bid / tick_size).floor() * tick_size;
-        let ask_price = (floored_ask / tick_size).ceil() * tick_size;
+            // Snap to tick grid
+            bid_prices[level] = (floored_bid / tick_size).floor() * tick_size;
+            ask_prices[level] = (floored_ask / tick_size).ceil() * tick_size;
+            bid_floored[level] = bid_floor_applied;
+            ask_floored[level] = ask_floor_applied;
+        }
 
-        // Calculate quantity (round to lot_size, ensure minimum)
-        let order_qty = self.config.order_qty_dollar / mid_price;
+        // Calculate quantity per level (round to lot_size, ensure minimum)
+        // Total exposure = order_qty_dollar, split evenly across levels
+        let order_qty_per_level = (self.config.order_qty_dollar / num_levels as f64) / mid_price;
         let lot_size = self.lot_size();
-        let quantity = ((order_qty / lot_size).round() * lot_size).max(lot_size);
+        let quantity = ((order_qty_per_level / lot_size).round() * lot_size).max(lot_size);
 
         // Log "valid for trading" milestone once (uses info! for visibility)
         let valid_for_trading = self.is_valid_for_trading();
         if valid_for_trading && !self.logged_valid_for_trading {
             self.logged_valid_for_trading = true;
             info!(
-                "[{}] Strategy now valid for trading (history={:.0}s, samples={})",
+                "[{}] Strategy now valid for trading (history={:.0}s, samples={}, levels={})",
                 snapshot.symbol,
                 self.history_duration_secs(),
-                self.total_samples
+                self.total_samples,
+                num_levels
             );
         }
 
         // Log quote generation with key metrics
         debug!(
-            "[{}] Quote: vol={:.4} alpha={:.3} bid_floor={} ask_floor={} spread={:.2}bps",
+            "[{}] Quote: vol={:.4} alpha={:.3} levels={} L0_spread={:.2}bps",
             snapshot.symbol,
             self.volatility,
             self.alpha,
-            bid_floored,
-            ask_floored,
-            (ask_price - bid_price) / mid_price * 10000.0
+            num_levels,
+            (ask_prices[0] - bid_prices[0]) / mid_price * 10000.0
         );
 
         Some(Quote {
             symbol: snapshot.symbol.clone(),
-            bid_price,
-            ask_price,
+            bid_prices,
+            ask_prices,
+            num_levels,
             quantity,
             mid_price,
-            spread: ask_price - bid_price,
+            spread: ask_prices[0] - bid_prices[0],
             volatility: self.volatility,
             alpha: self.alpha,
             position: self.position,
-            half_spread_tick,
+            half_spread_tick: base_half_spread_tick,
             valid_for_trading,
             history_secs: self.history_duration_secs(),
             bid_floored,
@@ -536,6 +559,8 @@ mod tests {
             order_qty_dollar: 20.0,
             lot_size: 0.001,
             min_half_spread_bps: 2.0,
+            order_levels: 1,
+            spread_level_multiplier: 1.5,
         }
     }
 

@@ -25,4 +25,4 @@ mod quotes;
 pub use traits::QuoteStrategy;
 pub use rolling::{RollingWindow, RollingStats};
 pub use obi::ObiStrategy;
-pub use quotes::{Quote, QuoteFormatter};
+pub use quotes::{Quote, QuoteFormatter, MAX_ORDER_LEVELS};

@@ -295,6 +295,7 @@ impl App {
                 lot_size,
                 debug: config.debug,
                 circuit_breaker_rejections: config.order.circuit_breaker_rejections,
+                num_levels: config.strategy.order_levels,
             };
             let order_manager = QuoteOrderManager::new(om_config, position);
             order_managers.insert(symbol.clone(), order_manager);
@@ -679,12 +680,21 @@ async fn main() -> anyhow::Result<()> {
     );
 
     info!(
-        "Strategy: tick={}, window={}, update_interval={}, vol_to_spread={}",
+        "Strategy: tick={}, window={}, update_interval={}, vol_to_spread={}, order_levels={}",
         config.strategy.tick_size,
         config.strategy.window_steps,
         config.strategy.update_interval_steps,
         config.strategy.vol_to_half_spread,
+        config.strategy.order_levels,
     );
+
+    if config.strategy.order_levels > 1 {
+        info!(
+            "Multi-level mode: {} levels per side, spread_level_multiplier={}",
+            config.strategy.order_levels,
+            config.strategy.spread_level_multiplier,
+        );
+    }
 
     if config.order.enabled {
         info!(
@@ -906,7 +916,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("Order executor task started");
                     while let Some((symbol, decision)) = order_rx.recv().await {
                         match decision {
-                            OrderDecision::Send { side, price, qty, cl_ord_id } => {
+                            OrderDecision::Send { side, level, price, qty, cl_ord_id } => {
                                 // Get current tick_size/lot_size from SharedSymbolInfo (dynamic)
                                 let (tick_size, lot_size) = executor_symbol_infos
                                     .get(symbol.as_ref())
@@ -920,7 +930,7 @@ async fn main() -> anyhow::Result<()> {
                                     Side::Sell => NewOrderRequest::post_only_sell_with_precision(&*symbol, price, qty, tick_size, lot_size)
                                         .with_client_id(&cl_ord_id),
                                 };
-                                debug!("[{}] Sending {} order: {} @ {:.2}", symbol, side, cl_ord_id, price);
+                                debug!("[{}] Sending {} L{} order: {} @ {:.2}", symbol, side, level, cl_ord_id, price);
                                 if let Err(e) = executor_client.place_order(req).await {
                                     warn!("[{}] Failed to place order: {}", symbol, e);
                                 }
@@ -931,7 +941,7 @@ async fn main() -> anyhow::Result<()> {
                                     warn!("[{}] Failed to cancel order: {}", symbol, e);
                                 }
                             }
-                            OrderDecision::CancelAndReplace { cancel_id, new_price, qty: _ } => {
+                            OrderDecision::CancelAndReplace { cancel_id, level: _, new_price, qty: _ } => {
                                 debug!("[{}] Cancel and replace: {} -> {:.2}", symbol, cancel_id, new_price);
                                 // Cancel only - new order will be placed on next quote cycle
                                 if let Err(e) = executor_client.cancel_order_by_client_id(&cancel_id).await {
@@ -1017,6 +1027,7 @@ async fn main() -> anyhow::Result<()> {
                     symbol: symbol.clone(),
                     debounce_count: 2, // 2 consecutive zero polls = 6 seconds
                     max_order_age_secs: config.order.max_live_age_secs * 2, // 2x max live age
+                    expected_order_levels: config.strategy.order_levels, // Match strategy levels
                 };
                 let checker = OpenOrdersChecker::new(
                     Arc::clone(auth),
@@ -1026,8 +1037,9 @@ async fn main() -> anyhow::Result<()> {
                 order_checker_handle = Some(checker.start());
             }
             info!(
-                "Open orders checker started (interval: 3s, debounce: 2, max_age: {}s)",
-                config.order.max_live_age_secs * 2
+                "Open orders checker started (interval: 3s, debounce: 2, max_age: {}s, levels: {})",
+                config.order.max_live_age_secs * 2,
+                config.strategy.order_levels
             );
         }
     }
