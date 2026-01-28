@@ -15,7 +15,7 @@
     "stale_timeout_secs": 60
   },
   "strategy": {
-    "order_qty_dollar": 495.0,
+    "min_order_qty_dollar": 10.0,
     "step_ns": 100000000,
     "window_steps": 6000,
     "update_interval_steps": 1,
@@ -24,9 +24,10 @@
     "half_spread_bps": 0.0,
     "min_half_spread_bps": 1.0,
     "skew": 1.0,
-    "max_position_dollar": 1990.0,
     "c1_ticks": 605.0,
-    "looking_depth": 0.025
+    "looking_depth": 0.025,
+    "order_levels": 2,
+    "spread_level_multiplier": 2.0
   },
   "order": {
     "enabled": true,

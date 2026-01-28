@@ -149,10 +149,6 @@ pub struct StrategyConfig {
     #[serde(default = "default_skew")]
     pub skew: f64,
 
-    /// Maximum position in dollar value for normalization
-    #[serde(default = "default_max_position_dollar")]
-    pub max_position_dollar: f64,
-
     /// Alpha coefficient in absolute price units (e.g., 3.6 means fair_price shifts by 3.6 per z-score).
     /// This is tick-size independent. If set to 0, falls back to c1_ticks * tick_size.
     #[serde(default)]
@@ -167,14 +163,28 @@ pub struct StrategyConfig {
     #[serde(default = "default_looking_depth")]
     pub looking_depth: f64,
 
-    /// Order quantity in dollar value
-    #[serde(default = "default_order_qty_dollar")]
-    pub order_qty_dollar: f64,
+    /// Minimum order quantity in dollar value.
+    /// Acts as a floor to prevent dust orders when equity is very low.
+    /// Default: 10.0
+    #[serde(default = "default_min_order_qty_dollar")]
+    pub min_order_qty_dollar: f64,
 
     /// FALLBACK lot size - only used if API fetch fails.
     /// The actual lot_size is automatically fetched from the exchange API.
     #[serde(default = "default_lot_size")]
     pub lot_size: f64,
+
+    /// Number of order levels per side (1 or 2).
+    /// 1 = single bid + single ask (default, current behavior)
+    /// 2 = 2 bids + 2 asks with spread multipliers
+    #[serde(default = "default_order_levels")]
+    pub order_levels: usize,
+
+    /// Spread multiplier for level 1 (outer level).
+    /// Level 0 uses base half_spread, level 1 uses half_spread * spread_level_multiplier.
+    /// Default: 1.5
+    #[serde(default = "default_spread_level_multiplier")]
+    pub spread_level_multiplier: f64,
 }
 
 fn default_tick_size() -> f64 { 0.01 }
@@ -183,12 +193,13 @@ fn default_window_steps() -> usize { 6000 }
 fn default_update_interval_steps() -> usize { 1 }  // Update on every message
 fn default_vol_to_half_spread() -> f64 { 8.0 }
 fn default_skew() -> f64 { 1.0 }
-fn default_max_position_dollar() -> f64 { 500.0 }
 fn default_c1_ticks() -> f64 { 160.0 }
 fn default_looking_depth() -> f64 { 0.025 }
-fn default_order_qty_dollar() -> f64 { 100.0 }
+fn default_min_order_qty_dollar() -> f64 { 10.0 }
 fn default_lot_size() -> f64 { 0.001 }
 fn default_min_half_spread_bps() -> f64 { 2.0 }
+fn default_order_levels() -> usize { 1 }
+fn default_spread_level_multiplier() -> f64 { 1.5 }
 
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -202,12 +213,13 @@ impl Default for StrategyConfig {
             half_spread_bps: 0.0,
             min_half_spread_bps: default_min_half_spread_bps(),
             skew: default_skew(),
-            max_position_dollar: default_max_position_dollar(),
             c1: 0.0, // 0 = use c1_ticks fallback
             c1_ticks: default_c1_ticks(),
             looking_depth: default_looking_depth(),
-            order_qty_dollar: default_order_qty_dollar(),
+            min_order_qty_dollar: default_min_order_qty_dollar(),
             lot_size: default_lot_size(),
+            order_levels: default_order_levels(),
+            spread_level_multiplier: default_spread_level_multiplier(),
         }
     }
 }
@@ -307,6 +319,12 @@ pub struct OrderConfig {
     /// Set to 0 to disable auto-recovery (manual reset required)
     #[serde(default = "default_circuit_breaker_recovery_secs")]
     pub circuit_breaker_recovery_secs: u64,
+
+    /// Safety pause recovery: resume trading after N seconds when >2 orders detected (default: 30)
+    /// This handles rare edge cases where duplicate/stuck orders accumulate.
+    /// Set to 0 to disable auto-recovery (manual intervention required)
+    #[serde(default = "default_safety_pause_recovery_secs")]
+    pub safety_pause_recovery_secs: u64,
 }
 
 fn default_order_enabled() -> bool { false } // Disabled by default for safety
@@ -316,6 +334,7 @@ fn default_max_live_age_secs() -> u64 { 60 }
 fn default_max_reconnect_attempts() -> u32 { 0 } // 0 = unlimited retries
 fn default_circuit_breaker_rejections() -> u32 { 5 }
 fn default_circuit_breaker_recovery_secs() -> u64 { 300 } // 5 minutes default
+fn default_safety_pause_recovery_secs() -> u64 { 30 } // 30 seconds default
 
 impl Default for OrderConfig {
     fn default() -> Self {
@@ -327,6 +346,7 @@ impl Default for OrderConfig {
             max_reconnect_attempts: default_max_reconnect_attempts(),
             circuit_breaker_rejections: default_circuit_breaker_rejections(),
             circuit_breaker_recovery_secs: default_circuit_breaker_recovery_secs(),
+            safety_pause_recovery_secs: default_safety_pause_recovery_secs(),
         }
     }
 }
@@ -581,9 +601,15 @@ impl Config {
             ));
         }
 
-        if self.strategy.max_position_dollar <= 0.0 {
+        if self.strategy.order_levels == 0 || self.strategy.order_levels > 2 {
             return Err(ConfigError::ValidationError(
-                "strategy.max_position_dollar must be positive".to_string()
+                "strategy.order_levels must be 1 or 2".to_string()
+            ));
+        }
+
+        if self.strategy.spread_level_multiplier <= 1.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.spread_level_multiplier must be greater than 1.0".to_string()
             ));
         }
 

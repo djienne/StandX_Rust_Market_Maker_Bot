@@ -32,6 +32,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod equity;
 pub mod order_checker;
 pub mod order_manager;
 pub mod order_ws;
@@ -59,6 +60,7 @@ pub use wallet_tracker::{WalletTracker, WalletTrackerConfig, WalletTrackerHandle
 pub use order_checker::{OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal};
 pub use symbol_info::{SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal};
 pub use client::SymbolInfo;
+pub use equity::SharedEquity;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

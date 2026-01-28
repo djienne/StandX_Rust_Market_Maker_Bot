@@ -21,6 +21,7 @@ use standx_orderbook::{
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
+use standx_orderbook::trading::SharedEquity;
 use standx_orderbook::trading::TradingStats;
 use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest, StandXClient};
 
@@ -218,6 +219,8 @@ struct App {
     positions: HashMap<String, Arc<SharedPosition>>,
     /// Shared symbol info per symbol (for dynamic tick_size/lot_size)
     symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
+    /// Shared equity for automatic order sizing (lock-free reads)
+    shared_equity: Arc<SharedEquity>,
     /// Order managers per symbol
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
@@ -254,6 +257,12 @@ impl App {
             config.history_minutes,
         ));
 
+        // Create SharedEquity for automatic order sizing
+        let shared_equity = Arc::new(SharedEquity::new(
+            config.strategy.order_levels,
+            config.strategy.min_order_qty_dollar,
+        ));
+
         // Create OBI strategy, shared position, order manager, and Arc<str> for each symbol
         let mut strategies = HashMap::new();
         let mut positions = HashMap::new();
@@ -261,16 +270,21 @@ impl App {
         let mut symbol_arcs = HashMap::new();
 
         for symbol in &config.symbols {
-            // Create strategy with shared symbol info if available
+            // Create strategy with shared symbol info and shared equity
             let strategy = if let Some(shared_info) = symbol_infos.get(symbol) {
                 ObiStrategy::with_shared_info(
                     config.strategy.clone(),
                     Arc::clone(shared_info),
+                    Arc::clone(&shared_equity),
                     config.history_minutes,
                 )
             } else {
-                // Fallback to config-based tick_size
-                ObiStrategy::with_required_history(config.strategy.clone(), config.history_minutes)
+                // Fallback to config-based tick_size (still uses shared_equity)
+                ObiStrategy::with_required_history(
+                    config.strategy.clone(),
+                    Arc::clone(&shared_equity),
+                    config.history_minutes,
+                )
             };
             strategies.insert(symbol.clone(), strategy);
 
@@ -288,15 +302,15 @@ impl App {
             let om_config = OrderManagerConfig {
                 symbol: symbol.clone(),
                 reprice_threshold_bps: config.order.reprice_threshold_bps,
-                max_position_dollar: config.strategy.max_position_dollar,
                 pending_timeout_ns: config.order.pending_timeout_secs * 1_000_000_000,
                 max_live_age_ns: config.order.max_live_age_secs * 1_000_000_000,
                 tick_size,
                 lot_size,
                 debug: config.debug,
                 circuit_breaker_rejections: config.order.circuit_breaker_rejections,
+                num_levels: config.strategy.order_levels,
             };
-            let order_manager = QuoteOrderManager::new(om_config, position);
+            let order_manager = QuoteOrderManager::new(om_config, position, Arc::clone(&shared_equity));
             order_managers.insert(symbol.clone(), order_manager);
 
             // Pre-allocate Arc<str> for hot path (avoids allocation per decision)
@@ -319,6 +333,7 @@ impl App {
             strategies,
             positions,
             symbol_infos,
+            shared_equity,
             order_managers,
             order_tx: None,
             symbol_arcs,
@@ -356,6 +371,11 @@ impl App {
     /// Get trading stats for wallet tracker.
     fn trading_stats(&self) -> Arc<TradingStats> {
         self.stats.trading_stats()
+    }
+
+    /// Get shared equity for wallet tracker.
+    fn shared_equity(&self) -> Arc<SharedEquity> {
+        Arc::clone(&self.shared_equity)
     }
 
     /// Get pre-allocated Arc<str> for a symbol (hot path optimization).
@@ -679,12 +699,21 @@ async fn main() -> anyhow::Result<()> {
     );
 
     info!(
-        "Strategy: tick={}, window={}, update_interval={}, vol_to_spread={}",
+        "Strategy: tick={}, window={}, update_interval={}, vol_to_spread={}, order_levels={}",
         config.strategy.tick_size,
         config.strategy.window_steps,
         config.strategy.update_interval_steps,
         config.strategy.vol_to_half_spread,
+        config.strategy.order_levels,
     );
+
+    if config.strategy.order_levels > 1 {
+        info!(
+            "Multi-level mode: {} levels per side, spread_level_multiplier={}",
+            config.strategy.order_levels,
+            config.strategy.spread_level_multiplier,
+        );
+    }
 
     if config.order.enabled {
         info!(
@@ -906,7 +935,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("Order executor task started");
                     while let Some((symbol, decision)) = order_rx.recv().await {
                         match decision {
-                            OrderDecision::Send { side, price, qty, cl_ord_id } => {
+                            OrderDecision::Send { side, level, price, qty, cl_ord_id } => {
                                 // Get current tick_size/lot_size from SharedSymbolInfo (dynamic)
                                 let (tick_size, lot_size) = executor_symbol_infos
                                     .get(symbol.as_ref())
@@ -920,7 +949,7 @@ async fn main() -> anyhow::Result<()> {
                                     Side::Sell => NewOrderRequest::post_only_sell_with_precision(&*symbol, price, qty, tick_size, lot_size)
                                         .with_client_id(&cl_ord_id),
                                 };
-                                debug!("[{}] Sending {} order: {} @ {:.2}", symbol, side, cl_ord_id, price);
+                                debug!("[{}] Sending {} L{} order: {} @ {:.2}", symbol, side, level, cl_ord_id, price);
                                 if let Err(e) = executor_client.place_order(req).await {
                                     warn!("[{}] Failed to place order: {}", symbol, e);
                                 }
@@ -931,7 +960,7 @@ async fn main() -> anyhow::Result<()> {
                                     warn!("[{}] Failed to cancel order: {}", symbol, e);
                                 }
                             }
-                            OrderDecision::CancelAndReplace { cancel_id, new_price, qty: _ } => {
+                            OrderDecision::CancelAndReplace { cancel_id, level: _, new_price, qty: _ } => {
                                 debug!("[{}] Cancel and replace: {} -> {:.2}", symbol, cancel_id, new_price);
                                 // Cancel only - new order will be placed on next quote cycle
                                 if let Err(e) = executor_client.cancel_order_by_client_id(&cancel_id).await {
@@ -970,7 +999,8 @@ async fn main() -> anyhow::Result<()> {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(SharedPosition::new("unknown".to_string())));
             let trading_stats = app.trading_stats();
-            let tracker = WalletTracker::new(Arc::clone(auth), tracker_config, position, trading_stats);
+            let shared_equity = app.shared_equity();
+            let tracker = WalletTracker::new(Arc::clone(auth), tracker_config, position, trading_stats, shared_equity);
             wallet_handle = Some(tracker.start());
             info!(
                 "PnL tracker started (interval: {}s, csv: {})",
@@ -1017,6 +1047,7 @@ async fn main() -> anyhow::Result<()> {
                     symbol: symbol.clone(),
                     debounce_count: 2, // 2 consecutive zero polls = 6 seconds
                     max_order_age_secs: config.order.max_live_age_secs * 2, // 2x max live age
+                    expected_order_levels: config.strategy.order_levels, // Match strategy levels
                 };
                 let checker = OpenOrdersChecker::new(
                     Arc::clone(auth),
@@ -1026,8 +1057,9 @@ async fn main() -> anyhow::Result<()> {
                 order_checker_handle = Some(checker.start());
             }
             info!(
-                "Open orders checker started (interval: 3s, debounce: 2, max_age: {}s)",
-                config.order.max_live_age_secs * 2
+                "Open orders checker started (interval: 3s, debounce: 2, max_age: {}s, levels: {})",
+                config.order.max_live_age_secs * 2,
+                config.strategy.order_levels
             );
         }
     }

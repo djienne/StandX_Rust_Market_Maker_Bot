@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use tracing::{debug, info};
 use crate::config::StrategyConfig;
-use crate::trading::SharedSymbolInfo;
+use crate::trading::{SharedEquity, SharedSymbolInfo};
 use crate::types::OrderbookSnapshot;
 use super::rolling::RollingStats;
 use super::quotes::Quote;
@@ -20,6 +20,8 @@ pub struct ObiStrategy {
     config: StrategyConfig,
     /// Shared symbol info for dynamic tick_size/lot_size (optional)
     shared_info: Option<Arc<SharedSymbolInfo>>,
+    /// Shared equity for automatic order sizing (optional)
+    shared_equity: Option<Arc<SharedEquity>>,
     /// Rolling window for mid-price changes (volatility)
     mid_price_chg_stats: RollingStats,
     /// Rolling window for imbalance (alpha)
@@ -66,6 +68,7 @@ impl ObiStrategy {
         Self {
             config,
             shared_info: None,
+            shared_equity: None,
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
             prev_mid_tick: None,
@@ -87,6 +90,7 @@ impl ObiStrategy {
     pub fn with_shared_info(
         config: StrategyConfig,
         shared_info: Arc<SharedSymbolInfo>,
+        shared_equity: Arc<SharedEquity>,
         required_history_minutes: u64,
     ) -> Self {
         let window_steps = config.window_steps;
@@ -94,6 +98,7 @@ impl ObiStrategy {
         Self {
             config,
             shared_info: Some(shared_info),
+            shared_equity: Some(shared_equity),
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
             prev_mid_tick: None,
@@ -112,8 +117,13 @@ impl ObiStrategy {
     }
 
     /// Create a new OBI strategy with custom required history duration.
-    pub fn with_required_history(config: StrategyConfig, required_history_minutes: u64) -> Self {
+    pub fn with_required_history(
+        config: StrategyConfig,
+        shared_equity: Arc<SharedEquity>,
+        required_history_minutes: u64,
+    ) -> Self {
         let mut strategy = Self::new(config);
+        strategy.shared_equity = Some(shared_equity);
         strategy.required_history_ns = required_history_minutes * 60 * 1_000_000_000;
         strategy
     }
@@ -321,16 +331,18 @@ impl ObiStrategy {
         sum_bid_qty - sum_ask_qty
     }
 
-    /// Calculate bid/ask quotes.
+    /// Calculate bid/ask quotes for multiple levels.
     #[inline]
     fn calculate_quote(&mut self, snapshot: &OrderbookSnapshot, mid_price: f64) -> Option<Quote> {
+        use super::quotes::MAX_ORDER_LEVELS;
+
         let best_bid = snapshot.best_bid_price()?;
         let best_ask = snapshot.best_ask_price()?;
 
-        // Calculate half-spread in ticks (priority: volatility > bps > fixed)
+        // Calculate base half-spread in ticks (priority: volatility > bps > fixed)
         // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
         let tick_size = self.tick_size();
-        let half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
+        let base_half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
             // Mode 1: Volatility-based
             self.volatility * self.config.vol_to_half_spread
         } else if self.config.half_spread_bps > 0.0 {
@@ -347,93 +359,136 @@ impl ObiStrategy {
         // Calculate fair price (mid + alpha adjustment)
         let fair_price = mid_price + self.config.c1() * self.alpha;
 
+        // Get max_position_dollar from SharedEquity (lock-free read, ~1ns)
+        // If not initialized, use f64::MAX (no normalization effect)
+        let max_position_dollar = self
+            .shared_equity
+            .as_ref()
+            .map(|eq| eq.max_position_dollar())
+            .filter(|&v| v > 0.0)
+            .unwrap_or(f64::MAX);
+
         // Calculate position skew (normalized to [-1, 1])
-        let normalized_position = (self.position * mid_price) / self.config.max_position_dollar;
+        let normalized_position = (self.position * mid_price) / max_position_dollar;
         let clamped_position = normalized_position.clamp(-1.0, 1.0);
 
-        // Adjust half-spread based on position
-        // When long (positive position), increase bid depth (push bid down)
-        // When short (negative position), increase ask depth (push ask up)
-        let bid_depth_tick = (half_spread_tick * (1.0 + self.config.skew * clamped_position)).max(0.0);
-        let ask_depth_tick = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
+        // Number of levels to generate (1 or 2)
+        let num_levels = self.config.order_levels.min(MAX_ORDER_LEVELS);
 
-        // Calculate raw quote prices
-        let raw_bid = fair_price - bid_depth_tick * tick_size;
-        let raw_ask = fair_price + ask_depth_tick * tick_size;
+        // Spread multipliers: level 0 = 1.0x, level 1 = spread_level_multiplier
+        let multipliers = [1.0, self.config.spread_level_multiplier];
 
-        // Clamp to BBO (never cross the spread)
-        let clamped_bid = raw_bid.min(best_bid);
-        let clamped_ask = raw_ask.max(best_ask);
+        // Get order_qty_dollar from SharedEquity (lock-free read, ~1ns)
+        // Skip quote if no sizing available (equity not yet fetched)
+        let order_qty_dollar = self
+            .shared_equity
+            .as_ref()
+            .filter(|eq| eq.is_initialized())
+            .map(|eq| eq.order_qty_dollar())
+            .unwrap_or(0.0);
 
-        // Apply floor AFTER BBO clamping
-        // Floor ensures minimum distance from mid_price
-        // If bid is too close (above mid - floor), push it down
-        // If ask is too close (below mid + floor), push it up
-        let (floored_bid, bid_floored) = if self.config.min_half_spread_bps > 0.0 {
-            let min_bid = mid_price * (1.0 - self.config.min_half_spread_bps / 10000.0);
-            if clamped_bid > min_bid {
-                (min_bid, true)
+        if order_qty_dollar <= 0.0 {
+            return None;
+        }
+
+        // Calculate prices for each level
+        let mut bid_prices = [0.0; MAX_ORDER_LEVELS];
+        let mut ask_prices = [0.0; MAX_ORDER_LEVELS];
+        let mut bid_floored = [false; MAX_ORDER_LEVELS];
+        let mut ask_floored = [false; MAX_ORDER_LEVELS];
+
+        for level in 0..num_levels {
+            let half_spread_tick = base_half_spread_tick * multipliers[level];
+
+            // Adjust half-spread based on position
+            // When long (positive position), increase bid depth (push bid down)
+            // When short (negative position), increase ask depth (push ask up)
+            let bid_depth_tick = (half_spread_tick * (1.0 + self.config.skew * clamped_position)).max(0.0);
+            let ask_depth_tick = (half_spread_tick * (1.0 - self.config.skew * clamped_position)).max(0.0);
+
+            // Calculate raw quote prices
+            let raw_bid = fair_price - bid_depth_tick * tick_size;
+            let raw_ask = fair_price + ask_depth_tick * tick_size;
+
+            // Clamp to BBO (never cross the spread)
+            let clamped_bid = raw_bid.min(best_bid);
+            let clamped_ask = raw_ask.max(best_ask);
+
+            // Apply floor AFTER BBO clamping
+            // Floor ensures minimum distance from mid_price
+            let (floored_bid, bid_floor_applied) = if self.config.min_half_spread_bps > 0.0 {
+                // For outer levels, scale the minimum floor by the multiplier
+                let level_min_bps = self.config.min_half_spread_bps * multipliers[level];
+                let min_bid = mid_price * (1.0 - level_min_bps / 10000.0);
+                if clamped_bid > min_bid {
+                    (min_bid, true)
+                } else {
+                    (clamped_bid, false)
+                }
             } else {
                 (clamped_bid, false)
-            }
-        } else {
-            (clamped_bid, false)
-        };
+            };
 
-        let (floored_ask, ask_floored) = if self.config.min_half_spread_bps > 0.0 {
-            let min_ask = mid_price * (1.0 + self.config.min_half_spread_bps / 10000.0);
-            if clamped_ask < min_ask {
-                (min_ask, true)
+            let (floored_ask, ask_floor_applied) = if self.config.min_half_spread_bps > 0.0 {
+                let level_min_bps = self.config.min_half_spread_bps * multipliers[level];
+                let min_ask = mid_price * (1.0 + level_min_bps / 10000.0);
+                if clamped_ask < min_ask {
+                    (min_ask, true)
+                } else {
+                    (clamped_ask, false)
+                }
             } else {
                 (clamped_ask, false)
-            }
-        } else {
-            (clamped_ask, false)
-        };
+            };
 
-        // Snap to tick grid
-        let bid_price = (floored_bid / tick_size).floor() * tick_size;
-        let ask_price = (floored_ask / tick_size).ceil() * tick_size;
+            // Snap to tick grid
+            bid_prices[level] = (floored_bid / tick_size).floor() * tick_size;
+            ask_prices[level] = (floored_ask / tick_size).ceil() * tick_size;
+            bid_floored[level] = bid_floor_applied;
+            ask_floored[level] = ask_floor_applied;
+        }
 
-        // Calculate quantity (round to lot_size, ensure minimum)
-        let order_qty = self.config.order_qty_dollar / mid_price;
+        // Calculate quantity per level (round to lot_size, ensure minimum)
+        // Note: order_qty_dollar is already per-order (formula includes /order_levels)
+        let order_qty_per_level = order_qty_dollar / mid_price;
         let lot_size = self.lot_size();
-        let quantity = ((order_qty / lot_size).round() * lot_size).max(lot_size);
+        let quantity = ((order_qty_per_level / lot_size).round() * lot_size).max(lot_size);
 
         // Log "valid for trading" milestone once (uses info! for visibility)
         let valid_for_trading = self.is_valid_for_trading();
         if valid_for_trading && !self.logged_valid_for_trading {
             self.logged_valid_for_trading = true;
             info!(
-                "[{}] Strategy now valid for trading (history={:.0}s, samples={})",
+                "[{}] Strategy now valid for trading (history={:.0}s, samples={}, levels={})",
                 snapshot.symbol,
                 self.history_duration_secs(),
-                self.total_samples
+                self.total_samples,
+                num_levels
             );
         }
 
         // Log quote generation with key metrics
         debug!(
-            "[{}] Quote: vol={:.4} alpha={:.3} bid_floor={} ask_floor={} spread={:.2}bps",
+            "[{}] Quote: vol={:.4} alpha={:.3} levels={} L0_spread={:.2}bps",
             snapshot.symbol,
             self.volatility,
             self.alpha,
-            bid_floored,
-            ask_floored,
-            (ask_price - bid_price) / mid_price * 10000.0
+            num_levels,
+            (ask_prices[0] - bid_prices[0]) / mid_price * 10000.0
         );
 
         Some(Quote {
             symbol: snapshot.symbol.clone(),
-            bid_price,
-            ask_price,
+            bid_prices,
+            ask_prices,
+            num_levels,
             quantity,
             mid_price,
-            spread: ask_price - bid_price,
+            spread: ask_prices[0] - bid_prices[0],
             volatility: self.volatility,
             alpha: self.alpha,
             position: self.position,
-            half_spread_tick,
+            half_spread_tick: base_half_spread_tick,
             valid_for_trading,
             history_secs: self.history_duration_secs(),
             bid_floored,
@@ -529,14 +584,22 @@ mod tests {
             half_spread: 0.0,
             half_spread_bps: 0.0,
             skew: 1.0,
-            max_position_dollar: 500.0,
             c1: 0.0, // Use c1_ticks fallback
             c1_ticks: 160.0,
             looking_depth: 0.025,
-            order_qty_dollar: 20.0,
+            min_order_qty_dollar: 10.0,
             lot_size: 0.001,
             min_half_spread_bps: 2.0,
+            order_levels: 1,
+            spread_level_multiplier: 1.5,
         }
+    }
+
+    /// Create a SharedEquity with initialized equity for tests
+    fn test_shared_equity() -> Arc<SharedEquity> {
+        let equity = Arc::new(SharedEquity::new(1, 10.0));
+        equity.set_equity(500.0); // $500 -> $90/order
+        equity
     }
 
     fn create_snapshot(best_bid: f64, best_ask: f64) -> OrderbookSnapshot {
@@ -571,7 +634,8 @@ mod tests {
     #[test]
     fn test_strategy_warmup() {
         let config = default_config();
-        let mut strategy = ObiStrategy::new(config);
+        let shared_equity = test_shared_equity();
+        let mut strategy = ObiStrategy::with_required_history(config, shared_equity, 0);
 
         // Feed snapshots until warmed up (need MIN_SAMPLES_FOR_QUOTE = 100)
         // First call has no prev_mid_tick so doesn't add to mid_price_chg_stats
@@ -596,7 +660,8 @@ mod tests {
     #[test]
     fn test_position_skew() {
         let config = default_config();
-        let mut strategy = ObiStrategy::new(config);
+        let shared_equity = test_shared_equity();
+        let mut strategy = ObiStrategy::with_required_history(config, shared_equity, 0);
 
         // Warm up (need MIN_SAMPLES_FOR_QUOTE = 100)
         // Add varying prices to create non-zero volatility
@@ -647,5 +712,27 @@ mod tests {
 
         // With more bids, imbalance should be positive
         assert!(imbalance > 0.0);
+    }
+
+    #[test]
+    fn test_no_quote_without_equity() {
+        let config = default_config();
+        // Create strategy WITHOUT shared_equity
+        let mut strategy = ObiStrategy::new(config);
+
+        // Warm up
+        for i in 0..200 {
+            let noise = if i % 3 == 0 { 0.05 } else if i % 3 == 1 { -0.03 } else { 0.02 };
+            let mid = 100.0 + noise;
+            let snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            let _ = strategy.update(&snapshot);
+        }
+
+        // Should be warmed up but no quotes (no equity)
+        assert!(strategy.is_warmed_up());
+
+        let snapshot = create_snapshot(99.99, 100.01);
+        let quote = strategy.update(&snapshot);
+        assert!(quote.is_none(), "Should not generate quote without equity");
     }
 }

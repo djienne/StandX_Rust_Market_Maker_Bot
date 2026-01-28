@@ -13,6 +13,7 @@
 //! - Hot path (`on_quote`) is synchronous and lock-free
 //! - Order execution happens asynchronously via channel
 //! - State machine tracks orders: Pending → Live → Canceling
+//! - Supports up to 2 order levels per side (4 orders total)
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,7 +21,11 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::strategy::Quote;
-use crate::trading::SharedPosition;
+use crate::trading::{SharedEquity, SharedPosition};
+
+/// Maximum number of order levels supported (2 bids + 2 asks).
+/// Must match MAX_ORDER_LEVELS in strategy/quotes.rs
+pub const MAX_ORDER_LEVELS: usize = 2;
 
 /// Order side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +54,7 @@ pub enum OrderState {
     Canceling,
 }
 
-/// Tracked live order (one per side per symbol).
+/// Tracked live order (one per level per side per symbol).
 #[derive(Debug, Clone)]
 pub struct LiveOrder {
     /// Client order ID (used for cancellation).
@@ -58,6 +63,8 @@ pub struct LiveOrder {
     pub order_id: Option<i64>,
     /// Order side.
     pub side: Side,
+    /// Order level (0 = inner, 1 = outer).
+    pub level: usize,
     /// Order price.
     pub price: f64,
     /// Order quantity.
@@ -78,6 +85,7 @@ pub enum OrderDecision {
     /// Send a new order.
     Send {
         side: Side,
+        level: usize,
         price: f64,
         qty: f64,
         cl_ord_id: String,
@@ -90,6 +98,7 @@ pub enum OrderDecision {
     /// Note: New order will be sent on next quote cycle after cancel confirms.
     CancelAndReplace {
         cancel_id: String,
+        level: usize,
         new_price: f64,
         qty: f64,
     },
@@ -119,8 +128,6 @@ pub struct OrderManagerConfig {
     pub symbol: String,
     /// Reprice threshold in basis points (default: 1.0).
     pub reprice_threshold_bps: f64,
-    /// Maximum position in dollar value (from strategy config).
-    pub max_position_dollar: f64,
     /// Order timeout in nanoseconds (applies to Pending and Canceling states).
     pub pending_timeout_ns: u64,
     /// Maximum age for Live orders in nanoseconds before forcing refresh.
@@ -136,6 +143,8 @@ pub struct OrderManagerConfig {
     /// Maximum consecutive rejections before pausing trading (circuit breaker).
     /// Set to 0 to disable.
     pub circuit_breaker_rejections: u32,
+    /// Number of order levels per side (1 or 2).
+    pub num_levels: usize,
 }
 
 impl Default for OrderManagerConfig {
@@ -143,13 +152,13 @@ impl Default for OrderManagerConfig {
         Self {
             symbol: "TEST-USD".to_string(),
             reprice_threshold_bps: 1.0,
-            max_position_dollar: 500.0,
             pending_timeout_ns: 5_000_000_000, // 5 seconds
             max_live_age_ns: 60_000_000_000,   // 60 seconds max age for Live orders
             tick_size: 0.01,
             lot_size: 0.001,
             debug: false,
             circuit_breaker_rejections: 5,     // Pause after 5 consecutive rejections
+            num_levels: 1,                     // Default to single level
         }
     }
 }
@@ -162,18 +171,23 @@ const TIMEOUT_CHECK_INTERVAL_NS: i64 = 1_000_000_000;
 ///
 /// Provides synchronous order decision-making in the hot path with
 /// fire-and-forget async execution.
+///
+/// Supports up to MAX_ORDER_LEVELS (2) per side for multi-level market making.
 pub struct OrderManager {
     /// Configuration.
     config: OrderManagerConfig,
 
-    /// Current bid order (buy).
-    bid_order: Option<LiveOrder>,
+    /// Current bid orders per level (buy).
+    bid_orders: [Option<LiveOrder>; MAX_ORDER_LEVELS],
 
-    /// Current ask order (sell).
-    ask_order: Option<LiveOrder>,
+    /// Current ask orders per level (sell).
+    ask_orders: [Option<LiveOrder>; MAX_ORDER_LEVELS],
 
     /// Shared position from poller (lock-free reads).
     position: Arc<SharedPosition>,
+
+    /// Shared equity for max_position_dollar (lock-free reads, ~1ns).
+    shared_equity: Arc<SharedEquity>,
 
     /// Client order ID counter.
     cl_ord_id_counter: AtomicU64,
@@ -194,13 +208,13 @@ pub struct OrderManager {
     /// Last time we checked for timeouts (throttles hot path).
     last_timeout_check_ns: i64,
 
-    /// Pending bid price after cancel confirms (for CancelAndReplace).
+    /// Pending bid prices after cancel confirms per level (for CancelAndReplace).
     /// Stores (price, qty) to place immediately when slot is cleared.
-    pending_bid_price: Option<(f64, f64)>,
+    pending_bid_prices: [Option<(f64, f64)>; MAX_ORDER_LEVELS],
 
-    /// Pending ask price after cancel confirms (for CancelAndReplace).
+    /// Pending ask prices after cancel confirms per level (for CancelAndReplace).
     /// Stores (price, qty) to place immediately when slot is cleared.
-    pending_ask_price: Option<(f64, f64)>,
+    pending_ask_prices: [Option<(f64, f64)>; MAX_ORDER_LEVELS],
 
     /// Consecutive rejection count for circuit breaker.
     consecutive_rejections: u32,
@@ -208,34 +222,50 @@ pub struct OrderManager {
     /// Timestamp when circuit breaker was triggered (Unix millis, 0 if not triggered).
     circuit_breaker_triggered_at_ms: u64,
 
+    /// Timestamp when safety pause was triggered (Unix millis, 0 if not triggered).
+    /// Safety pause is triggered when orders exceed expected count (duplicate/stuck state).
+    safety_pause_triggered_at_ms: u64,
+
     /// Timestamp when last order was sent (Unix millis, 0 if never).
     last_order_sent_at_ms: u64,
 }
 
 impl OrderManager {
     /// Create a new order manager.
-    pub fn new(config: OrderManagerConfig, position: Arc<SharedPosition>) -> Self {
+    pub fn new(
+        config: OrderManagerConfig,
+        position: Arc<SharedPosition>,
+        shared_equity: Arc<SharedEquity>,
+    ) -> Self {
         // Generate session prefix including symbol for O(1) lookup by symbol in event handlers
         // Format: mm_<symbol>_<timestamp>
         let session_prefix = format!("mm_{}_{}", config.symbol, chrono::Utc::now().timestamp_millis() % 1_000_000);
 
         Self {
             config,
-            bid_order: None,
-            ask_order: None,
+            bid_orders: [None, None],
+            ask_orders: [None, None],
             position,
+            shared_equity,
             cl_ord_id_counter: AtomicU64::new(1),
             session_prefix,
             stats: OrderManagerStats::default(),
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             last_timeout_check_ns: 0,
-            pending_bid_price: None,
-            pending_ask_price: None,
+            pending_bid_prices: [None, None],
+            pending_ask_prices: [None, None],
             consecutive_rejections: 0,
             circuit_breaker_triggered_at_ms: 0,
+            safety_pause_triggered_at_ms: 0,
             last_order_sent_at_ms: 0,
         }
+    }
+
+    /// Get the configured number of levels.
+    #[inline]
+    pub fn num_levels(&self) -> usize {
+        self.config.num_levels
     }
 
     /// Get the symbol being managed.
@@ -248,25 +278,42 @@ impl OrderManager {
         &self.stats
     }
 
-    /// Generate a unique client order ID.
-    /// Format: mm_<symbol>_<timestamp>_<seq>
+    /// Generate a unique client order ID with level.
+    /// Format: mm_<symbol>_<timestamp>_<level>_<seq>
     #[inline]
-    pub fn generate_cl_ord_id(&self) -> String {
+    pub fn generate_cl_ord_id(&self, level: usize) -> String {
         let seq = self.cl_ord_id_counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}_{}", self.session_prefix, seq)
+        format!("{}_{}_{}", self.session_prefix, level, seq)
     }
 
     /// Extract symbol from a client order ID.
-    /// Format: mm_<symbol>_<timestamp>_<seq>
+    /// Format: mm_<symbol>_<timestamp>_<level>_<seq>
     /// Returns None if format doesn't match.
     #[inline]
     pub fn extract_symbol_from_cl_ord_id(cl_ord_id: &str) -> Option<&str> {
-        // Format: mm_<symbol>_<timestamp>_<seq>
+        // Format: mm_<symbol>_<timestamp>_<level>_<seq>
         // Skip "mm_", find symbol between first and second "_" after "mm_"
         let rest = cl_ord_id.strip_prefix("mm_")?;
         // Find the first underscore (after symbol)
         let underscore_pos = rest.find('_')?;
         Some(&rest[..underscore_pos])
+    }
+
+    /// Extract level from a client order ID.
+    /// Format: mm_<symbol>_<timestamp>_<level>_<seq>
+    /// Returns None if format doesn't match.
+    #[inline]
+    pub fn extract_level_from_cl_ord_id(cl_ord_id: &str) -> Option<usize> {
+        // Format: mm_<symbol>_<timestamp>_<level>_<seq>
+        let rest = cl_ord_id.strip_prefix("mm_")?;
+        let parts: Vec<&str> = rest.split('_').collect();
+        // parts: [symbol, timestamp, level, seq]
+        if parts.len() >= 4 {
+            parts[2].parse().ok()
+        } else {
+            // Backward compatibility: old format without level = level 0
+            Some(0)
+        }
     }
 
     /// Check for timed out pending orders and return cancel decisions.
@@ -328,86 +375,104 @@ impl OrderManager {
 
         // Calculate position in dollars (from poller - source of truth)
         let position_dollar = self.position.get() * quote.mid_price;
+
+        // Get max_position from SharedEquity (lock-free read, ~1ns)
+        // If equity not initialized (max_position = 0), don't enforce limits
+        let max_position = self.shared_equity.max_position_dollar();
+
         // Use > and < (not >= and <=) so that at exactly the limit we can still
         // place orders on the opposite side to rebalance position
-        let at_max_long = position_dollar > self.config.max_position_dollar;
-        let at_max_short = position_dollar < -self.config.max_position_dollar;
+        let at_max_long = max_position > 0.0 && position_dollar > max_position;
+        let at_max_short = max_position > 0.0 && position_dollar < -max_position;
 
-        let mut decisions = Vec::with_capacity(4);
+        // Use the minimum of configured levels and quote levels
+        let num_levels = self.config.num_levels.min(quote.num_levels);
 
-        // Process BID side (buy) - skip if at max long position
-        if !at_max_long {
-            if let Some(decision) = self.process_side(
-                Side::Buy,
-                quote.bid_price,
-                quote.quantity,
-                current_time_ns,
-            ) {
-                decisions.push(decision);
-            }
-        } else if let Some(bid) = &self.bid_order {
-            // At max long - cancel any existing bid
-            if bid.state != OrderState::Canceling {
-                debug!(
-                    "[{}] At max long position ({:.2} > {:.2}), canceling bid",
-                    self.config.symbol, position_dollar, self.config.max_position_dollar
-                );
-                decisions.push(OrderDecision::Cancel {
-                    cl_ord_id: bid.cl_ord_id.clone(),
-                });
-            }
-        }
+        let mut decisions = Vec::with_capacity(num_levels * 4); // 2 sides x 2 levels x 2 actions max
 
-        // Process ASK side (sell) - skip if at max short position
-        if !at_max_short {
-            if let Some(decision) = self.process_side(
-                Side::Sell,
-                quote.ask_price,
-                quote.quantity,
-                current_time_ns,
-            ) {
-                decisions.push(decision);
+        // Process each level
+        for level in 0..num_levels {
+            // Process BID side (buy) - skip if at max long position
+            if !at_max_long {
+                if let Some(decision) = self.process_side_level(
+                    Side::Buy,
+                    level,
+                    quote.bid_prices[level],
+                    quote.quantity,
+                    current_time_ns,
+                ) {
+                    decisions.push(decision);
+                }
+            } else {
+                // At max long - cancel any existing bid at this level
+                if let Some(bid) = &self.bid_orders[level] {
+                    if bid.state != OrderState::Canceling {
+                        debug!(
+                            "[{}] At max long position ({:.2} > {:.2}), canceling bid L{}",
+                            self.config.symbol, position_dollar, max_position, level
+                        );
+                        decisions.push(OrderDecision::Cancel {
+                            cl_ord_id: bid.cl_ord_id.clone(),
+                        });
+                    }
+                }
             }
-        } else if let Some(ask) = &self.ask_order {
-            // At max short - cancel any existing ask
-            if ask.state != OrderState::Canceling {
-                debug!(
-                    "[{}] At max short position ({:.2} < -{:.2}), canceling ask",
-                    self.config.symbol, position_dollar, self.config.max_position_dollar
-                );
-                decisions.push(OrderDecision::Cancel {
-                    cl_ord_id: ask.cl_ord_id.clone(),
-                });
+
+            // Process ASK side (sell) - skip if at max short position
+            if !at_max_short {
+                if let Some(decision) = self.process_side_level(
+                    Side::Sell,
+                    level,
+                    quote.ask_prices[level],
+                    quote.quantity,
+                    current_time_ns,
+                ) {
+                    decisions.push(decision);
+                }
+            } else {
+                // At max short - cancel any existing ask at this level
+                if let Some(ask) = &self.ask_orders[level] {
+                    if ask.state != OrderState::Canceling {
+                        debug!(
+                            "[{}] At max short position ({:.2} < -{:.2}), canceling ask L{}",
+                            self.config.symbol, position_dollar, max_position, level
+                        );
+                        decisions.push(OrderDecision::Cancel {
+                            cl_ord_id: ask.cl_ord_id.clone(),
+                        });
+                    }
+                }
             }
         }
 
         decisions
     }
 
-    /// Process one side (bid or ask) and return decision.
+    /// Process one side at a specific level and return decision.
     #[inline]
-    fn process_side(
+    fn process_side_level(
         &mut self,
         side: Side,
+        level: usize,
         new_price: f64,
         qty: f64,
         current_time_ns: i64,
     ) -> Option<OrderDecision> {
         // Check order state without cloning - only clone cl_ord_id when needed
         let order = match side {
-            Side::Buy => self.bid_order.as_ref(),
-            Side::Sell => self.ask_order.as_ref(),
+            Side::Buy => self.bid_orders[level].as_ref(),
+            Side::Sell => self.ask_orders[level].as_ref(),
         };
 
         match order {
             None => {
-                // No order on this side - place new one
-                let cl_ord_id = self.generate_cl_ord_id();
+                // No order at this level - place new one
+                let cl_ord_id = self.generate_cl_ord_id(level);
                 debug!(
-                    "[{}] NEW {} order: price={:.2}, qty={:.6}, id={}",
-                    self.config.symbol, side, new_price, qty, cl_ord_id
+                    "[{}] NEW {} L{} order: price={:.2}, qty={:.6}, id={}",
+                    self.config.symbol, side, level, new_price, qty, cl_ord_id
                 );
-                self.set_order_pending(side, cl_ord_id.clone(), new_price, qty, current_time_ns);
+                self.set_order_pending(side, level, cl_ord_id.clone(), new_price, qty, current_time_ns);
                 self.stats.orders_sent += 1;
                 self.last_order_sent_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -415,6 +480,7 @@ impl OrderManager {
                     .as_millis() as u64;
                 Some(OrderDecision::Send {
                     side,
+                    level,
                     price: new_price,
                     qty,
                     cl_ord_id,
@@ -425,8 +491,8 @@ impl OrderManager {
                 let age_secs = (current_time_ns - o.sent_at_ns) / 1_000_000_000;
                 if self.config.debug {
                     info!(
-                        "[{}] {} order blocked: pending confirmation for {} ({}s ago)",
-                        self.config.symbol, side, o.cl_ord_id, age_secs
+                        "[{}] {} L{} order blocked: pending confirmation for {} ({}s ago)",
+                        self.config.symbol, side, level, o.cl_ord_id, age_secs
                     );
                 }
                 None
@@ -436,8 +502,8 @@ impl OrderManager {
                 let age_secs = (current_time_ns - o.sent_at_ns) / 1_000_000_000;
                 // Always log at info level for Canceling - this blocks new orders
                 info!(
-                    "[{}] {} order blocked: cancel pending for {} ({}s ago, order_id={:?})",
-                    self.config.symbol, side, o.cl_ord_id, age_secs, o.order_id
+                    "[{}] {} L{} order blocked: cancel pending for {} ({}s ago, order_id={:?})",
+                    self.config.symbol, side, level, o.cl_ord_id, age_secs, o.order_id
                 );
                 None
             }
@@ -454,29 +520,30 @@ impl OrderManager {
 
                     if order_too_old && !price_changed {
                         debug!(
-                            "[{}] REFRESH {} order (age={}s > {}s): {:.2} -> {:.2} ({:.1}bps), id={}",
-                            self.config.symbol, side, age_secs,
+                            "[{}] REFRESH {} L{} order (age={}s > {}s): {:.2} -> {:.2} ({:.1}bps), id={}",
+                            self.config.symbol, side, level, age_secs,
                             self.config.max_live_age_ns / 1_000_000_000,
                             o.price, new_price, change_bps, o.cl_ord_id
                         );
                     } else {
                         debug!(
-                            "[{}] REPRICE {} order: {:.2} -> {:.2} ({:.1}bps), id={}",
-                            self.config.symbol, side, o.price, new_price, change_bps, o.cl_ord_id
+                            "[{}] REPRICE {} L{} order: {:.2} -> {:.2} ({:.1}bps), id={}",
+                            self.config.symbol, side, level, o.price, new_price, change_bps, o.cl_ord_id
                         );
                     }
                     let cancel_id = o.cl_ord_id.clone(); // Only clone when actually repricing
-                    self.set_order_canceling(side, current_time_ns);
+                    self.set_order_canceling(side, level, current_time_ns);
                     self.stats.reprices += 1;
 
                     // Store pending price for immediate placement after cancel confirms
                     match side {
-                        Side::Buy => self.pending_bid_price = Some((new_price, qty)),
-                        Side::Sell => self.pending_ask_price = Some((new_price, qty)),
+                        Side::Buy => self.pending_bid_prices[level] = Some((new_price, qty)),
+                        Side::Sell => self.pending_ask_prices[level] = Some((new_price, qty)),
                     }
 
                     Some(OrderDecision::CancelAndReplace {
                         cancel_id,
+                        level,
                         new_price,
                         qty,
                     })
@@ -505,72 +572,76 @@ impl OrderManager {
     /// the slot so new orders can be placed.
     #[inline]
     fn check_timeouts(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
-        let mut cancels = Vec::with_capacity(2); // At most 2 orders (bid + ask)
+        let mut cancels = Vec::with_capacity(MAX_ORDER_LEVELS * 2); // At most 4 orders
         let timeout_ns = self.config.pending_timeout_ns as i64;
         let timeout_secs = timeout_ns / 1_000_000_000;
 
-        // Check bid order - only timeout Pending or Canceling orders
+        // Check bid orders at all levels - only timeout Pending or Canceling orders
         // Live orders should NOT timeout - they're valid on the exchange
-        if let Some(order) = &self.bid_order {
-            // Skip Live orders - they don't need timeout checking
-            if order.state == OrderState::Live {
-                // Live order is fine, no timeout needed
-            } else {
-                let age_ns = current_time_ns - order.sent_at_ns;
-                let age_secs = age_ns / 1_000_000_000;
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.bid_orders[level] {
+                // Skip Live orders - they don't need timeout checking
+                if order.state == OrderState::Live {
+                    // Live order is fine, no timeout needed
+                } else {
+                    let age_ns = current_time_ns - order.sent_at_ns;
+                    let age_secs = age_ns / 1_000_000_000;
 
-                // Debug: log every check when order exists and is getting old
-                if age_secs >= 50 {
-                    info!(
-                        "[{}] Timeout check: {} order {} state={:?} age={}s timeout={}s",
-                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
-                    );
-                }
+                    // Debug: log every check when order exists and is getting old
+                    if age_secs >= 50 {
+                        info!(
+                            "[{}] Timeout check: {} L{} order {} state={:?} age={}s timeout={}s",
+                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
+                        );
+                    }
 
-                if age_ns > timeout_ns {
-                    warn!(
-                        "[{}] {} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
-                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
-                    );
-                    cancels.push(OrderDecision::Cancel {
-                        cl_ord_id: order.cl_ord_id.clone(),
-                    });
-                    self.stats.timeouts += 1;
-                    // Clear immediately
-                    self.bid_order = None;
+                    if age_ns > timeout_ns {
+                        warn!(
+                            "[{}] {} L{} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
+                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
+                        );
+                        cancels.push(OrderDecision::Cancel {
+                            cl_ord_id: order.cl_ord_id.clone(),
+                        });
+                        self.stats.timeouts += 1;
+                        // Clear immediately
+                        self.bid_orders[level] = None;
+                    }
                 }
             }
         }
 
-        // Check ask order - only timeout Pending or Canceling orders
+        // Check ask orders at all levels - only timeout Pending or Canceling orders
         // Live orders should NOT timeout - they're valid on the exchange
-        if let Some(order) = &self.ask_order {
-            // Skip Live orders - they don't need timeout checking
-            if order.state == OrderState::Live {
-                // Live order is fine, no timeout needed
-            } else {
-                let age_ns = current_time_ns - order.sent_at_ns;
-                let age_secs = age_ns / 1_000_000_000;
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.ask_orders[level] {
+                // Skip Live orders - they don't need timeout checking
+                if order.state == OrderState::Live {
+                    // Live order is fine, no timeout needed
+                } else {
+                    let age_ns = current_time_ns - order.sent_at_ns;
+                    let age_secs = age_ns / 1_000_000_000;
 
-                // Debug: log every check when order exists and is getting old
-                if age_secs >= 50 {
-                    info!(
-                        "[{}] Timeout check: {} order {} state={:?} age={}s timeout={}s",
-                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
-                    );
-                }
+                    // Debug: log every check when order exists and is getting old
+                    if age_secs >= 50 {
+                        info!(
+                            "[{}] Timeout check: {} L{} order {} state={:?} age={}s timeout={}s",
+                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
+                        );
+                    }
 
-                if age_ns > timeout_ns {
-                    warn!(
-                        "[{}] {} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
-                        self.config.symbol, order.side, order.cl_ord_id, order.state, age_secs, timeout_secs
-                    );
-                    cancels.push(OrderDecision::Cancel {
-                        cl_ord_id: order.cl_ord_id.clone(),
-                    });
-                    self.stats.timeouts += 1;
-                    // Clear immediately
-                    self.ask_order = None;
+                    if age_ns > timeout_ns {
+                        warn!(
+                            "[{}] {} L{} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
+                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
+                        );
+                        cancels.push(OrderDecision::Cancel {
+                            cl_ord_id: order.cl_ord_id.clone(),
+                        });
+                        self.stats.timeouts += 1;
+                        // Clear immediately
+                        self.ask_orders[level] = None;
+                    }
                 }
             }
         }
@@ -582,6 +653,7 @@ impl OrderManager {
     fn set_order_pending(
         &mut self,
         side: Side,
+        level: usize,
         cl_ord_id: String,
         price: f64,
         quantity: f64,
@@ -591,6 +663,7 @@ impl OrderManager {
             cl_ord_id,
             order_id: None,
             side,
+            level,
             price,
             quantity,
             state: OrderState::Pending,
@@ -599,8 +672,8 @@ impl OrderManager {
         };
 
         match side {
-            Side::Buy => self.bid_order = Some(order),
-            Side::Sell => self.ask_order = Some(order),
+            Side::Buy => self.bid_orders[level] = Some(order),
+            Side::Sell => self.ask_orders[level] = Some(order),
         }
     }
 
@@ -609,10 +682,10 @@ impl OrderManager {
     /// Updating `sent_at_ns` when entering Canceling state ensures that:
     /// 1. Timeout is measured from when cancel was initiated, not original order placement
     /// 2. If cancel fails and we revert to Live, the timeout won't fire prematurely
-    fn set_order_canceling(&mut self, side: Side, current_time_ns: i64) {
+    fn set_order_canceling(&mut self, side: Side, level: usize, current_time_ns: i64) {
         let order = match side {
-            Side::Buy => &mut self.bid_order,
-            Side::Sell => &mut self.ask_order,
+            Side::Buy => &mut self.bid_orders[level],
+            Side::Sell => &mut self.ask_orders[level],
         };
 
         if let Some(o) = order {
@@ -676,9 +749,9 @@ impl OrderManager {
 
     /// Called when an order is rejected.
     pub fn on_order_rejected(&mut self, cl_ord_id: &str, reason: &str) {
-        // Get side before clearing
-        let side = self.find_order(cl_ord_id).map(|o| o.side);
-        let side_str = side.map(|s| format!("{} ", s)).unwrap_or_default();
+        // Get side and level before clearing
+        let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.level));
+        let side_str = order_info.map(|(s, l)| format!("{} L{} ", s, l)).unwrap_or_default();
         warn!(
             "[{}] {}order rejected: {} - {}",
             self.config.symbol, side_str, cl_ord_id, reason
@@ -686,9 +759,9 @@ impl OrderManager {
         self.clear_order_by_cl_ord_id(cl_ord_id);
         self.stats.rejections += 1;
 
-        // Also clear pending price for this side to avoid placing stale orders
-        if let Some(s) = side {
-            self.clear_pending_price(s);
+        // Also clear pending price for this side/level to avoid placing stale orders
+        if let Some((side, level)) = order_info {
+            self.clear_pending_price(side, level);
         }
 
         // Circuit breaker: pause trading after too many consecutive rejections
@@ -749,6 +822,60 @@ impl OrderManager {
         false
     }
 
+    /// Trigger a safety pause from external signal (e.g., >2 orders detected).
+    ///
+    /// This is called when the OpenOrdersChecker detects more than 2 orders
+    /// on the exchange, indicating a duplicate/stuck state that requires
+    /// immediate intervention.
+    pub fn trigger_safety_pause(&mut self, reason: &str) {
+        error!(
+            "[{}] SAFETY PAUSE: {} - pausing trading",
+            self.config.symbol, reason
+        );
+        self.paused.store(true, Ordering::Release);
+        self.safety_pause_triggered_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+    }
+
+    /// Check if safety pause should auto-recover.
+    /// Returns true if recovery occurred.
+    ///
+    /// Unlike circuit breaker which is triggered by rejections, safety pause
+    /// is triggered by detecting >2 orders on the exchange. Both have their
+    /// own recovery timers to allow independent tuning.
+    pub fn check_safety_pause_recovery(&mut self, recovery_secs: u64) -> bool {
+        // Only check if safety pause is active and auto-recovery is enabled
+        if recovery_secs == 0 || self.safety_pause_triggered_at_ms == 0 {
+            return false;
+        }
+
+        // Don't recover if not actually paused
+        if !self.paused.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let elapsed_secs = (now_ms - self.safety_pause_triggered_at_ms) / 1000;
+
+        if elapsed_secs >= recovery_secs {
+            warn!(
+                "[{}] SAFETY PAUSE RECOVERY: {} seconds elapsed, resuming trading",
+                self.config.symbol, elapsed_secs
+            );
+            self.safety_pause_triggered_at_ms = 0;
+            self.paused.store(false, Ordering::Release);
+            return true;
+        }
+
+        false
+    }
+
     /// Get consecutive rejection count.
     pub fn consecutive_rejections(&self) -> u32 {
         self.consecutive_rejections
@@ -769,20 +896,28 @@ impl OrderManager {
 
     /// Called when an order is canceled.
     pub fn on_order_canceled(&mut self, order_id: i64) {
-        // Get info for logging before clearing
-        let order_info = self.bid_order.as_ref()
-            .filter(|o| o.order_id == Some(order_id))
-            .map(|o| (o.cl_ord_id.clone(), o.side, o.state))
-            .or_else(|| {
-                self.ask_order.as_ref()
-                    .filter(|o| o.order_id == Some(order_id))
-                    .map(|o| (o.cl_ord_id.clone(), o.side, o.state))
-            });
+        // Get info for logging before clearing - search all levels
+        let mut order_info: Option<(String, Side, usize, OrderState)> = None;
 
-        if let Some((cl_ord_id, side, state)) = order_info {
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(o) = &self.bid_orders[level] {
+                if o.order_id == Some(order_id) {
+                    order_info = Some((o.cl_ord_id.clone(), o.side, level, o.state));
+                    break;
+                }
+            }
+            if let Some(o) = &self.ask_orders[level] {
+                if o.order_id == Some(order_id) {
+                    order_info = Some((o.cl_ord_id.clone(), o.side, level, o.state));
+                    break;
+                }
+            }
+        }
+
+        if let Some((cl_ord_id, side, level, state)) = order_info {
             info!(
-                "[{}] {} order canceled: {} (order_id={}, was {:?}) - slot freed",
-                self.config.symbol, side, cl_ord_id, order_id, state
+                "[{}] {} L{} order canceled: {} (order_id={}, was {:?}) - slot freed",
+                self.config.symbol, side, level, cl_ord_id, order_id, state
             );
         } else {
             // Order not found - may have been force-cleared or already canceled
@@ -798,12 +933,12 @@ impl OrderManager {
     /// Called when an order cancel is confirmed by client order ID.
     pub fn on_order_canceled_by_cl_ord_id(&mut self, cl_ord_id: &str) {
         // Get info for logging before clearing
-        let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.state));
+        let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.level, o.state));
 
-        if let Some((side, state)) = order_info {
+        if let Some((side, level, state)) = order_info {
             info!(
-                "[{}] {} order canceled: {} (was {:?}) - slot freed",
-                self.config.symbol, side, cl_ord_id, state
+                "[{}] {} L{} order canceled: {} (was {:?}) - slot freed",
+                self.config.symbol, side, level, cl_ord_id, state
             );
         } else {
             debug!(
@@ -829,51 +964,57 @@ impl OrderManager {
             self.config.symbol, order_id, reason
         );
 
-        // Find the order and handle the failure
-        if let Some(order) = &mut self.bid_order {
-            if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
-                order.cancel_fail_count += 1;
+        // Find the order and handle the failure - search all levels
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &mut self.bid_orders[level] {
+                if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
+                    order.cancel_fail_count += 1;
 
-                // If too many failures, forcefully clear the slot to break the loop
-                if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
-                    error!(
-                        "[{}] Bid order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
-                        self.config.symbol, order_id, Self::MAX_CANCEL_FAILURES,
-                        order_id, order.cl_ord_id
-                    );
-                    self.bid_order = None;
-                    self.pending_bid_price = None; // Clear pending price too
-                } else {
-                    // Revert to Live for retry
-                    order.state = OrderState::Live;
-                    debug!(
-                        "[{}] Reverted bid order {} to Live state (fail count: {})",
-                        self.config.symbol, order_id, order.cancel_fail_count
-                    );
+                    // If too many failures, forcefully clear the slot to break the loop
+                    if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
+                        error!(
+                            "[{}] Bid L{} order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
+                            self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
+                            order_id, order.cl_ord_id
+                        );
+                        self.bid_orders[level] = None;
+                        self.pending_bid_prices[level] = None; // Clear pending price too
+                    } else {
+                        // Revert to Live for retry
+                        order.state = OrderState::Live;
+                        debug!(
+                            "[{}] Reverted bid L{} order {} to Live state (fail count: {})",
+                            self.config.symbol, level, order_id, order.cancel_fail_count
+                        );
+                    }
+                    return;
                 }
-                return;
             }
         }
-        if let Some(order) = &mut self.ask_order {
-            if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
-                order.cancel_fail_count += 1;
 
-                // If too many failures, forcefully clear the slot to break the loop
-                if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
-                    error!(
-                        "[{}] Ask order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
-                        self.config.symbol, order_id, Self::MAX_CANCEL_FAILURES,
-                        order_id, order.cl_ord_id
-                    );
-                    self.ask_order = None;
-                    self.pending_ask_price = None; // Clear pending price too
-                } else {
-                    // Revert to Live for retry
-                    order.state = OrderState::Live;
-                    debug!(
-                        "[{}] Reverted ask order {} to Live state (fail count: {})",
-                        self.config.symbol, order_id, order.cancel_fail_count
-                    );
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &mut self.ask_orders[level] {
+                if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
+                    order.cancel_fail_count += 1;
+
+                    // If too many failures, forcefully clear the slot to break the loop
+                    if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
+                        error!(
+                            "[{}] Ask L{} order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
+                            self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
+                            order_id, order.cl_ord_id
+                        );
+                        self.ask_orders[level] = None;
+                        self.pending_ask_prices[level] = None; // Clear pending price too
+                    } else {
+                        // Revert to Live for retry
+                        order.state = OrderState::Live;
+                        debug!(
+                            "[{}] Reverted ask L{} order {} to Live state (fail count: {})",
+                            self.config.symbol, level, order_id, order.cancel_fail_count
+                        );
+                    }
+                    return;
                 }
             }
         }
@@ -889,81 +1030,94 @@ impl OrderManager {
     pub fn check_pending_orders(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
         let mut decisions = Vec::new();
 
-        // Check bid - only place if slot is empty
-        if self.bid_order.is_none() {
-            if let Some((price, qty)) = self.pending_bid_price.take() {
-                let cl_ord_id = self.generate_cl_ord_id();
-                debug!(
-                    "[{}] Placing pending BID: {:.2} x {:.6}, id={}",
-                    self.config.symbol, price, qty, cl_ord_id
-                );
-                self.set_order_pending(Side::Buy, cl_ord_id.clone(), price, qty, current_time_ns);
-                self.stats.orders_sent += 1;
-                self.last_order_sent_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                decisions.push(OrderDecision::Send {
-                    side: Side::Buy,
-                    price,
-                    qty,
-                    cl_ord_id,
-                });
+        // Check bid orders at all levels - only place if slot is empty
+        for level in 0..MAX_ORDER_LEVELS {
+            if self.bid_orders[level].is_none() {
+                if let Some((price, qty)) = self.pending_bid_prices[level].take() {
+                    let cl_ord_id = self.generate_cl_ord_id(level);
+                    debug!(
+                        "[{}] Placing pending BID L{}: {:.2} x {:.6}, id={}",
+                        self.config.symbol, level, price, qty, cl_ord_id
+                    );
+                    self.set_order_pending(Side::Buy, level, cl_ord_id.clone(), price, qty, current_time_ns);
+                    self.stats.orders_sent += 1;
+                    self.last_order_sent_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    decisions.push(OrderDecision::Send {
+                        side: Side::Buy,
+                        level,
+                        price,
+                        qty,
+                        cl_ord_id,
+                    });
+                }
             }
         }
 
-        // Check ask - only place if slot is empty
-        if self.ask_order.is_none() {
-            if let Some((price, qty)) = self.pending_ask_price.take() {
-                let cl_ord_id = self.generate_cl_ord_id();
-                debug!(
-                    "[{}] Placing pending ASK: {:.2} x {:.6}, id={}",
-                    self.config.symbol, price, qty, cl_ord_id
-                );
-                self.set_order_pending(Side::Sell, cl_ord_id.clone(), price, qty, current_time_ns);
-                self.stats.orders_sent += 1;
-                self.last_order_sent_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                decisions.push(OrderDecision::Send {
-                    side: Side::Sell,
-                    price,
-                    qty,
-                    cl_ord_id,
-                });
+        // Check ask orders at all levels - only place if slot is empty
+        for level in 0..MAX_ORDER_LEVELS {
+            if self.ask_orders[level].is_none() {
+                if let Some((price, qty)) = self.pending_ask_prices[level].take() {
+                    let cl_ord_id = self.generate_cl_ord_id(level);
+                    debug!(
+                        "[{}] Placing pending ASK L{}: {:.2} x {:.6}, id={}",
+                        self.config.symbol, level, price, qty, cl_ord_id
+                    );
+                    self.set_order_pending(Side::Sell, level, cl_ord_id.clone(), price, qty, current_time_ns);
+                    self.stats.orders_sent += 1;
+                    self.last_order_sent_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    decisions.push(OrderDecision::Send {
+                        side: Side::Sell,
+                        level,
+                        price,
+                        qty,
+                        cl_ord_id,
+                    });
+                }
             }
         }
 
         decisions
     }
 
-    /// Clear pending price for a side (e.g., on rejection or timeout).
-    pub fn clear_pending_price(&mut self, side: Side) {
+    /// Clear pending price for a side at a specific level (e.g., on rejection or timeout).
+    pub fn clear_pending_price(&mut self, side: Side, level: usize) {
+        if level >= MAX_ORDER_LEVELS {
+            return;
+        }
         match side {
-            Side::Buy => self.pending_bid_price = None,
-            Side::Sell => self.pending_ask_price = None,
+            Side::Buy => self.pending_bid_prices[level] = None,
+            Side::Sell => self.pending_ask_prices[level] = None,
         }
     }
 
     /// Clear all pending prices (e.g., on disconnect).
     pub fn clear_all_pending_prices(&mut self) {
-        self.pending_bid_price = None;
-        self.pending_ask_price = None;
+        for level in 0..MAX_ORDER_LEVELS {
+            self.pending_bid_prices[level] = None;
+            self.pending_ask_prices[level] = None;
+        }
     }
 
     // ========== Order Lookup Helpers ==========
 
     #[inline]
     fn find_order(&self, cl_ord_id: &str) -> Option<&LiveOrder> {
-        if let Some(order) = &self.bid_order {
-            if order.cl_ord_id == cl_ord_id {
-                return Some(order);
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.bid_orders[level] {
+                if order.cl_ord_id == cl_ord_id {
+                    return Some(order);
+                }
             }
-        }
-        if let Some(order) = &self.ask_order {
-            if order.cl_ord_id == cl_ord_id {
-                return Some(order);
+            if let Some(order) = &self.ask_orders[level] {
+                if order.cl_ord_id == cl_ord_id {
+                    return Some(order);
+                }
             }
         }
         None
@@ -971,14 +1125,17 @@ impl OrderManager {
 
     #[inline]
     fn find_order_mut(&mut self, cl_ord_id: &str) -> Option<&mut LiveOrder> {
-        if let Some(order) = &mut self.bid_order {
-            if order.cl_ord_id == cl_ord_id {
-                return Some(order);
+        // First find which array and level contains the order
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.bid_orders[level] {
+                if order.cl_ord_id == cl_ord_id {
+                    return self.bid_orders[level].as_mut();
+                }
             }
-        }
-        if let Some(order) = &mut self.ask_order {
-            if order.cl_ord_id == cl_ord_id {
-                return Some(order);
+            if let Some(order) = &self.ask_orders[level] {
+                if order.cl_ord_id == cl_ord_id {
+                    return self.ask_orders[level].as_mut();
+                }
             }
         }
         None
@@ -986,30 +1143,36 @@ impl OrderManager {
 
     #[inline]
     fn clear_order_by_cl_ord_id(&mut self, cl_ord_id: &str) {
-        if let Some(order) = &self.bid_order {
-            if order.cl_ord_id == cl_ord_id {
-                self.bid_order = None;
-                return;
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.bid_orders[level] {
+                if order.cl_ord_id == cl_ord_id {
+                    self.bid_orders[level] = None;
+                    return;
+                }
             }
-        }
-        if let Some(order) = &self.ask_order {
-            if order.cl_ord_id == cl_ord_id {
-                self.ask_order = None;
+            if let Some(order) = &self.ask_orders[level] {
+                if order.cl_ord_id == cl_ord_id {
+                    self.ask_orders[level] = None;
+                    return;
+                }
             }
         }
     }
 
     #[inline]
     fn clear_order_by_exchange_id(&mut self, order_id: i64) {
-        if let Some(order) = &self.bid_order {
-            if order.order_id == Some(order_id) {
-                self.bid_order = None;
-                return;
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.bid_orders[level] {
+                if order.order_id == Some(order_id) {
+                    self.bid_orders[level] = None;
+                    return;
+                }
             }
-        }
-        if let Some(order) = &self.ask_order {
-            if order.order_id == Some(order_id) {
-                self.ask_order = None;
+            if let Some(order) = &self.ask_orders[level] {
+                if order.order_id == Some(order_id) {
+                    self.ask_orders[level] = None;
+                    return;
+                }
             }
         }
     }
@@ -1049,16 +1212,18 @@ impl OrderManager {
 
     /// Get all live order client IDs for batch cancel on shutdown.
     pub fn get_all_live_order_ids(&self) -> Vec<String> {
-        let mut ids = Vec::with_capacity(2);
+        let mut ids = Vec::with_capacity(MAX_ORDER_LEVELS * 2);
 
-        if let Some(order) = &self.bid_order {
-            if matches!(order.state, OrderState::Live | OrderState::Pending) {
-                ids.push(order.cl_ord_id.clone());
+        for level in 0..MAX_ORDER_LEVELS {
+            if let Some(order) = &self.bid_orders[level] {
+                if matches!(order.state, OrderState::Live | OrderState::Pending) {
+                    ids.push(order.cl_ord_id.clone());
+                }
             }
-        }
-        if let Some(order) = &self.ask_order {
-            if matches!(order.state, OrderState::Live | OrderState::Pending) {
-                ids.push(order.cl_ord_id.clone());
+            if let Some(order) = &self.ask_orders[level] {
+                if matches!(order.state, OrderState::Live | OrderState::Pending) {
+                    ids.push(order.cl_ord_id.clone());
+                }
             }
         }
 
@@ -1071,24 +1236,46 @@ impl OrderManager {
     /// internal state is synchronized. This prevents stale orders from blocking
     /// new order placement after reconnection.
     pub fn clear_all_orders(&mut self) {
-        if self.bid_order.is_some() {
-            debug!("[{}] Clearing bid order from state", self.config.symbol);
-            self.bid_order = None;
-        }
-        if self.ask_order.is_some() {
-            debug!("[{}] Clearing ask order from state", self.config.symbol);
-            self.ask_order = None;
+        for level in 0..MAX_ORDER_LEVELS {
+            if self.bid_orders[level].is_some() {
+                debug!("[{}] Clearing bid L{} order from state", self.config.symbol, level);
+                self.bid_orders[level] = None;
+            }
+            if self.ask_orders[level].is_some() {
+                debug!("[{}] Clearing ask L{} order from state", self.config.symbol, level);
+                self.ask_orders[level] = None;
+            }
         }
     }
 
-    /// Get current bid order info (for logging/monitoring).
+    /// Get current bid order info at level 0 (for logging/monitoring).
+    /// For backward compatibility, returns the level 0 bid order.
     pub fn bid_order(&self) -> Option<&LiveOrder> {
-        self.bid_order.as_ref()
+        self.bid_orders[0].as_ref()
     }
 
-    /// Get current ask order info (for logging/monitoring).
+    /// Get current ask order info at level 0 (for logging/monitoring).
+    /// For backward compatibility, returns the level 0 ask order.
     pub fn ask_order(&self) -> Option<&LiveOrder> {
-        self.ask_order.as_ref()
+        self.ask_orders[0].as_ref()
+    }
+
+    /// Get bid order at a specific level.
+    pub fn bid_order_at(&self, level: usize) -> Option<&LiveOrder> {
+        if level < MAX_ORDER_LEVELS {
+            self.bid_orders[level].as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Get ask order at a specific level.
+    pub fn ask_order_at(&self, level: usize) -> Option<&LiveOrder> {
+        if level < MAX_ORDER_LEVELS {
+            self.ask_orders[level].as_ref()
+        } else {
+            None
+        }
     }
 }
 
@@ -1100,11 +1287,27 @@ mod tests {
         Arc::new(SharedPosition::new("TEST-USD".to_string()))
     }
 
+    /// Create SharedEquity with a given max_position_dollar.
+    /// Uses reverse formula: equity = max_position / 0.9 (since max_pos = equity * 0.9)
+    fn create_test_equity(max_position_dollar: f64) -> Arc<SharedEquity> {
+        let equity = Arc::new(SharedEquity::new(1, 10.0));
+        // Reverse the formula: max_pos = equity * 0.9 => equity = max_pos / 0.9
+        let raw_equity = max_position_dollar / 0.9;
+        equity.set_equity(raw_equity);
+        equity
+    }
+
+    /// Create SharedEquity with default high limit (won't trigger position limits in tests).
+    fn create_test_equity_high_limit() -> Arc<SharedEquity> {
+        create_test_equity(100_000_000.0) // $100M max position
+    }
+
     fn create_test_quote(bid: f64, ask: f64, qty: f64) -> Quote {
         Quote {
             symbol: "TEST-USD".into(),
-            bid_price: bid,
-            ask_price: ask,
+            bid_prices: [bid, bid - 1.0], // Level 1 is 1.0 lower
+            ask_prices: [ask, ask + 1.0], // Level 1 is 1.0 higher
+            num_levels: 1, // Default to 1 level for backward compatibility
             quantity: qty,
             mid_price: (bid + ask) / 2.0,
             spread: ask - bid,
@@ -1114,16 +1317,37 @@ mod tests {
             half_spread_tick: 1.0,
             valid_for_trading: true,
             history_secs: 600.0,
-            bid_floored: false,
-            ask_floored: false,
+            bid_floored: [false, false],
+            ask_floored: [false, false],
+        }
+    }
+
+    fn create_test_quote_2_levels(bid: f64, ask: f64, qty: f64) -> Quote {
+        Quote {
+            symbol: "TEST-USD".into(),
+            bid_prices: [bid, bid - 10.0], // Level 1 is wider
+            ask_prices: [ask, ask + 10.0], // Level 1 is wider
+            num_levels: 2,
+            quantity: qty,
+            mid_price: (bid + ask) / 2.0,
+            spread: ask - bid,
+            volatility: 0.001,
+            alpha: 0.0,
+            position: 0.0,
+            half_spread_tick: 1.0,
+            valid_for_trading: true,
+            history_secs: 600.0,
+            bid_floored: [false, false],
+            ask_floored: [false, false],
         }
     }
 
     #[test]
     fn test_new_order_manager() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let config = OrderManagerConfig::default();
-        let manager = OrderManager::new(config, position);
+        let manager = OrderManager::new(config, position, equity);
 
         assert!(manager.bid_order().is_none());
         assert!(manager.ask_order().is_none());
@@ -1133,8 +1357,9 @@ mod tests {
     #[test]
     fn test_initial_order_placement() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         let quote = create_test_quote(99000.0, 101000.0, 0.001);
         let decisions = manager.on_quote(&quote, 1_000_000_000);
@@ -1152,9 +1377,10 @@ mod tests {
     #[test]
     fn test_no_reprice_within_threshold() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let mut config = OrderManagerConfig::default();
         config.reprice_threshold_bps = 10.0; // 10 bps threshold
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
         let quote = create_test_quote(100000.0, 100010.0, 0.001);
@@ -1180,9 +1406,10 @@ mod tests {
     #[test]
     fn test_reprice_beyond_threshold() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let mut config = OrderManagerConfig::default();
         config.reprice_threshold_bps = 1.0; // 1 bps threshold
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
         let quote = create_test_quote(100000.0, 100100.0, 0.001);
@@ -1208,9 +1435,10 @@ mod tests {
         let position = create_test_position();
         position.set(0.005); // 0.005 BTC position
 
-        let mut config = OrderManagerConfig::default();
-        config.max_position_dollar = 500.0; // $500 max
-        let mut manager = OrderManager::new(config, position);
+        // Set max_position to $500 via SharedEquity
+        let equity = create_test_equity(500.0);
+        let config = OrderManagerConfig::default();
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Quote at $100,000 means position = $500 (at max)
         let quote = create_test_quote(100000.0, 100100.0, 0.001);
@@ -1224,8 +1452,9 @@ mod tests {
     #[test]
     fn test_shutdown() {
         let position = create_test_position();
+        let equity = create_test_equity_high_limit();
         let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position);
+        let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
         let quote = create_test_quote(100000.0, 100100.0, 0.001);
@@ -1238,5 +1467,72 @@ mod tests {
         // Should not place any orders after shutdown
         let decisions2 = manager.on_quote(&quote, 2_000_000_000);
         assert!(decisions2.is_empty(), "Should not place orders after shutdown");
+    }
+
+    #[test]
+    fn test_two_level_order_placement() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let mut config = OrderManagerConfig::default();
+        config.num_levels = 2; // Enable 2 levels
+        let mut manager = OrderManager::new(config, position, equity);
+
+        // Create a 2-level quote
+        let quote = create_test_quote_2_levels(99000.0, 101000.0, 0.001);
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+
+        // Should place 4 orders total (2 bids + 2 asks)
+        assert_eq!(decisions.len(), 4, "Should place 4 orders for 2-level mode");
+
+        // Check we have orders at both levels
+        let mut bid_levels = vec![];
+        let mut ask_levels = vec![];
+
+        for decision in &decisions {
+            if let OrderDecision::Send { side, level, .. } = decision {
+                match side {
+                    Side::Buy => bid_levels.push(*level),
+                    Side::Sell => ask_levels.push(*level),
+                }
+            }
+        }
+
+        assert!(bid_levels.contains(&0), "Should have bid at level 0");
+        assert!(bid_levels.contains(&1), "Should have bid at level 1");
+        assert!(ask_levels.contains(&0), "Should have ask at level 0");
+        assert!(ask_levels.contains(&1), "Should have ask at level 1");
+    }
+
+    #[test]
+    fn test_two_level_position_limit_cancels_both() {
+        let position = create_test_position();
+        position.set(0.006); // 0.006 BTC position = $600 at $100k
+
+        // Set max_position to $500 via SharedEquity
+        let equity = create_test_equity(500.0);
+        let mut config = OrderManagerConfig::default();
+        config.num_levels = 2;
+        let mut manager = OrderManager::new(config, position, equity);
+
+        // First place orders (simulating already having orders)
+        let quote = create_test_quote_2_levels(100000.0, 100100.0, 0.001);
+        let initial_decisions = manager.on_quote(&quote, 1_000_000_000);
+
+        // Accept only the sell orders (we're over max long so no buys should be placed)
+        for decision in &initial_decisions {
+            if let OrderDecision::Send { side: Side::Sell, cl_ord_id, .. } = decision {
+                manager.on_order_accepted(cl_ord_id, 1001);
+            }
+        }
+
+        // At max long, should not place any buy orders at either level
+        assert!(!initial_decisions.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Buy, .. })),
+            "Should not place buy orders when at max long position");
+
+        // Should only have sell orders (at both levels)
+        let sell_count = initial_decisions.iter()
+            .filter(|d| matches!(d, OrderDecision::Send { side: Side::Sell, .. }))
+            .count();
+        assert_eq!(sell_count, 2, "Should have 2 sell orders (one per level) when at max long");
     }
 }

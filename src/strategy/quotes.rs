@@ -7,20 +7,25 @@ use crate::types::Symbol;
 use crate::log_quote;
 use std::time::Instant;
 
+/// Maximum number of order levels supported (2 bids + 2 asks).
+pub const MAX_ORDER_LEVELS: usize = 2;
+
 /// A calculated market making quote.
 #[derive(Debug, Clone)]
 pub struct Quote {
     /// Symbol being quoted
     pub symbol: Symbol,
-    /// Bid price
-    pub bid_price: f64,
-    /// Ask price
-    pub ask_price: f64,
-    /// Order quantity in base asset
+    /// Bid prices per level [level_0, level_1]
+    pub bid_prices: [f64; MAX_ORDER_LEVELS],
+    /// Ask prices per level [level_0, level_1]
+    pub ask_prices: [f64; MAX_ORDER_LEVELS],
+    /// Number of active levels (1 or 2)
+    pub num_levels: usize,
+    /// Order quantity in base asset (same qty per level)
     pub quantity: f64,
     /// Mid price (reference)
     pub mid_price: f64,
-    /// Spread (ask - bid)
+    /// Spread (ask - bid) for level 0
     pub spread: f64,
     /// Current volatility (per-second, in ticks)
     pub volatility: f64,
@@ -28,36 +33,60 @@ pub struct Quote {
     pub alpha: f64,
     /// Current position in base asset
     pub position: f64,
-    /// Half-spread in ticks
+    /// Half-spread in ticks (for level 0)
     pub half_spread_tick: f64,
     /// Whether this quote is valid for trading (has enough history)
     pub valid_for_trading: bool,
     /// History duration in seconds
     pub history_secs: f64,
-    /// Whether bid depth was floored to minimum spread
-    pub bid_floored: bool,
-    /// Whether ask depth was floored to minimum spread
-    pub ask_floored: bool,
+    /// Whether bid depth was floored to minimum spread per level
+    pub bid_floored: [bool; MAX_ORDER_LEVELS],
+    /// Whether ask depth was floored to minimum spread per level
+    pub ask_floored: [bool; MAX_ORDER_LEVELS],
 }
 
 impl Quote {
-    /// Calculate bid distance from mid in basis points.
+    /// Get bid price (for backward compatibility, returns level 0)
+    #[inline]
+    pub fn bid_price(&self) -> f64 {
+        self.bid_prices[0]
+    }
+
+    /// Get ask price (for backward compatibility, returns level 0)
+    #[inline]
+    pub fn ask_price(&self) -> f64 {
+        self.ask_prices[0]
+    }
+}
+
+impl Quote {
+    /// Calculate bid distance from mid in basis points (level 0).
     pub fn bid_bps(&self) -> f64 {
-        if self.mid_price == 0.0 {
-            return 0.0;
-        }
-        ((self.bid_price - self.mid_price) / self.mid_price) * 10000.0
+        self.bid_bps_at(0)
     }
 
-    /// Calculate ask distance from mid in basis points.
+    /// Calculate ask distance from mid in basis points (level 0).
     pub fn ask_bps(&self) -> f64 {
-        if self.mid_price == 0.0 {
-            return 0.0;
-        }
-        ((self.ask_price - self.mid_price) / self.mid_price) * 10000.0
+        self.ask_bps_at(0)
     }
 
-    /// Calculate spread in basis points.
+    /// Calculate bid distance from mid in basis points for a specific level.
+    pub fn bid_bps_at(&self, level: usize) -> f64 {
+        if self.mid_price == 0.0 || level >= self.num_levels {
+            return 0.0;
+        }
+        ((self.bid_prices[level] - self.mid_price) / self.mid_price) * 10000.0
+    }
+
+    /// Calculate ask distance from mid in basis points for a specific level.
+    pub fn ask_bps_at(&self, level: usize) -> f64 {
+        if self.mid_price == 0.0 || level >= self.num_levels {
+            return 0.0;
+        }
+        ((self.ask_prices[level] - self.mid_price) / self.mid_price) * 10000.0
+    }
+
+    /// Calculate spread in basis points (level 0).
     pub fn spread_bps(&self) -> f64 {
         if self.mid_price == 0.0 {
             return 0.0;
@@ -65,7 +94,7 @@ impl Quote {
         (self.spread / self.mid_price) * 10000.0
     }
 
-    /// Get half-spread in basis points.
+    /// Get half-spread in basis points (level 0).
     pub fn half_spread_bps(&self) -> f64 {
         self.spread_bps() / 2.0
     }
@@ -130,12 +159,18 @@ impl QuoteFormatter {
         };
 
         // Header line: symbol, mid, spread, volatility, alpha, status
+        let levels_str = if quote.num_levels > 1 {
+            format!(" ({}lvl)", quote.num_levels)
+        } else {
+            String::new()
+        };
         log_quote!(
-            "[{}] mid={:.prec$} spread={:.prec$} ({:.2}bps) vol={:.4} alpha={:.3} [{} {:.0}s]",
+            "[{}] mid={:.prec$} spread={:.prec$} ({:.2}bps){} vol={:.4} alpha={:.3} [{} {:.0}s]",
             quote.symbol.as_str(),
             quote.mid_price,
             quote.spread,
             quote.spread_bps(),
+            levels_str,
             quote.volatility,
             quote.alpha,
             trade_status,
@@ -143,21 +178,29 @@ impl QuoteFormatter {
             prec = self.price_precision
         );
 
-        // Quote line: bid and ask with bps (show [FLOOR] if minimum was applied)
-        let bid_floor_indicator = if quote.bid_floored { " [FLOOR]" } else { "" };
-        let ask_floor_indicator = if quote.ask_floored { " [FLOOR]" } else { "" };
-        log_quote!(
-            "  Quote: bid={:.prec$} ({:+.2}bps){} ask={:.prec$} ({:+.2}bps){} qty={:.qprec$}",
-            quote.bid_price,
-            quote.bid_bps(),
-            bid_floor_indicator,
-            quote.ask_price,
-            quote.ask_bps(),
-            ask_floor_indicator,
-            quote.quantity,
-            prec = self.price_precision,
-            qprec = self.qty_precision
-        );
+        // Log each level
+        for level in 0..quote.num_levels {
+            let bid_floor_indicator = if quote.bid_floored[level] { " [FLOOR]" } else { "" };
+            let ask_floor_indicator = if quote.ask_floored[level] { " [FLOOR]" } else { "" };
+            let level_label = if quote.num_levels > 1 {
+                format!("L{}", level)
+            } else {
+                "Quote".to_string()
+            };
+            log_quote!(
+                "  {}: bid={:.prec$} ({:+.2}bps){} ask={:.prec$} ({:+.2}bps){} qty={:.qprec$}",
+                level_label,
+                quote.bid_prices[level],
+                quote.bid_bps_at(level),
+                bid_floor_indicator,
+                quote.ask_prices[level],
+                quote.ask_bps_at(level),
+                ask_floor_indicator,
+                quote.quantity,
+                prec = self.price_precision,
+                qprec = self.qty_precision
+            );
+        }
 
         // Position info if non-zero
         if quote.position.abs() > 1e-8 {
@@ -170,14 +213,14 @@ impl QuoteFormatter {
         }
     }
 
-    /// Format quote as a single-line string.
+    /// Format quote as a single-line string (level 0 only for brevity).
     pub fn format_oneline(&self, quote: &Quote) -> String {
         format!(
             "[{}] bid={:.prec$}({:+.1}bp) ask={:.prec$}({:+.1}bp) spread={:.1}bp vol={:.3} alpha={:.2}",
             quote.symbol.as_str(),
-            quote.bid_price,
+            quote.bid_price(),
             quote.bid_bps(),
-            quote.ask_price,
+            quote.ask_price(),
             quote.ask_bps(),
             quote.spread_bps(),
             quote.volatility,
@@ -191,12 +234,18 @@ impl QuoteFormatter {
         let mut output = String::new();
 
         // Header
+        let levels_str = if quote.num_levels > 1 {
+            format!(" ({}lvl)", quote.num_levels)
+        } else {
+            String::new()
+        };
         output.push_str(&format!(
-            "[{}] mid={:.prec$} spread={:.prec$} ({:.2}bps)\n",
+            "[{}] mid={:.prec$} spread={:.prec$} ({:.2}bps){}\n",
             quote.symbol.as_str(),
             quote.mid_price,
             quote.spread,
             quote.spread_bps(),
+            levels_str,
             prec = self.price_precision
         ));
 
@@ -208,15 +257,23 @@ impl QuoteFormatter {
             quote.half_spread_tick
         ));
 
-        // Quote prices
-        output.push_str(&format!(
-            "  Quote: bid={:.prec$} ({:+.2}bps) | ask={:.prec$} ({:+.2}bps)\n",
-            quote.bid_price,
-            quote.bid_bps(),
-            quote.ask_price,
-            quote.ask_bps(),
-            prec = self.price_precision
-        ));
+        // Quote prices for each level
+        for level in 0..quote.num_levels {
+            let level_label = if quote.num_levels > 1 {
+                format!("L{}", level)
+            } else {
+                "Quote".to_string()
+            };
+            output.push_str(&format!(
+                "  {}: bid={:.prec$} ({:+.2}bps) | ask={:.prec$} ({:+.2}bps)\n",
+                level_label,
+                quote.bid_prices[level],
+                quote.bid_bps_at(level),
+                quote.ask_prices[level],
+                quote.ask_bps_at(level),
+                prec = self.price_precision
+            ));
+        }
 
         // Quantity
         output.push_str(&format!(
@@ -247,8 +304,9 @@ mod tests {
     fn sample_quote() -> Quote {
         Quote {
             symbol: Symbol::new("TEST-USD"),
-            bid_price: 99999.50,
-            ask_price: 100000.50,
+            bid_prices: [99999.50, 99999.00],
+            ask_prices: [100000.50, 100001.00],
+            num_levels: 1,
             quantity: 0.001,
             mid_price: 100000.0,
             spread: 1.0,
@@ -258,8 +316,28 @@ mod tests {
             half_spread_tick: 50.0,
             valid_for_trading: true,
             history_secs: 600.0,
-            bid_floored: false,
-            ask_floored: false,
+            bid_floored: [false, false],
+            ask_floored: [false, false],
+        }
+    }
+
+    fn sample_quote_2_levels() -> Quote {
+        Quote {
+            symbol: Symbol::new("TEST-USD"),
+            bid_prices: [99999.50, 99999.00],
+            ask_prices: [100000.50, 100001.00],
+            num_levels: 2,
+            quantity: 0.001,
+            mid_price: 100000.0,
+            spread: 1.0,
+            volatility: 0.0234,
+            alpha: 0.15,
+            position: 0.0,
+            half_spread_tick: 50.0,
+            valid_for_trading: true,
+            history_secs: 600.0,
+            bid_floored: [false, true],
+            ask_floored: [false, false],
         }
     }
 
@@ -285,6 +363,19 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_level_bps() {
+        let quote = sample_quote_2_levels();
+        // Level 0: (99999.50 - 100000) / 100000 * 10000 = -0.05 bps
+        assert!((quote.bid_bps_at(0) - (-0.05)).abs() < 0.001);
+        // Level 1: (99999.00 - 100000) / 100000 * 10000 = -0.10 bps
+        assert!((quote.bid_bps_at(1) - (-0.10)).abs() < 0.001);
+        // Level 0: (100000.50 - 100000) / 100000 * 10000 = 0.05 bps
+        assert!((quote.ask_bps_at(0) - 0.05).abs() < 0.001);
+        // Level 1: (100001.00 - 100000) / 100000 * 10000 = 0.10 bps
+        assert!((quote.ask_bps_at(1) - 0.10).abs() < 0.001);
+    }
+
+    #[test]
     fn test_format_oneline() {
         let quote = sample_quote();
         let formatter = QuoteFormatter::default();
@@ -306,5 +397,17 @@ mod tests {
         assert!(output.contains("mid="));
         assert!(output.contains("Quote:"));
         assert!(output.contains("Size:"));
+    }
+
+    #[test]
+    fn test_format_multiline_2_levels() {
+        let quote = sample_quote_2_levels();
+        let formatter = QuoteFormatter::default();
+        let output = formatter.format_multiline(&quote);
+
+        assert!(output.contains("TEST-USD"));
+        assert!(output.contains("(2lvl)"));
+        assert!(output.contains("L0:"));
+        assert!(output.contains("L1:"));
     }
 }
