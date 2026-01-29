@@ -24,7 +24,7 @@
     "half_spread_bps": 0.0,
     "min_half_spread_bps": 1.0,
     "skew": 4.2,
-    "c1_ticks": 0.34,
+    "c1_ticks": 1.6,
     "looking_depth": 0.025,
     "order_levels": 2,
     "spread_level_multiplier": 2.0
