@@ -191,7 +191,7 @@ fn default_tick_size() -> f64 { 0.01 }
 fn default_step_ns() -> u64 { 100_000_000 } // 100ms
 fn default_window_steps() -> usize { 6000 }
 fn default_update_interval_steps() -> usize { 1 }  // Update on every message
-fn default_vol_to_half_spread() -> f64 { 8.0 }
+fn default_vol_to_half_spread() -> f64 { 0.8 }
 fn default_skew() -> f64 { 1.0 }
 fn default_c1_ticks() -> f64 { 160.0 }
 fn default_looking_depth() -> f64 { 0.025 }

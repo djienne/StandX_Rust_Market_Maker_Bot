@@ -343,8 +343,8 @@ impl ObiStrategy {
         // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
         let tick_size = self.tick_size();
         let base_half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
-            // Mode 1: Volatility-based
-            self.volatility * self.config.vol_to_half_spread
+            // Mode 1: Volatility-based (half_spread_price = volatility * vol_to_half_spread)
+            (self.volatility * self.config.vol_to_half_spread) / tick_size
         } else if self.config.half_spread_bps > 0.0 {
             // Mode 2: BPS-based
             mid_price * (self.config.half_spread_bps / 10000.0) / tick_size
@@ -580,7 +580,7 @@ mod tests {
             step_ns: 100_000_000,
             window_steps: 10,  // Small window for testing
             update_interval_steps: 1,
-            vol_to_half_spread: 8.0,
+            vol_to_half_spread: 0.8,
             half_spread: 0.0,
             half_spread_bps: 0.0,
             skew: 1.0,
