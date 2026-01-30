@@ -1,5 +1,5 @@
 {
-  "symbols": ["XAU-USD"],
+  "symbols": ["BTC-USD"],
   "orderbook_levels": 20,
   "history_minutes": 10,
   "history_buffer_size": 100000,
@@ -19,12 +19,12 @@
     "step_ns": 100000000,
     "window_steps": 6000,
     "update_interval_steps": 1,
-    "vol_to_half_spread": 27.0,
+    "vol_to_half_spread": 40.0,
     "half_spread": 0.0,
     "half_spread_bps": 0.0,
     "min_half_spread_bps": 1.0,
-    "skew": 4.2,
-    "c1_ticks": 1.6,
+    "skew": 2.4,
+    "c1_ticks": 3.9,
     "looking_depth": 0.025,
     "order_levels": 2,
     "spread_level_multiplier": 2.0
