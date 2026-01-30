@@ -26,8 +26,8 @@ pub struct ObiStrategy {
     mid_price_chg_stats: RollingStats,
     /// Rolling window for imbalance (alpha)
     imbalance_stats: RollingStats,
-    /// Previous mid-price in ticks
-    prev_mid_tick: Option<f64>,
+    /// Previous mid-price in dollars (price units)
+    prev_mid_price: Option<f64>,
     /// Current position in base asset units
     position: f64,
     /// Current step count
@@ -71,7 +71,7 @@ impl ObiStrategy {
             shared_equity: None,
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
-            prev_mid_tick: None,
+            prev_mid_price: None,
             position: 0.0,
             step_count: 0,
             last_update_step: 0,
@@ -101,7 +101,7 @@ impl ObiStrategy {
             shared_equity: Some(shared_equity),
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
-            prev_mid_tick: None,
+            prev_mid_price: None,
             position: 0.0,
             step_count: 0,
             last_update_step: 0,
@@ -242,11 +242,10 @@ impl ObiStrategy {
 
         // Get mid-price
         let mid_price = snapshot.mid_price()?;
-        let mid_tick = mid_price / self.tick_size();
 
-        // Calculate mid-price change
-        if let Some(prev_tick) = self.prev_mid_tick {
-            let mid_chg = mid_tick - prev_tick;
+        // Calculate mid-price change in dollars (consistent with Python)
+        if let Some(prev_mid) = self.prev_mid_price {
+            let mid_chg = mid_price - prev_mid;
             self.mid_price_chg_stats.push(mid_chg);
             self.total_samples += 1;
 
@@ -258,7 +257,7 @@ impl ObiStrategy {
                 );
             }
         }
-        self.prev_mid_tick = Some(mid_tick);
+        self.prev_mid_price = Some(mid_price);
 
         // Calculate imbalance
         let imbalance = self.calculate_imbalance(snapshot, mid_price);
@@ -500,7 +499,7 @@ impl ObiStrategy {
     pub fn reset_state(&mut self) {
         self.mid_price_chg_stats.clear();
         self.imbalance_stats.clear();
-        self.prev_mid_tick = None;
+        self.prev_mid_price = None;
         self.step_count = 0;
         self.last_update_step = 0;
         self.volatility = 0.0;
