@@ -82,6 +82,7 @@
 //! }
 //! ```
 
+pub mod binance;
 pub mod config;
 pub mod logging;
 pub mod orderbook;
@@ -107,6 +108,11 @@ pub use trading::{
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
 pub use types::{OrderbookSnapshot, PriceLevel, Symbol, MAX_LEVELS};
+pub use binance::{
+    BinanceClient, BinanceClientConfig, BinanceEvent, BinanceObiCalculator,
+    BinanceOrderbook, BinanceWsStats, BinanceWsStatsSnapshot,
+    SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
+};
 pub use websocket::{
     WsClient, WsClientBuilder, WsEvent, WsStats, WsStatsSnapshot,
     StandXMessage, DepthBookData, MessageError,

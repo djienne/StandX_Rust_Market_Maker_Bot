@@ -6,6 +6,7 @@
 /// A ring buffer for storing rolling values.
 ///
 /// Designed for single-threaded use (no atomics needed since always &mut self).
+#[derive(Debug)]
 pub struct RollingWindow {
     /// Pre-allocated buffer of values
     buffer: Box<[f64]>,
@@ -114,6 +115,7 @@ impl RollingWindow {
 ///
 /// Uses the formula: Var(X) = E[X²] - E[X]²
 /// This allows O(1) updates by tracking sum and sum of squares.
+#[derive(Debug)]
 pub struct RollingStats {
     /// Rolling window of values (needed for old value retrieval)
     window: RollingWindow,

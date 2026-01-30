@@ -20,6 +20,7 @@ use standx_orderbook::{
     OrderbookSanityChecker, SanityCheckerConfig, SanityCheckerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
+    SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
 };
 use standx_orderbook::trading::SharedEquity;
 use standx_orderbook::trading::TradingStats;
@@ -221,6 +222,8 @@ struct App {
     symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
     /// Shared equity for automatic order sizing (lock-free reads)
     shared_equity: Arc<SharedEquity>,
+    /// Shared Binance alpha for lock-free reads (optional)
+    shared_binance_alpha: Option<Arc<SharedAlpha>>,
     /// Order managers per symbol
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
@@ -250,7 +253,11 @@ struct App {
 
 impl App {
     /// Create a new application with shared symbol info for dynamic tick_size/lot_size.
-    fn new(config: Config, symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>) -> Self {
+    fn new(
+        config: Config,
+        symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
+        shared_binance_alpha: Option<Arc<SharedAlpha>>,
+    ) -> Self {
         let store = Arc::new(OrderbookStore::new(
             &config.symbols,
             config.history_buffer_size,
@@ -270,14 +277,26 @@ impl App {
         let mut symbol_arcs = HashMap::new();
 
         for symbol in &config.symbols {
-            // Create strategy with shared symbol info and shared equity
+            // Create strategy with shared symbol info, shared equity, and optional Binance alpha
             let strategy = if let Some(shared_info) = symbol_infos.get(symbol) {
-                ObiStrategy::with_shared_info(
-                    config.strategy.clone(),
-                    Arc::clone(shared_info),
-                    Arc::clone(&shared_equity),
-                    config.history_minutes,
-                )
+                if let Some(ref binance_alpha) = shared_binance_alpha {
+                    // Full constructor with Binance alpha
+                    ObiStrategy::with_binance_alpha(
+                        config.strategy.clone(),
+                        Arc::clone(shared_info),
+                        Arc::clone(&shared_equity),
+                        Arc::clone(binance_alpha),
+                        config.history_minutes,
+                    )
+                } else {
+                    // Without Binance alpha
+                    ObiStrategy::with_shared_info(
+                        config.strategy.clone(),
+                        Arc::clone(shared_info),
+                        Arc::clone(&shared_equity),
+                        config.history_minutes,
+                    )
+                }
             } else {
                 // Fallback to config-based tick_size (still uses shared_equity)
                 ObiStrategy::with_required_history(
@@ -334,6 +353,7 @@ impl App {
             positions,
             symbol_infos,
             shared_equity,
+            shared_binance_alpha,
             order_managers,
             order_tx: None,
             symbol_arcs,
@@ -763,8 +783,41 @@ async fn main() -> anyhow::Result<()> {
         symbol_infos.insert(symbol.clone(), Arc::new(SharedSymbolInfo::from_api_response(&info)));
     }
 
-    // Create application with symbol info
-    let mut app = App::new(config.clone(), symbol_infos);
+    // Create SharedAlpha for Binance integration (lock-free reads from hot path)
+    let shared_binance_alpha: Option<Arc<SharedAlpha>> = if config.strategy.alpha_source == "binance" {
+        Some(Arc::new(SharedAlpha::new()))
+    } else {
+        None
+    };
+
+    // Start Binance alpha poller if configured
+    let mut binance_alpha_handle: Option<BinanceAlphaPollerHandle> = None;
+    if let Some(ref shared_alpha) = shared_binance_alpha {
+        // Use btcusdt as the Binance symbol for alpha (BTC is the most liquid market)
+        let binance_symbol = "btcusdt";
+        let window_size = 300; // 30s window at 100ms updates
+        let looking_depth = config.strategy.looking_depth;
+
+        info!(
+            "Starting Binance alpha poller (symbol={}, window={}s, depth={}%, stale_threshold={}ms)",
+            binance_symbol,
+            window_size / 10, // 300 samples @ 100ms = 30s
+            looking_depth * 100.0,
+            config.strategy.binance_stale_ms
+        );
+
+        binance_alpha_handle = Some(start_binance_alpha_poller(
+            binance_symbol,
+            window_size,
+            looking_depth,
+            Arc::clone(shared_alpha),
+        ));
+    } else {
+        info!("Alpha source: StandX (Binance alpha disabled)");
+    }
+
+    // Create application with symbol info and Binance alpha
+    let mut app = App::new(config.clone(), symbol_infos, shared_binance_alpha);
 
     // Create shared auth manager if any feature needs it
     // IMPORTANT: Use a SINGLE AuthManager for all features to ensure consistent ed25519 keypair
@@ -1444,6 +1497,12 @@ async fn main() -> anyhow::Result<()> {
         for handle in symbol_info_handles {
             handle.stop();
         }
+    }
+
+    // Stop Binance alpha poller
+    if let Some(handle) = binance_alpha_handle {
+        info!("Stopping Binance alpha poller...");
+        handle.stop();
     }
 
     // Final stats
