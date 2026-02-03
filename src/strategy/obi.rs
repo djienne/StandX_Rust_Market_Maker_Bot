@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use tracing::{debug, info};
+use crate::binance::SharedAlpha;
 use crate::config::StrategyConfig;
 use crate::trading::{SharedEquity, SharedSymbolInfo};
 use crate::types::OrderbookSnapshot;
@@ -22,12 +23,18 @@ pub struct ObiStrategy {
     shared_info: Option<Arc<SharedSymbolInfo>>,
     /// Shared equity for automatic order sizing (optional)
     shared_equity: Option<Arc<SharedEquity>>,
+    /// Shared Binance alpha for lock-free reads (optional)
+    shared_binance_alpha: Option<Arc<SharedAlpha>>,
+    /// Whether to use Binance alpha (from config)
+    use_binance_alpha: bool,
+    /// Binance stale threshold in milliseconds
+    binance_stale_ms: u64,
     /// Rolling window for mid-price changes (volatility)
     mid_price_chg_stats: RollingStats,
     /// Rolling window for imbalance (alpha)
     imbalance_stats: RollingStats,
-    /// Previous mid-price in ticks
-    prev_mid_tick: Option<f64>,
+    /// Previous mid-price in dollars (price units)
+    prev_mid_price: Option<f64>,
     /// Current position in base asset units
     position: f64,
     /// Current step count
@@ -50,6 +57,8 @@ pub struct ObiStrategy {
     total_samples: usize,
     /// Has logged the "valid for trading" milestone (log only once)
     logged_valid_for_trading: bool,
+    /// Has logged the "using Binance alpha" milestone (log only once)
+    logged_binance_alpha_active: bool,
 }
 
 /// Default required history for trading: 10 minutes in nanoseconds
@@ -64,14 +73,19 @@ impl ObiStrategy {
     /// Create a new OBI strategy.
     pub fn new(config: StrategyConfig) -> Self {
         let window_steps = config.window_steps;
+        let use_binance_alpha = config.alpha_source == "binance";
+        let binance_stale_ms = config.binance_stale_ms;
 
         Self {
             config,
             shared_info: None,
             shared_equity: None,
+            shared_binance_alpha: None,
+            use_binance_alpha,
+            binance_stale_ms,
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
-            prev_mid_tick: None,
+            prev_mid_price: None,
             position: 0.0,
             step_count: 0,
             last_update_step: 0,
@@ -83,6 +97,7 @@ impl ObiStrategy {
             required_history_ns: DEFAULT_REQUIRED_HISTORY_NS,
             total_samples: 0,
             logged_valid_for_trading: false,
+            logged_binance_alpha_active: false,
         }
     }
 
@@ -94,14 +109,19 @@ impl ObiStrategy {
         required_history_minutes: u64,
     ) -> Self {
         let window_steps = config.window_steps;
+        let use_binance_alpha = config.alpha_source == "binance";
+        let binance_stale_ms = config.binance_stale_ms;
 
         Self {
             config,
             shared_info: Some(shared_info),
             shared_equity: Some(shared_equity),
+            shared_binance_alpha: None,
+            use_binance_alpha,
+            binance_stale_ms,
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
-            prev_mid_tick: None,
+            prev_mid_price: None,
             position: 0.0,
             step_count: 0,
             last_update_step: 0,
@@ -113,6 +133,47 @@ impl ObiStrategy {
             required_history_ns: required_history_minutes * 60 * 1_000_000_000,
             total_samples: 0,
             logged_valid_for_trading: false,
+            logged_binance_alpha_active: false,
+        }
+    }
+
+    /// Create a new OBI strategy with Binance alpha integration.
+    ///
+    /// This is the preferred constructor when using Binance as the alpha source.
+    /// The shared_binance_alpha provides lock-free reads (~1ns) for the hot path.
+    pub fn with_binance_alpha(
+        config: StrategyConfig,
+        shared_info: Arc<SharedSymbolInfo>,
+        shared_equity: Arc<SharedEquity>,
+        shared_binance_alpha: Arc<SharedAlpha>,
+        required_history_minutes: u64,
+    ) -> Self {
+        let window_steps = config.window_steps;
+        let use_binance_alpha = config.alpha_source == "binance";
+        let binance_stale_ms = config.binance_stale_ms;
+
+        Self {
+            config,
+            shared_info: Some(shared_info),
+            shared_equity: Some(shared_equity),
+            shared_binance_alpha: Some(shared_binance_alpha),
+            use_binance_alpha,
+            binance_stale_ms,
+            mid_price_chg_stats: RollingStats::new(window_steps),
+            imbalance_stats: RollingStats::new(window_steps),
+            prev_mid_price: None,
+            position: 0.0,
+            step_count: 0,
+            last_update_step: 0,
+            volatility: 0.0,
+            alpha: 0.0,
+            warmed_up: false,
+            first_timestamp_ns: None,
+            latest_timestamp_ns: 0,
+            required_history_ns: required_history_minutes * 60 * 1_000_000_000,
+            total_samples: 0,
+            logged_valid_for_trading: false,
+            logged_binance_alpha_active: false,
         }
     }
 
@@ -126,6 +187,11 @@ impl ObiStrategy {
         strategy.shared_equity = Some(shared_equity);
         strategy.required_history_ns = required_history_minutes * 60 * 1_000_000_000;
         strategy
+    }
+
+    /// Set the shared Binance alpha (for late binding after construction).
+    pub fn set_binance_alpha(&mut self, shared_alpha: Arc<SharedAlpha>) {
+        self.shared_binance_alpha = Some(shared_alpha);
     }
 
     /// Get the current tick size (from SharedSymbolInfo if available, else from config).
@@ -242,11 +308,10 @@ impl ObiStrategy {
 
         // Get mid-price
         let mid_price = snapshot.mid_price()?;
-        let mid_tick = mid_price / self.tick_size();
 
-        // Calculate mid-price change
-        if let Some(prev_tick) = self.prev_mid_tick {
-            let mid_chg = mid_tick - prev_tick;
+        // Calculate mid-price change in dollars (consistent with Python)
+        if let Some(prev_mid) = self.prev_mid_price {
+            let mid_chg = mid_price - prev_mid;
             self.mid_price_chg_stats.push(mid_chg);
             self.total_samples += 1;
 
@@ -258,7 +323,7 @@ impl ObiStrategy {
                 );
             }
         }
-        self.prev_mid_tick = Some(mid_tick);
+        self.prev_mid_price = Some(mid_price);
 
         // Calculate imbalance
         let imbalance = self.calculate_imbalance(snapshot, mid_price);
@@ -295,8 +360,38 @@ impl ObiStrategy {
         let vol_raw = self.mid_price_chg_stats.std();
         self.volatility = vol_raw * self.config.vol_scale();
 
-        // Calculate alpha (z-score of imbalance)
-        self.alpha = self.imbalance_stats.zscore(imbalance);
+        // Calculate alpha - prefer Binance if configured and available (~5ns decision)
+        // This is the critical hot path optimization: lock-free atomic reads
+        self.alpha = if self.use_binance_alpha {
+            if let Some(ref binance) = self.shared_binance_alpha {
+                if binance.is_warmed_up() && !binance.is_stale(self.binance_stale_ms) {
+                    // Use Binance alpha (lock-free read, ~1ns)
+                    let binance_alpha = binance.alpha();
+
+                    // Log milestone once when Binance alpha becomes active
+                    if !self.logged_binance_alpha_active {
+                        info!(
+                            "[{}] Using Binance alpha: {:.3} (samples={})",
+                            snapshot.symbol,
+                            binance_alpha,
+                            binance.sample_count()
+                        );
+                        self.logged_binance_alpha_active = true;
+                    }
+
+                    binance_alpha
+                } else {
+                    // Fallback to StandX alpha (Binance not ready or stale)
+                    self.imbalance_stats.zscore(imbalance)
+                }
+            } else {
+                // No Binance alpha provided, use StandX
+                self.imbalance_stats.zscore(imbalance)
+            }
+        } else {
+            // StandX alpha explicitly configured
+            self.imbalance_stats.zscore(imbalance)
+        };
 
         // Calculate and return quote
         self.calculate_quote(snapshot, mid_price)
@@ -343,8 +438,8 @@ impl ObiStrategy {
         // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
         let tick_size = self.tick_size();
         let base_half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
-            // Mode 1: Volatility-based
-            self.volatility * self.config.vol_to_half_spread
+            // Mode 1: Volatility-based (half_spread_price = volatility * vol_to_half_spread)
+            (self.volatility * self.config.vol_to_half_spread) / tick_size
         } else if self.config.half_spread_bps > 0.0 {
             // Mode 2: BPS-based
             mid_price * (self.config.half_spread_bps / 10000.0) / tick_size
@@ -500,7 +595,7 @@ impl ObiStrategy {
     pub fn reset_state(&mut self) {
         self.mid_price_chg_stats.clear();
         self.imbalance_stats.clear();
-        self.prev_mid_tick = None;
+        self.prev_mid_price = None;
         self.step_count = 0;
         self.last_update_step = 0;
         self.volatility = 0.0;
@@ -510,6 +605,22 @@ impl ObiStrategy {
         self.latest_timestamp_ns = 0;
         self.total_samples = 0;
         self.logged_valid_for_trading = false;
+        self.logged_binance_alpha_active = false;
+    }
+
+    /// Check if using Binance alpha.
+    #[inline]
+    pub fn is_using_binance_alpha(&self) -> bool {
+        self.use_binance_alpha
+            && self.shared_binance_alpha.as_ref().map_or(false, |b| {
+                b.is_warmed_up() && !b.is_stale(self.binance_stale_ms)
+            })
+    }
+
+    /// Get the configured alpha source.
+    #[inline]
+    pub fn alpha_source(&self) -> &str {
+        &self.config.alpha_source
     }
 }
 
@@ -580,7 +691,7 @@ mod tests {
             step_ns: 100_000_000,
             window_steps: 10,  // Small window for testing
             update_interval_steps: 1,
-            vol_to_half_spread: 8.0,
+            vol_to_half_spread: 0.8,
             half_spread: 0.0,
             half_spread_bps: 0.0,
             skew: 1.0,
@@ -592,6 +703,8 @@ mod tests {
             min_half_spread_bps: 2.0,
             order_levels: 1,
             spread_level_multiplier: 1.5,
+            alpha_source: "standx".to_string(), // Use StandX for tests
+            binance_stale_ms: 5000,
         }
     }
 

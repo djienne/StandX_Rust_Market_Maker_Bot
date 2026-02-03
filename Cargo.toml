@@ -55,6 +55,9 @@ base64 = "0.21"
 # Fast float parsing (faster than std::str::parse)
 fast-float = "0.2"
 
+# Ordered floats for BTreeMap keys
+ordered-float = "4.0"
+
 # Environment variables
 dotenvy = "0.15"
 

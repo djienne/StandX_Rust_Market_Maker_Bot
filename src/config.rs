@@ -185,13 +185,25 @@ pub struct StrategyConfig {
     /// Default: 1.5
     #[serde(default = "default_spread_level_multiplier")]
     pub spread_level_multiplier: f64,
+
+    /// Alpha source: "binance" (default) or "standx".
+    /// When set to "binance", uses Binance Futures orderbook imbalance for alpha signal.
+    /// Falls back to StandX alpha if Binance is stale or not warmed up.
+    #[serde(default = "default_alpha_source")]
+    pub alpha_source: String,
+
+    /// Binance alpha stale threshold in milliseconds.
+    /// If Binance alpha hasn't been updated within this time, falls back to StandX.
+    /// Default: 5000 (5 seconds)
+    #[serde(default = "default_binance_stale_ms")]
+    pub binance_stale_ms: u64,
 }
 
 fn default_tick_size() -> f64 { 0.01 }
 fn default_step_ns() -> u64 { 100_000_000 } // 100ms
 fn default_window_steps() -> usize { 6000 }
 fn default_update_interval_steps() -> usize { 1 }  // Update on every message
-fn default_vol_to_half_spread() -> f64 { 8.0 }
+fn default_vol_to_half_spread() -> f64 { 0.8 }
 fn default_skew() -> f64 { 1.0 }
 fn default_c1_ticks() -> f64 { 160.0 }
 fn default_looking_depth() -> f64 { 0.025 }
@@ -200,6 +212,8 @@ fn default_lot_size() -> f64 { 0.001 }
 fn default_min_half_spread_bps() -> f64 { 2.0 }
 fn default_order_levels() -> usize { 1 }
 fn default_spread_level_multiplier() -> f64 { 1.5 }
+fn default_alpha_source() -> String { "binance".to_string() }
+fn default_binance_stale_ms() -> u64 { 5000 }
 
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -220,6 +234,8 @@ impl Default for StrategyConfig {
             lot_size: default_lot_size(),
             order_levels: default_order_levels(),
             spread_level_multiplier: default_spread_level_multiplier(),
+            alpha_source: default_alpha_source(),
+            binance_stale_ms: default_binance_stale_ms(),
         }
     }
 }
