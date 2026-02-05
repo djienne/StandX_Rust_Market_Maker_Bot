@@ -197,6 +197,13 @@ pub struct StrategyConfig {
     /// Default: 5000 (5 seconds)
     #[serde(default = "default_binance_stale_ms")]
     pub binance_stale_ms: u64,
+
+    /// Leverage multiplier (1.0–5.0).
+    /// Multiplies effective capital for order sizing and position limits.
+    /// With leverage N, order_qty and max_position scale as if equity were `equity * N`.
+    /// Default: 1.0 (no leverage)
+    #[serde(default = "default_leverage")]
+    pub leverage: f64,
 }
 
 fn default_tick_size() -> f64 { 0.01 }
@@ -214,6 +221,7 @@ fn default_order_levels() -> usize { 1 }
 fn default_spread_level_multiplier() -> f64 { 1.5 }
 fn default_alpha_source() -> String { "binance".to_string() }
 fn default_binance_stale_ms() -> u64 { 5000 }
+fn default_leverage() -> f64 { 1.0 }
 
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -236,6 +244,7 @@ impl Default for StrategyConfig {
             spread_level_multiplier: default_spread_level_multiplier(),
             alpha_source: default_alpha_source(),
             binance_stale_ms: default_binance_stale_ms(),
+            leverage: default_leverage(),
         }
     }
 }
@@ -626,6 +635,12 @@ impl Config {
         if self.strategy.spread_level_multiplier <= 1.0 {
             return Err(ConfigError::ValidationError(
                 "strategy.spread_level_multiplier must be greater than 1.0".to_string()
+            ));
+        }
+
+        if self.strategy.leverage < 1.0 || self.strategy.leverage > 5.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.leverage must be between 1.0 and 5.0".to_string()
             ));
         }
 

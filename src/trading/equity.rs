@@ -42,24 +42,28 @@ pub struct SharedEquity {
     order_levels: AtomicU8,
     /// Minimum order size in USD
     min_order_qty_dollar: f64,
+    /// Leverage multiplier (1.0–5.0), immutable after construction
+    leverage: f64,
     /// Last update timestamp (Unix millis)
     last_update_ms: AtomicU64,
 }
 
 impl SharedEquity {
-    /// Create a new SharedEquity with the given order levels and minimum order size.
+    /// Create a new SharedEquity with the given order levels, minimum order size, and leverage.
     ///
     /// # Arguments
     ///
     /// * `order_levels` - Number of order levels (1 or 2)
     /// * `min_order_qty_dollar` - Minimum order size in USD (prevents dust orders)
-    pub fn new(order_levels: usize, min_order_qty_dollar: f64) -> Self {
+    /// * `leverage` - Leverage multiplier (1.0–5.0). Multiplies effective capital.
+    pub fn new(order_levels: usize, min_order_qty_dollar: f64, leverage: f64) -> Self {
         Self {
             equity_bits: AtomicU64::new(0.0f64.to_bits()),
             order_qty_dollar_bits: AtomicU64::new(0.0f64.to_bits()),
             max_position_dollar_bits: AtomicU64::new(0.0f64.to_bits()),
             order_levels: AtomicU8::new(order_levels as u8),
             min_order_qty_dollar,
+            leverage,
             last_update_ms: AtomicU64::new(0),
         }
     }
@@ -100,10 +104,10 @@ impl SharedEquity {
     /// The formula division happens here, not in the hot path.
     ///
     /// ## Order Quantity Formula
-    /// `order_qty_dollar = equity / 5 * 0.9 / order_levels`
+    /// `order_qty_dollar = equity * leverage / 5 * 0.9 / order_levels`
     ///
     /// ## Max Position Formula
-    /// `max_position_dollar = (equity - order_reserve) * (1.0 - safety_margin)`
+    /// `max_position_dollar = (equity * leverage - order_reserve) * (1.0 - safety_margin)`
     /// Where:
     /// - `order_reserve = order_qty * order_levels` (margin blocked by bid orders)
     /// - `safety_margin = 0.10` (10% buffer for price movements, funding, PnL)
@@ -113,19 +117,22 @@ impl SharedEquity {
     pub fn set_equity(&self, equity: f64) {
         self.equity_bits.store(equity.to_bits(), Ordering::Release);
 
-        // Calculate order_qty: equity / 5 * 0.9 / order_levels
+        // Apply leverage to get effective capital
+        let effective = equity * self.leverage;
+
+        // Calculate order_qty: effective / 5 * 0.9 / order_levels
         let levels = self.order_levels.load(Ordering::Acquire) as f64;
-        let raw_qty = equity / 5.0 * 0.9 / levels;
+        let raw_qty = effective / 5.0 * 0.9 / levels;
         let qty = raw_qty.max(self.min_order_qty_dollar);
 
         self.order_qty_dollar_bits
             .store(qty.to_bits(), Ordering::Release);
 
-        // Calculate max_position: (equity - order_reserve) * (1.0 - safety_margin)
+        // Calculate max_position: (effective - order_reserve) * (1.0 - safety_margin)
         // order_reserve = order_qty * levels (margin blocked by all bid orders)
-        // Example: $2000 equity, $200/order, 2 levels -> ($2000 - $400) * 0.9 = $1440
+        // Example: $2000 equity, 3x leverage, $540/order, 2 levels -> ($6000 - $1080) * 0.9 = $4428
         let order_reserve = qty * levels;
-        let max_pos = (equity - order_reserve) * (1.0 - MAX_POSITION_SAFETY_MARGIN);
+        let max_pos = (effective - order_reserve) * (1.0 - MAX_POSITION_SAFETY_MARGIN);
         let max_pos = max_pos.max(0.0); // Floor at 0 for edge cases (low equity)
         self.max_position_dollar_bits
             .store(max_pos.to_bits(), Ordering::Release);
@@ -157,6 +164,12 @@ impl SharedEquity {
     pub fn min_order_qty_dollar(&self) -> f64 {
         self.min_order_qty_dollar
     }
+
+    /// Get the leverage multiplier.
+    #[inline]
+    pub fn leverage(&self) -> f64 {
+        self.leverage
+    }
 }
 
 #[cfg(test)]
@@ -165,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_shared_equity_new() {
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
         assert_eq!(equity.equity(), 0.0);
         assert_eq!(equity.order_qty_dollar(), 0.0);
         assert_eq!(equity.max_position_dollar(), 0.0);
@@ -178,7 +191,7 @@ mod tests {
         // order_qty: $500 / 5 * 0.9 / 2 = $45
         // order_reserve: $45 * 2 = $90
         // max_position: ($500 - $90) * 0.9 = $410 * 0.9 = $369
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
         equity.set_equity(500.0);
 
         assert!(equity.is_initialized());
@@ -193,7 +206,7 @@ mod tests {
         // order_qty: $500 / 5 * 0.9 / 1 = $90
         // order_reserve: $90 * 1 = $90
         // max_position: ($500 - $90) * 0.9 = $410 * 0.9 = $369
-        let equity = SharedEquity::new(1, 10.0);
+        let equity = SharedEquity::new(1, 10.0, 1.0);
         equity.set_equity(500.0);
 
         assert_eq!(equity.order_qty_dollar(), 90.0);
@@ -206,7 +219,7 @@ mod tests {
         // order_qty: $10 / 5 * 0.9 / 2 = $0.9, below min -> 10.0
         // order_reserve: $10 * 2 = $20
         // max_position: ($10 - $20) * 0.9 = -$10 * 0.9 = -$9 -> floored to 0
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
         equity.set_equity(10.0);
 
         assert_eq!(equity.order_qty_dollar(), 10.0);
@@ -219,7 +232,7 @@ mod tests {
         // order_qty floors to min_order_qty_dollar = 10.0
         // order_reserve: $10 * 2 = $20
         // max_position: ($0 - $20) * 0.9 = -$18 -> floored to 0
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
         equity.set_equity(0.0);
 
         assert!(!equity.is_initialized());
@@ -229,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_shared_equity_age() {
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
 
         // Before any update, age should be MAX
         assert_eq!(equity.age_ms(), u64::MAX);
@@ -245,7 +258,7 @@ mod tests {
         // order_qty: $2000 / 5 * 0.9 / 2 = $180
         // order_reserve: $180 * 2 = $360
         // max_position: ($2000 - $360) * 0.9 = $1640 * 0.9 = $1476
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
         equity.set_equity(2000.0);
 
         assert_eq!(equity.order_qty_dollar(), 180.0);
@@ -258,7 +271,7 @@ mod tests {
         // order_qty: $2227.59 / 5 * 0.9 / 2 = $200.48 (approx)
         // order_reserve: $200.48 * 2 = $400.97
         // max_position: ($2227.59 - $400.97) * 0.9 = $1826.62 * 0.9 = $1643.96
-        let equity = SharedEquity::new(2, 10.0);
+        let equity = SharedEquity::new(2, 10.0, 1.0);
         equity.set_equity(2227.59);
 
         let order_qty = equity.order_qty_dollar();
@@ -268,5 +281,21 @@ mod tests {
         assert!((order_qty - 200.4831).abs() < 0.01);
         // Check max_position is approximately $1643.96
         assert!((max_pos - 1643.96).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_shared_equity_with_leverage() {
+        // Test with $2000 equity, 3x leverage, 2 order levels
+        // effective = $2000 * 3 = $6000
+        // order_qty: $6000 / 5 * 0.9 / 2 = $540
+        // order_reserve: $540 * 2 = $1080
+        // max_position: ($6000 - $1080) * 0.9 = $4920 * 0.9 = $4428
+        let equity = SharedEquity::new(2, 10.0, 3.0);
+        equity.set_equity(2000.0);
+
+        assert_eq!(equity.equity(), 2000.0); // Raw equity unchanged
+        assert_eq!(equity.leverage(), 3.0);
+        assert_eq!(equity.order_qty_dollar(), 540.0);
+        assert_eq!(equity.max_position_dollar(), 4428.0);
     }
 }

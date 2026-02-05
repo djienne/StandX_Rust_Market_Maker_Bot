@@ -164,10 +164,18 @@ impl WalletTracker {
             self.shared_equity.set_equity(equity);
             let order_qty = self.shared_equity.order_qty_dollar();
             if !was_initialized {
-                info!(
-                    "Order sizing: equity=${:.2} -> ${:.2}/order",
-                    equity, order_qty
-                );
+                let leverage = self.shared_equity.leverage();
+                if leverage > 1.0 {
+                    info!(
+                        "Order sizing: equity=${:.2} x{:.0} leverage -> ${:.2}/order",
+                        equity, leverage, order_qty
+                    );
+                } else {
+                    info!(
+                        "Order sizing: equity=${:.2} -> ${:.2}/order",
+                        equity, order_qty
+                    );
+                }
             }
         }
 

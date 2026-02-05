@@ -705,12 +705,13 @@ mod tests {
             spread_level_multiplier: 1.5,
             alpha_source: "standx".to_string(), // Use StandX for tests
             binance_stale_ms: 5000,
+            leverage: 1.0,
         }
     }
 
     /// Create a SharedEquity with initialized equity for tests
     fn test_shared_equity() -> Arc<SharedEquity> {
-        let equity = Arc::new(SharedEquity::new(1, 10.0));
+        let equity = Arc::new(SharedEquity::new(1, 10.0, 1.0));
         equity.set_equity(500.0); // $500 -> $90/order
         equity
     }

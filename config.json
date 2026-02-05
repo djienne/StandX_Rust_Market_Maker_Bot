@@ -27,7 +27,8 @@
     "c1_ticks": 2.0,
     "looking_depth": 0.025,
     "order_levels": 2,
-    "spread_level_multiplier": 2.0
+    "spread_level_multiplier": 2.0,
+    "leverage": 3.0
   },
   "order": {
     "enabled": true,
