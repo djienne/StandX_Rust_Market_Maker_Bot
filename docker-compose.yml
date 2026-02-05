@@ -9,6 +9,11 @@ services:
       - ./config.json:/app/config.json:ro
       - ./data:/app/data
     stop_grace_period: 30s
+    deploy:
+      ressources:
+        limits:
+          cpus: '1.0'
+          memory: '300m'
     logging:
       driver: json-file
       options:
