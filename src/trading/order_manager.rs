@@ -1290,7 +1290,7 @@ mod tests {
     /// Create SharedEquity with a given max_position_dollar.
     /// Uses reverse formula: equity = max_position / 0.9 (since max_pos = equity * 0.9)
     fn create_test_equity(max_position_dollar: f64) -> Arc<SharedEquity> {
-        let equity = Arc::new(SharedEquity::new(1, 10.0));
+        let equity = Arc::new(SharedEquity::new(1, 10.0, 1.0));
         // Reverse the formula: max_pos = equity * 0.9 => equity = max_pos / 0.9
         let raw_equity = max_position_dollar / 0.9;
         equity.set_equity(raw_equity);

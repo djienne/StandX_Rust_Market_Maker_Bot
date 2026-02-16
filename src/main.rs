@@ -268,6 +268,7 @@ impl App {
         let shared_equity = Arc::new(SharedEquity::new(
             config.strategy.order_levels,
             config.strategy.min_order_qty_dollar,
+            config.strategy.leverage,
         ));
 
         // Create OBI strategy, shared position, order manager, and Arc<str> for each symbol
@@ -719,12 +720,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     info!(
-        "Strategy: tick={}, window={}, update_interval={}, vol_to_spread={}, order_levels={}",
+        "Strategy: tick={}, window={}, update_interval={}, vol_to_spread={}, order_levels={}, leverage={}x",
         config.strategy.tick_size,
         config.strategy.window_steps,
         config.strategy.update_interval_steps,
         config.strategy.vol_to_half_spread,
         config.strategy.order_levels,
+        config.strategy.leverage,
     );
 
     if config.strategy.order_levels > 1 {
@@ -857,25 +859,26 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Ensure leverage is set to 1x for all symbols before trading
+    // Ensure exchange leverage matches config for all symbols before trading
+    let target_leverage = config.strategy.leverage as i32;
     if config.order.enabled {
         if let Some(ref auth) = shared_auth {
             for symbol in &config.symbols {
                 let mut auth_guard = auth.lock().await;
                 match auth_guard.query_leverage(symbol).await {
                     Ok(current) => {
-                        if current != 1 {
-                            info!("[{}] Leverage is {}x, changing to 1x...", symbol, current);
-                            match auth_guard.set_leverage(symbol, 1).await {
+                        if current != target_leverage {
+                            info!("[{}] Leverage is {}x, changing to {}x...", symbol, current, target_leverage);
+                            match auth_guard.set_leverage(symbol, target_leverage).await {
                                 Ok(()) => {
-                                    info!("[{}] Leverage set to 1x", symbol);
+                                    info!("[{}] Leverage set to {}x", symbol, target_leverage);
                                 }
                                 Err(e) => {
-                                    error!("[{}] Failed to set leverage to 1x: {}", symbol, e);
+                                    error!("[{}] Failed to set leverage to {}x: {}", symbol, target_leverage, e);
                                 }
                             }
                         } else {
-                            info!("[{}] Leverage verified at 1x", symbol);
+                            info!("[{}] Leverage verified at {}x", symbol, target_leverage);
                         }
                     }
                     Err(e) => {
