@@ -2,6 +2,8 @@
 
 High-performance market making system for the StandX perpetual futures exchange, written in Rust.
 
+**Support this project:** Sign up on StandX using [this referral link](https://standx.com/referral?code=FREQTRADEFR)
+
 ## Features
 
 - **Low-latency architecture**: Synchronous hot path (<10μs decisions), async execution
@@ -47,7 +49,7 @@ High-performance market making system for the StandX perpetual futures exchange,
 
 ### Prerequisites
 
-- Rust 1.70+ (for local development)
+- Rust 1.85+ (for local development)
 - Docker & Docker Compose (for deployment)
 - StandX API credentials (set in `.env`)
 
@@ -55,7 +57,7 @@ High-performance market making system for the StandX perpetual futures exchange,
 
 ```bash
 # Clone and build
-cd standx-rs
+cd standx
 cargo build --release
 
 # Create .env file with credentials
@@ -90,11 +92,6 @@ Copy `.env.example` to `.env` and configure:
 |----------|-------------|
 | `WALLET_AD` | Your wallet address (0x...) |
 | `PRIVATE_KEY` | Your private key (without 0x prefix) |
-| `DEPLOY_USER` | SSH username for deployment |
-| `DEPLOY_HOST` | Server IP/hostname for deployment |
-| `DEPLOY_SSH_KEY` | Path to SSH private key |
-| `DEPLOY_DIR` | Remote directory (default: ~/standx-bot) |
-
 ### Configuration
 
 Edit `config.json`:
@@ -242,7 +239,7 @@ When `enabled`, the bot:
 ## Project Structure
 
 ```
-standx-rs/
+standx/
 ├── src/
 │   ├── main.rs           # Application entry point
 │   ├── lib.rs            # Library exports
