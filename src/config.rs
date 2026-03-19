@@ -638,6 +638,24 @@ impl Config {
             ));
         }
 
+        if self.strategy.vol_to_half_spread < 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.vol_to_half_spread must be non-negative".to_string()
+            ));
+        }
+
+        if self.strategy.min_order_qty_dollar <= 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.min_order_qty_dollar must be positive".to_string()
+            ));
+        }
+
+        if self.strategy.skew < 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.skew must be non-negative".to_string()
+            ));
+        }
+
         if self.strategy.leverage < 1.0 || self.strategy.leverage > 5.0 {
             return Err(ConfigError::ValidationError(
                 "strategy.leverage must be between 1.0 and 5.0".to_string()

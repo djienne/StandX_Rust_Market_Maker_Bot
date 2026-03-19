@@ -142,8 +142,12 @@ impl RollingStats {
     }
 
     /// Push a new value and update statistics in O(1).
+    /// NaN/Inf values are silently dropped to prevent contamination.
     #[inline]
     pub fn push(&mut self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
         let old_value = self.window.push(value);
 
         // Add new value's contribution

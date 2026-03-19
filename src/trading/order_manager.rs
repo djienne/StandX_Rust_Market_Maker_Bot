@@ -476,7 +476,7 @@ impl OrderManager {
                 self.stats.orders_sent += 1;
                 self.last_order_sent_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 Some(OrderDecision::Send {
                     side,

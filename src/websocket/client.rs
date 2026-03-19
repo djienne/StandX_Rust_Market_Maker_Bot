@@ -225,8 +225,8 @@ impl WsClient {
                 break;
             }
 
-            // Read with timeout
-            let read_timeout = Duration::from_secs(30);
+            // Read with timeout (use stale_timeout as read deadline)
+            let read_timeout = stale_timeout;
             match timeout(read_timeout, read.next()).await {
                 Ok(Some(Ok(msg))) => {
                     last_message = Instant::now();
