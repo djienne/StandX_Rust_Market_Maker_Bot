@@ -694,19 +694,12 @@ impl OrderManager {
         // Reset circuit breaker on successful acceptance
         self.consecutive_rejections = 0;
 
-        // Reject orders with invalid order_id - cancel would fail with order_id=0
-        if order_id <= 0 {
-            error!(
-                "[{}] Order {} accepted with invalid order_id={} - clearing slot (cancel would fail)",
+        // Warn if order_id is 0 or negative (some exchanges like StandX return 0 normally)
+        if order_id < 0 {
+            warn!(
+                "[{}] Order {} accepted with negative order_id={} - cancellation by order_id may fail",
                 self.config.symbol, cl_ord_id, order_id
             );
-            // Get side/level for pending price cleanup
-            let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.level));
-            self.clear_order_by_cl_ord_id(cl_ord_id);
-            if let Some((side, level)) = order_info {
-                self.clear_pending_price(side, level);
-            }
-            return;
         }
 
         if let Some(order) = self.find_order_mut(cl_ord_id) {
