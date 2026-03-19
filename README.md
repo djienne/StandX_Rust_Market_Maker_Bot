@@ -4,6 +4,8 @@ High-performance market making system for the StandX perpetual futures exchange,
 
 **Support this project:** Sign up on StandX using [this referral link](https://standx.com/referral?code=FREQTRADEFR)
 
+**Warning:** Leverage is configurable (1x–5x) but it is highly recommended to keep it at 1x. Using higher values is very risky and should only be attempted after thorough testing.
+
 ## Features
 
 - **Low-latency architecture**: Synchronous hot path (<10μs decisions), async execution
