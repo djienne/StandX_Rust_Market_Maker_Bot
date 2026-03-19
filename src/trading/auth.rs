@@ -313,7 +313,7 @@ impl AuthManager {
 
         self.auth_count.fetch_add(1, Ordering::Relaxed);
 
-        Ok(self.token.as_ref().unwrap())
+        self.token.as_ref().ok_or(AuthError::NotAuthenticated)
     }
 
     /// Refresh the token if expired or close to expiring.
@@ -339,7 +339,9 @@ impl AuthManager {
             self.authenticate().await?;
         }
 
-        Ok(self.token.as_ref().unwrap().token.as_str())
+        self.token.as_ref()
+            .map(|t| t.token.as_str())
+            .ok_or(AuthError::NotAuthenticated)
     }
 
     /// Query positions (convenience method).
@@ -355,7 +357,7 @@ impl AuthManager {
             Err(ClientError::ApiError(e)) if e.contains("401") || e.contains("unauthorized") => {
                 // Retry on auth error
                 self.authenticate().await?;
-                let new_token = self.token.as_ref().unwrap().token.clone();
+                let new_token = self.token.as_ref().ok_or(AuthError::NotAuthenticated)?.token.clone();
                 self.client.query_positions(&new_token, symbol).await.map_err(Into::into)
             }
             Err(e) => Err(e.into()),
@@ -375,7 +377,7 @@ impl AuthManager {
             Err(ClientError::ApiError(e)) if e.contains("401") || e.contains("unauthorized") => {
                 // Retry on auth error
                 self.authenticate().await?;
-                let new_token = self.token.as_ref().unwrap().token.clone();
+                let new_token = self.token.as_ref().ok_or(AuthError::NotAuthenticated)?.token.clone();
                 self.client.query_balance(&new_token).await.map_err(Into::into)
             }
             Err(e) => Err(e.into()),
@@ -393,7 +395,7 @@ impl AuthManager {
             Err(ClientError::ApiError(e)) if e.contains("401") || e.contains("unauthorized") => {
                 // Retry on auth error
                 self.authenticate().await?;
-                let new_token = self.token.as_ref().unwrap().token.clone();
+                let new_token = self.token.as_ref().ok_or(AuthError::NotAuthenticated)?.token.clone();
                 self.client.query_open_orders(&new_token, symbol).await.map_err(Into::into)
             }
             Err(e) => Err(e.into()),
@@ -493,7 +495,7 @@ impl AuthManager {
             Err(ClientError::ApiError(e)) if e.contains("401") || e.contains("unauthorized") => {
                 // Retry on auth error
                 self.authenticate().await?;
-                let new_token = self.token.as_ref().unwrap().token.clone();
+                let new_token = self.token.as_ref().ok_or(AuthError::NotAuthenticated)?.token.clone();
                 let config = self.client.query_position_config(&new_token, symbol).await?;
                 Ok(config.leverage)
             }

@@ -316,7 +316,7 @@ impl ObiStrategy {
             self.total_samples += 1;
 
             // Log warmup milestones
-            if self.total_samples == 100 || self.total_samples == 500 || self.total_samples == MIN_SAMPLES_FOR_QUOTE {
+            if self.total_samples == MIN_SAMPLES_FOR_QUOTE || self.total_samples == 500 {
                 debug!(
                     "[{}] Warmup milestone: {} samples collected",
                     snapshot.symbol, self.total_samples

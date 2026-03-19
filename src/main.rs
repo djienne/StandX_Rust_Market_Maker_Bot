@@ -35,6 +35,8 @@ struct StatsTracker {
     quote_count: u64,
     /// Order decision counter
     order_decision_count: u64,
+    /// Consecutive order decision channel drops (reset on successful send)
+    consecutive_channel_drops: u64,
     /// Last stats log time
     last_stats_time: std::time::Instant,
     /// Last position log time
@@ -49,6 +51,7 @@ impl StatsTracker {
             message_count: 0,
             quote_count: 0,
             order_decision_count: 0,
+            consecutive_channel_drops: 0,
             last_stats_time: std::time::Instant::now(),
             last_position_log: std::time::Instant::now(),
             trading_stats: Arc::new(TradingStats::default()),
@@ -435,7 +438,7 @@ impl App {
         use std::time::{SystemTime, UNIX_EPOCH};
         let current_time_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
+            .unwrap_or_default()
             .as_nanos() as i64;
 
         // Log clock drift periodically (every ~30s based on stats interval)
@@ -599,7 +602,7 @@ impl App {
                                     use std::time::{SystemTime, UNIX_EPOCH};
                                     let system_time_ns = SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
-                                        .expect("System time before UNIX epoch")
+                                        .unwrap_or_default()
                                         .as_nanos() as i64;
                                     let decisions = order_manager.on_quote(&quote, system_time_ns);
 
@@ -611,7 +614,19 @@ impl App {
                                             self.stats.order_decision_count += 1;
                                             // Non-blocking send (Arc::clone is just a refcount increment)
                                             if tx.try_send((Arc::clone(&symbol_arc), decision)).is_err() {
-                                                warn!("[{}] Order decision channel full, dropping decision", data.symbol);
+                                                self.stats.consecutive_channel_drops += 1;
+                                                if self.stats.consecutive_channel_drops <= 3 {
+                                                    warn!("[{}] Order decision channel full, dropping decision", data.symbol);
+                                                }
+                                                // After 10 consecutive drops, trigger safety pause (executor likely dead)
+                                                if self.stats.consecutive_channel_drops == 10 {
+                                                    error!("[{}] 10 consecutive channel drops - pausing all trading (executor may have crashed)", data.symbol);
+                                                    for (_, manager) in self.order_managers.iter_mut() {
+                                                        manager.trigger_safety_pause("executor channel blocked");
+                                                    }
+                                                }
+                                            } else {
+                                                self.stats.consecutive_channel_drops = 0;
                                             }
                                         }
                                     }
@@ -696,9 +711,9 @@ async fn main() -> anyhow::Result<()> {
     let config = match Config::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            // Log the actual error and use defaults
-            eprintln!("WARNING: Config error for '{}': {} - using defaults", config_path, e);
-            Config::default()
+            eprintln!("FATAL: Config error for '{}': {}", config_path, e);
+            eprintln!("Fix the config file or provide a valid path. Refusing to start with defaults.");
+            std::process::exit(1);
         }
     };
 
@@ -860,6 +875,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Ensure exchange leverage matches config for all symbols before trading
+    // CRITICAL: If leverage cannot be verified/set, refuse to trade to prevent wrong-leverage risk
     let target_leverage = config.strategy.leverage as i32;
     if config.order.enabled {
         if let Some(ref auth) = shared_auth {
@@ -874,7 +890,8 @@ async fn main() -> anyhow::Result<()> {
                                     info!("[{}] Leverage set to {}x", symbol, target_leverage);
                                 }
                                 Err(e) => {
-                                    error!("[{}] Failed to set leverage to {}x: {}", symbol, target_leverage, e);
+                                    error!("[{}] FATAL: Failed to set leverage to {}x: {} - refusing to trade", symbol, target_leverage, e);
+                                    anyhow::bail!("[{}] Cannot set leverage to {}x: {}", symbol, target_leverage, e);
                                 }
                             }
                         } else {
@@ -882,7 +899,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => {
-                        error!("[{}] Failed to query leverage: {}", symbol, e);
+                        error!("[{}] FATAL: Failed to query leverage: {} - refusing to trade", symbol, e);
+                        anyhow::bail!("[{}] Cannot verify leverage: {}", symbol, e);
                     }
                 }
             }
@@ -926,7 +944,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up order management if enabled
     let mut order_event_rx: Option<mpsc::Receiver<OrderEvent>> = None;
-    let order_client: Option<Arc<OrderWsClient>> = if config.order.enabled {
+    let (order_client, executor_handle_opt): (Option<Arc<OrderWsClient>>, Option<tokio::task::JoinHandle<()>>) = if config.order.enabled {
         if let Some(ref auth) = shared_auth {
             // Check if auth succeeded
             let auth_ok = {
@@ -936,7 +954,7 @@ async fn main() -> anyhow::Result<()> {
 
             if !auth_ok {
                 error!("Order management disabled (authentication failed)");
-                None
+                (None, None)
             } else {
                 // Cancel all existing orders before starting (cleanup from previous sessions)
                 {
@@ -985,8 +1003,8 @@ async fn main() -> anyhow::Result<()> {
                 let fallback_tick_size = app.config.strategy.tick_size;
                 let fallback_lot_size = app.config.strategy.lot_size;
 
-                // Spawn order executor task
-                tokio::spawn(async move {
+                // Spawn order executor task (store handle for crash detection)
+                let executor_handle = tokio::spawn(async move {
                     let mut order_rx = order_rx;
                     info!("Order executor task started");
                     while let Some((symbol, decision)) = order_rx.recv().await {
@@ -1029,15 +1047,16 @@ async fn main() -> anyhow::Result<()> {
                     info!("Order executor task stopped");
                 });
 
-                Some(ws_client)
+                (Some(ws_client), Some(executor_handle))
             }
         } else {
             warn!("Order management disabled (no credentials)");
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
+    let mut executor_handle: Option<tokio::task::JoinHandle<()>> = executor_handle_opt;
 
     // Start PnL tracking if enabled (uses shared auth)
     let mut wallet_handle: Option<WalletTrackerHandle> = None;
@@ -1231,7 +1250,7 @@ async fn main() -> anyhow::Result<()> {
                                 use std::time::{SystemTime, UNIX_EPOCH};
                                 let now_ns = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
-                                    .unwrap()
+                                    .unwrap_or_default()
                                     .as_nanos() as i64;
                                 let pending_decisions = manager.check_pending_orders(now_ns);
                                 for decision in pending_decisions {
@@ -1327,6 +1346,37 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Detect order executor crash (if it exits unexpectedly, trigger shutdown)
+            result = async {
+                match executor_handle.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(result) = result {
+                    match result {
+                        Ok(()) => {
+                            error!("FATAL: Order executor task exited unexpectedly - initiating shutdown");
+                        }
+                        Err(e) => {
+                            error!("FATAL: Order executor task panicked: {} - initiating shutdown", e);
+                        }
+                    }
+                    // Pause all order managers immediately
+                    for (_, manager) in app.order_managers_mut() {
+                        manager.pause();
+                    }
+                    // Cancel all orders via HTTP
+                    if let Some(auth) = &shared_auth {
+                        let mut auth_guard = auth.lock().await;
+                        if let Err(e) = auth_guard.cancel_all_orders(None).await {
+                            error!("Failed to cancel orders after executor crash: {}", e);
+                        }
+                    }
+                    break;
+                }
+            }
+
             // Handle shutdown signal
             _ = signal::ctrl_c() => {
                 info!("Received shutdown signal");
@@ -1336,16 +1386,38 @@ async fn main() -> anyhow::Result<()> {
                 if !orders_to_cancel.is_empty() {
                     info!("Canceling {} live order(s)...", orders_to_cancel.len());
 
-                    // Use HTTP batch cancel for reliability (reuse existing auth)
+                    // Use HTTP batch cancel with retry for reliability
                     if let Some(auth) = &shared_auth {
-                        let mut auth_guard = auth.lock().await;
-                        match auth_guard.cancel_orders_by_client_id(&orders_to_cancel).await {
-                            Ok(_) => info!("Successfully canceled orders on shutdown"),
-                            Err(e) => error!("Failed to cancel orders on shutdown: {}", e),
+                        let mut canceled = false;
+                        for attempt in 1..=3 {
+                            let mut auth_guard = auth.lock().await;
+                            match auth_guard.cancel_orders_by_client_id(&orders_to_cancel).await {
+                                Ok(_) => {
+                                    info!("Successfully canceled orders on shutdown");
+                                    canceled = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("Failed to cancel orders on shutdown (attempt {}/3): {}", attempt, e);
+                                    drop(auth_guard);
+                                    if attempt < 3 {
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                        }
+                        if !canceled {
+                            // Last resort: try cancel_all_orders (cancels everything, not just our IDs)
+                            let mut auth_guard = auth.lock().await;
+                            if let Err(e) = auth_guard.cancel_all_orders(None).await {
+                                error!("CRITICAL: Failed to cancel ALL orders on shutdown: {} - ORDERS MAY BE ORPHANED", e);
+                            } else {
+                                info!("Canceled all orders via fallback on shutdown");
+                            }
                         }
                     }
 
-                    // Wait a bit for cancels to process
+                    // Wait for cancels to process
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
 

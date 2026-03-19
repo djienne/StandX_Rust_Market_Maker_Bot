@@ -15,7 +15,7 @@
 //! - State machine tracks orders: Pending → Live → Canceling
 //! - Supports up to 2 order levels per side (4 orders total)
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
@@ -26,6 +26,13 @@ use crate::trading::{SharedEquity, SharedPosition};
 /// Maximum number of order levels supported (2 bids + 2 asks).
 /// Must match MAX_ORDER_LEVELS in strategy/quotes.rs
 pub const MAX_ORDER_LEVELS: usize = 2;
+
+/// Pause reason bitfield values.
+/// Multiple pause reasons can be active simultaneously; trading resumes
+/// only when ALL reasons have been cleared.
+const PAUSE_WS_DISCONNECT: u8 = 1;
+const PAUSE_CIRCUIT_BREAKER: u8 = 2;
+const PAUSE_SAFETY: u8 = 4;
 
 /// Order side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,9 +208,10 @@ pub struct OrderManager {
     /// Shutdown flag.
     shutdown: AtomicBool,
 
-    /// Paused flag (for WebSocket disconnection).
-    /// When paused, no new orders are generated.
-    paused: AtomicBool,
+    /// Pause reasons bitfield (PAUSE_WS_DISCONNECT | PAUSE_CIRCUIT_BREAKER | PAUSE_SAFETY).
+    /// Trading is paused when any bit is set. Each subsystem only clears its own bit,
+    /// preventing one recovery from incorrectly resuming trading blocked by another reason.
+    pause_reasons: AtomicU8,
 
     /// Last time we checked for timeouts (throttles hot path).
     last_timeout_check_ns: i64,
@@ -251,7 +259,7 @@ impl OrderManager {
             session_prefix,
             stats: OrderManagerStats::default(),
             shutdown: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
+            pause_reasons: AtomicU8::new(0),
             last_timeout_check_ns: 0,
             pending_bid_prices: [None, None],
             pending_ask_prices: [None, None],
@@ -299,23 +307,6 @@ impl OrderManager {
         Some(&rest[..underscore_pos])
     }
 
-    /// Extract level from a client order ID.
-    /// Format: mm_<symbol>_<timestamp>_<level>_<seq>
-    /// Returns None if format doesn't match.
-    #[inline]
-    pub fn extract_level_from_cl_ord_id(cl_ord_id: &str) -> Option<usize> {
-        // Format: mm_<symbol>_<timestamp>_<level>_<seq>
-        let rest = cl_ord_id.strip_prefix("mm_")?;
-        let parts: Vec<&str> = rest.split('_').collect();
-        // parts: [symbol, timestamp, level, seq]
-        if parts.len() >= 4 {
-            parts[2].parse().ok()
-        } else {
-            // Backward compatibility: old format without level = level 0
-            Some(0)
-        }
-    }
-
     /// Check for timed out pending orders and return cancel decisions.
     ///
     /// This should be called on EVERY orderbook update, not just when quotes
@@ -358,7 +349,7 @@ impl OrderManager {
     pub fn on_quote(&mut self, quote: &Quote, current_time_ns: i64) -> Vec<OrderDecision> {
         // Early exit if shutting down or paused (atomic, no latency)
         // Use Acquire ordering to ensure we see the Release store from shutdown()/pause()
-        if self.shutdown.load(Ordering::Acquire) || self.paused.load(Ordering::Acquire) {
+        if self.shutdown.load(Ordering::Acquire) || self.pause_reasons.load(Ordering::Acquire) != 0 {
             return vec![];
         }
 
@@ -604,8 +595,9 @@ impl OrderManager {
                             cl_ord_id: order.cl_ord_id.clone(),
                         });
                         self.stats.timeouts += 1;
-                        // Clear immediately
+                        // Clear order and any stale pending price for this slot
                         self.bid_orders[level] = None;
+                        self.pending_bid_prices[level] = None;
                     }
                 }
             }
@@ -639,8 +631,9 @@ impl OrderManager {
                             cl_ord_id: order.cl_ord_id.clone(),
                         });
                         self.stats.timeouts += 1;
-                        // Clear immediately
+                        // Clear order and any stale pending price for this slot
                         self.ask_orders[level] = None;
+                        self.pending_ask_prices[level] = None;
                     }
                 }
             }
@@ -701,12 +694,19 @@ impl OrderManager {
         // Reset circuit breaker on successful acceptance
         self.consecutive_rejections = 0;
 
-        // Warn if order_id is 0 or negative (potentially invalid)
+        // Reject orders with invalid order_id - cancel would fail with order_id=0
         if order_id <= 0 {
-            warn!(
-                "[{}] Order {} accepted with suspicious order_id={} - cancellation may fail",
+            error!(
+                "[{}] Order {} accepted with invalid order_id={} - clearing slot (cancel would fail)",
                 self.config.symbol, cl_ord_id, order_id
             );
+            // Get side/level for pending price cleanup
+            let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.level));
+            self.clear_order_by_cl_ord_id(cl_ord_id);
+            if let Some((side, level)) = order_info {
+                self.clear_pending_price(side, level);
+            }
+            return;
         }
 
         if let Some(order) = self.find_order_mut(cl_ord_id) {
@@ -727,7 +727,7 @@ impl OrderManager {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let now_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_nanos() as i64;
                 let latency_ms = (now_ns - sent_at_ns) / 1_000_000;
 
@@ -773,21 +773,26 @@ impl OrderManager {
                 "[{}] CIRCUIT BREAKER: {} consecutive rejections - PAUSING trading",
                 self.config.symbol, self.consecutive_rejections
             );
-            self.paused.store(true, Ordering::Release);
+            self.pause_reasons.fetch_or(PAUSE_CIRCUIT_BREAKER, Ordering::Release);
             // Record when circuit breaker was triggered
             self.circuit_breaker_triggered_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64;
         }
     }
 
-    /// Reset circuit breaker and resume trading.
+    /// Reset circuit breaker. Trading resumes only if no other pause reasons are active.
     pub fn reset_circuit_breaker(&mut self) {
         self.consecutive_rejections = 0;
         self.circuit_breaker_triggered_at_ms = 0;
-        self.paused.store(false, Ordering::Release);
-        info!("[{}] Circuit breaker reset, trading resumed", self.config.symbol);
+        self.pause_reasons.fetch_and(!PAUSE_CIRCUIT_BREAKER, Ordering::Release);
+        let remaining = self.pause_reasons.load(Ordering::Acquire);
+        if remaining == 0 {
+            info!("[{}] Circuit breaker reset, trading resumed", self.config.symbol);
+        } else {
+            info!("[{}] Circuit breaker reset, but still paused (reasons: {:#04b})", self.config.symbol, remaining);
+        }
     }
 
     /// Check if circuit breaker should auto-recover.
@@ -798,21 +803,21 @@ impl OrderManager {
             return false;
         }
 
-        // Don't recover if not actually paused (could be WS disconnect)
-        if !self.paused.load(Ordering::Acquire) {
+        // Only recover if circuit breaker bit is actually set
+        if self.pause_reasons.load(Ordering::Acquire) & PAUSE_CIRCUIT_BREAKER == 0 {
             return false;
         }
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         let elapsed_secs = (now_ms - self.circuit_breaker_triggered_at_ms) / 1000;
 
         if elapsed_secs >= recovery_secs {
             warn!(
-                "[{}] CIRCUIT BREAKER AUTO-RECOVERY: {} seconds elapsed, resuming trading",
+                "[{}] CIRCUIT BREAKER AUTO-RECOVERY: {} seconds elapsed",
                 self.config.symbol, elapsed_secs
             );
             self.reset_circuit_breaker();
@@ -832,10 +837,10 @@ impl OrderManager {
             "[{}] SAFETY PAUSE: {} - pausing trading",
             self.config.symbol, reason
         );
-        self.paused.store(true, Ordering::Release);
+        self.pause_reasons.fetch_or(PAUSE_SAFETY, Ordering::Release);
         self.safety_pause_triggered_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
     }
 
@@ -851,25 +856,33 @@ impl OrderManager {
             return false;
         }
 
-        // Don't recover if not actually paused
-        if !self.paused.load(Ordering::Acquire) {
+        // Only recover if safety pause bit is actually set
+        if self.pause_reasons.load(Ordering::Acquire) & PAUSE_SAFETY == 0 {
             return false;
         }
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         let elapsed_secs = (now_ms - self.safety_pause_triggered_at_ms) / 1000;
 
         if elapsed_secs >= recovery_secs {
-            warn!(
-                "[{}] SAFETY PAUSE RECOVERY: {} seconds elapsed, resuming trading",
-                self.config.symbol, elapsed_secs
-            );
             self.safety_pause_triggered_at_ms = 0;
-            self.paused.store(false, Ordering::Release);
+            self.pause_reasons.fetch_and(!PAUSE_SAFETY, Ordering::Release);
+            let remaining = self.pause_reasons.load(Ordering::Acquire);
+            if remaining == 0 {
+                warn!(
+                    "[{}] SAFETY PAUSE RECOVERY: {} seconds elapsed, resuming trading",
+                    self.config.symbol, elapsed_secs
+                );
+            } else {
+                warn!(
+                    "[{}] SAFETY PAUSE RECOVERY: {} seconds elapsed, but still paused (reasons: {:#04b})",
+                    self.config.symbol, elapsed_secs, remaining
+                );
+            }
             return true;
         }
 
@@ -889,7 +902,7 @@ impl OrderManager {
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         Some((now_ms - self.last_order_sent_at_ms) / 1000)
     }
@@ -1043,7 +1056,7 @@ impl OrderManager {
                     self.stats.orders_sent += 1;
                     self.last_order_sent_at_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_millis() as u64;
                     decisions.push(OrderDecision::Send {
                         side: Side::Buy,
@@ -1069,7 +1082,7 @@ impl OrderManager {
                     self.stats.orders_sent += 1;
                     self.last_order_sent_at_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_millis() as u64;
                     decisions.push(OrderDecision::Send {
                         side: Side::Sell,
@@ -1179,22 +1192,28 @@ impl OrderManager {
 
     // ========== Pause/Resume (for WebSocket disconnection) ==========
 
-    /// Pause trading (stop generating new orders).
-    /// Called when Order WebSocket disconnects.
+    /// Pause trading due to WebSocket disconnection.
     pub fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
+        self.pause_reasons.fetch_or(PAUSE_WS_DISCONNECT, Ordering::Release);
         info!("[{}] Order manager paused (WebSocket disconnected)", self.config.symbol);
     }
 
     /// Resume trading after WebSocket reconnection.
+    /// Only clears the WS disconnect pause reason; trading stays paused if
+    /// circuit breaker or safety pause is also active.
     pub fn resume(&self) {
-        self.paused.store(false, Ordering::Release);
-        info!("[{}] Order manager resumed (WebSocket reconnected)", self.config.symbol);
+        self.pause_reasons.fetch_and(!PAUSE_WS_DISCONNECT, Ordering::Release);
+        let remaining = self.pause_reasons.load(Ordering::Acquire);
+        if remaining == 0 {
+            info!("[{}] Order manager resumed (WebSocket reconnected)", self.config.symbol);
+        } else {
+            info!("[{}] WS reconnected but still paused (reasons: {:#04b})", self.config.symbol, remaining);
+        }
     }
 
-    /// Check if trading is paused.
+    /// Check if trading is paused (any reason).
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.pause_reasons.load(Ordering::Acquire) != 0
     }
 
     // ========== Shutdown ==========
@@ -1246,6 +1265,8 @@ impl OrderManager {
                 self.ask_orders[level] = None;
             }
         }
+        // Also clear pending prices to avoid placing stale orders after state reset
+        self.clear_all_pending_prices();
     }
 
     /// Get current bid order info at level 0 (for logging/monitoring).

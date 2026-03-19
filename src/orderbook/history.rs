@@ -95,11 +95,26 @@ impl OrderbookHistory {
         // Get the slot
         let slot = &self.buffer[idx];
 
-        // Increment generation before writing
-        slot.generation.fetch_add(1, Ordering::Release);
+        // CAS loop: claim the slot by transitioning generation from even (stable) to odd (writing).
+        // This prevents data corruption if two writers target the same slot (e.g., after wrap-around).
+        loop {
+            let gen = slot.generation.load(Ordering::Acquire);
+            if gen % 2 != 0 {
+                // Slot is being written by another thread - spin wait
+                std::hint::spin_loop();
+                continue;
+            }
+            // Try to claim: even → odd
+            if slot.generation.compare_exchange(
+                gen, gen + 1, Ordering::AcqRel, Ordering::Relaxed
+            ).is_ok() {
+                break;
+            }
+            std::hint::spin_loop();
+        }
 
-        // Write the snapshot (this is not atomic, but we use generation to detect)
-        // SAFETY: We're the only writer to this slot due to the atomic increment
+        // Write the snapshot (we own the slot - generation is odd)
+        // SAFETY: The CAS above guarantees exclusive write access to this slot
         let slot_ptr = slot as *const HistorySlot as *mut HistorySlot;
         unsafe {
             (*slot_ptr).snapshot = snapshot;
@@ -108,7 +123,7 @@ impl OrderbookHistory {
         // Memory barrier to ensure snapshot is visible before generation update
         std::sync::atomic::fence(Ordering::Release);
 
-        // Increment generation after writing (odd = writing, even = stable)
+        // Mark slot as stable (odd → even) - readers can now safely read
         slot.generation.fetch_add(1, Ordering::Release);
 
         self.total_writes.fetch_add(1, Ordering::Relaxed);
