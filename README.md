@@ -6,6 +6,8 @@ High-performance market making system for the StandX perpetual futures exchange,
 
 **Warning:** Leverage is configurable (1x–5x) but it is highly recommended to keep it at 1x. Using higher values is very risky and should only be attempted after thorough testing.
 
+Associated [Youtube video](https://youtu.be/7P3MwTRjy2I)
+
 ## Features
 
 - **Low-latency architecture**: Synchronous hot path (<10μs decisions), async execution
