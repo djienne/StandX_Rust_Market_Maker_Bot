@@ -112,6 +112,8 @@ pub use binance::{
     BinanceClient, BinanceClientConfig, BinanceEvent, BinanceObiCalculator,
     BinanceOrderbook, BinanceWsStats, BinanceWsStatsSnapshot,
     SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
+    SharedBbo, BinanceBboPollerHandle, start_binance_bbo_poller,
+    BinanceBookTickerClient, BookTickerClientConfig, BookTickerEvent,
 };
 pub use websocket::{
     WsClient, WsClientBuilder, WsEvent, WsStats, WsStatsSnapshot,
