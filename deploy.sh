@@ -36,14 +36,14 @@ echo -e "${GREEN}[2/4] Building Docker image on remote server...${NC}"
 ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" << EOF
     set -e
     cd $REMOTE_DIR
-    docker-compose build
+    docker compose build --no-cache
 EOF
 
 echo -e "${GREEN}[3/4] Stopping existing container (if running)...${NC}"
 ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" << EOF
     set -e
     cd $REMOTE_DIR
-    docker-compose down 2>/dev/null || true
+    docker compose down 2>/dev/null || true
 EOF
 
 echo -e "${GREEN}[4/4] Starting container...${NC}"
@@ -51,9 +51,9 @@ ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" << EOF
     set -e
     cd $REMOTE_DIR
     mkdir -p data
-    docker-compose up -d
+    docker compose up -d
 EOF
 
 echo -e "${GREEN}Done! Showing logs (Ctrl+C to exit)...${NC}"
 echo ""
-ssh -t -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && docker-compose logs -f"
+ssh -t -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && docker compose logs -f"
