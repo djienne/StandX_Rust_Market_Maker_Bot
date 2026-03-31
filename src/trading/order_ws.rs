@@ -274,9 +274,10 @@ impl OrderWsClient {
                 }
             }
 
-            // Mark as disconnected
+            // Mark as disconnected and clear stale state
             self.connected.store(false, Ordering::Release);
             self.ws_authenticated.store(false, Ordering::Release);
+            self.pending_cancels.lock().await.clear();
 
             if !self.running.load(Ordering::Acquire) {
                 break;
@@ -357,8 +358,8 @@ impl OrderWsClient {
                 break;
             }
 
-            // Read with timeout
-            let read_timeout = Duration::from_secs(30);
+            // Read with timeout (use stale_timeout as read deadline)
+            let read_timeout = stale_timeout;
             match timeout(read_timeout, read.next()).await {
                 Ok(Some(Ok(msg))) => {
                     last_message = Instant::now();

@@ -157,6 +157,13 @@ pub fn parse_level(level: &[String; 2]) -> Result<(f64, f64), ParseError> {
         .map_err(|_| ParseError::InvalidPrice(level[0].clone()))?;
     let qty: f64 = fast_float::parse(&level[1])
         .map_err(|_| ParseError::InvalidQuantity(level[1].clone()))?;
+    // Reject NaN/Infinity from malformed inputs (fast_float can parse "NaN"/"Infinity")
+    if !price.is_finite() {
+        return Err(ParseError::InvalidPrice(level[0].clone()));
+    }
+    if !qty.is_finite() {
+        return Err(ParseError::InvalidQuantity(level[1].clone()));
+    }
     Ok((price, qty))
 }
 

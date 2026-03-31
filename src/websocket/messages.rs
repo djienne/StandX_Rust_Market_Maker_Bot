@@ -219,9 +219,9 @@ impl DepthBookData {
 pub fn parse_timestamp_value(val: &serde_json::Value) -> Result<i64, MessageError> {
     match val {
         serde_json::Value::Number(n) => {
-            // Integer timestamp in milliseconds
+            // Integer timestamp in milliseconds - use saturating_mul to prevent overflow
             let ms = n.as_i64().unwrap_or(0);
-            Ok(ms * 1_000_000) // Convert to nanoseconds
+            Ok(ms.saturating_mul(1_000_000)) // Convert to nanoseconds
         }
         serde_json::Value::String(s) => {
             parse_timestamp(s)

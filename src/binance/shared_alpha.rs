@@ -89,7 +89,7 @@ impl SharedAlpha {
     /// Requires at least 150 samples (~15 seconds at 100ms intervals).
     #[inline]
     pub fn is_warmed_up(&self) -> bool {
-        self.sample_count.load(Ordering::Relaxed) >= 150
+        self.sample_count.load(Ordering::Acquire) >= 150
     }
 
     /// Check if the alpha is stale (no update within threshold_ms).
@@ -98,7 +98,7 @@ impl SharedAlpha {
     /// * `threshold_ms` - Maximum allowed age in milliseconds
     #[inline]
     pub fn is_stale(&self, threshold_ms: u64) -> bool {
-        let last = self.last_update_ms.load(Ordering::Relaxed);
+        let last = self.last_update_ms.load(Ordering::Acquire);
         let now = current_time_ms();
         now.saturating_sub(last) > threshold_ms
     }
@@ -107,12 +107,17 @@ impl SharedAlpha {
     ///
     /// Called by the Binance poller task on each orderbook update.
     /// This increments the sample count automatically.
+    ///
+    /// Uses Release on the final store (sample_count) so readers using Acquire
+    /// on sample_count will see the preceding alpha/volatility/timestamp writes.
+    /// This is necessary for correctness on ARM (Graviton) where Relaxed provides
+    /// no inter-thread visibility guarantees.
     #[inline]
     pub fn update(&self, alpha: f64, volatility: f64) {
         self.alpha_bits.store(alpha.to_bits(), Ordering::Relaxed);
         self.volatility_bits.store(volatility.to_bits(), Ordering::Relaxed);
         self.last_update_ms.store(current_time_ms(), Ordering::Relaxed);
-        self.sample_count.fetch_add(1, Ordering::Relaxed);
+        self.sample_count.fetch_add(1, Ordering::Release);
     }
 
     /// Reset the shared state (clear all values and sample count).
@@ -137,7 +142,7 @@ impl Default for SharedAlpha {
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("System time before UNIX epoch")
+        .unwrap_or_default()
         .as_millis() as u64
 }
 

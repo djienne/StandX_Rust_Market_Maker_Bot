@@ -167,12 +167,21 @@ impl BinanceOrderbook {
         } else {
             // Subsequent updates - check continuity
             if is_futures {
-                // Futures: pu == previous_u
-                if let Some(pu) = update.prev_final_update_id {
-                    if pu != self.last_update_id {
+                // Futures: pu == previous_u (pu field is required for sequence validation)
+                match update.prev_final_update_id {
+                    Some(pu) => {
+                        if pu != self.last_update_id {
+                            return Err(SyncError::SequenceBreak {
+                                expected: self.last_update_id,
+                                got: pu,
+                            });
+                        }
+                    }
+                    None => {
+                        // Missing pu field - cannot verify sequence, treat as break
                         return Err(SyncError::SequenceBreak {
                             expected: self.last_update_id,
-                            got: pu,
+                            got: 0,
                         });
                     }
                 }
