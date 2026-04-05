@@ -617,7 +617,7 @@ impl OrderWsClient {
         self.send_message_internal(&msg).await
     }
 
-    /// Disconnect the WebSocket gracefully.
+    /// Disconnect the WebSocket gracefully (permanent shutdown).
     pub async fn disconnect(&self) {
         self.running.store(false, Ordering::Release);
         self.connected.store(false, Ordering::Release);
@@ -629,6 +629,25 @@ impl OrderWsClient {
         }
 
         info!("Order WebSocket disconnected");
+    }
+
+    /// Force a reconnection by closing the current connection.
+    ///
+    /// Unlike disconnect(), this keeps the client running so the
+    /// connection loop will automatically reconnect and re-authenticate
+    /// with a fresh JWT token. Used for proactive token refresh.
+    pub async fn force_reconnect(&self) {
+        if !self.is_connected() {
+            return;
+        }
+        info!("Order WebSocket forcing reconnect for token refresh");
+        self.connected.store(false, Ordering::Release);
+        self.ws_authenticated.store(false, Ordering::Release);
+
+        let mut writer_guard = self.writer.lock().await;
+        if let Some(mut writer) = writer_guard.take() {
+            let _ = writer.close().await;
+        }
     }
 
     // ========== Field Extraction Helpers ==========

@@ -1565,6 +1565,37 @@ async fn main() -> anyhow::Result<()> {
                 // Check pending order timeouts (independent of market data)
                 app.check_order_timeouts();
 
+                // Proactive JWT refresh: force WS reconnect before token expires.
+                // The ed25519 keypair is stable across refreshes, so re-authentication
+                // after reconnect will work seamlessly with the same signing key.
+                // Check every periodic tick (1s) but only act when token is near expiry.
+                if let Some(ref auth) = shared_auth {
+                    if let Ok(auth_guard) = auth.try_lock() {
+                        let remaining = auth_guard.token_remaining_secs();
+                        // Reconnect when < 2 hours remaining (well before 1-hour HTTP refresh threshold)
+                        if remaining > 0 && remaining < 7200 {
+                            drop(auth_guard);
+                            if let Some(ref oc) = order_client {
+                                if oc.is_connected() {
+                                    warn!(
+                                        "JWT token expires in {}s, forcing order WS reconnect for re-authentication",
+                                        remaining
+                                    );
+                                    // Pause order managers while reconnecting
+                                    for (_, manager) in app.order_managers_mut() {
+                                        manager.pause();
+                                        manager.clear_all_orders();
+                                    }
+                                    let oc_clone = Arc::clone(oc);
+                                    tokio::spawn(async move {
+                                        oc_clone.force_reconnect().await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Check circuit breaker auto-recovery
                 app.check_circuit_breaker_recovery();
 

@@ -197,7 +197,17 @@ impl AuthManager {
     }
 
     /// Generate ed25519 keypair and request ID.
+    ///
+    /// Only generates a new keypair if one doesn't exist yet.
+    /// Reusing the same keypair across token refreshes is critical because
+    /// the order WebSocket session is tied to the request_id (derived from
+    /// the ed25519 public key). Regenerating the key mid-session would cause
+    /// all WS requests to be signed with a different key than the session
+    /// expects, silently breaking order placement.
     fn generate_keypair(&mut self) {
+        if self.ed25519_key.is_some() {
+            return; // Reuse existing keypair
+        }
         let signing_key = Ed25519SigningKey::generate(&mut OsRng);
         let public_key = signing_key.verifying_key();
         let request_id = bs58::encode(public_key.as_bytes()).into_string();
@@ -326,8 +336,13 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Minimum token validity before proactive refresh (1 hour).
+    /// Minimum token validity before proactive HTTP refresh (1 hour).
     const MIN_TOKEN_VALIDITY_SECS: u64 = 3600;
+
+    /// Get remaining token validity in seconds (0 if expired or no token).
+    pub fn token_remaining_secs(&self) -> u64 {
+        self.token.as_ref().map(|t| t.remaining_secs()).unwrap_or(0)
+    }
 
     /// Ensure we have a valid token, refreshing proactively if needed.
     async fn ensure_valid_token(&mut self) -> Result<&str, AuthError> {
