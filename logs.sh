@@ -16,4 +16,4 @@ if [ -z "$REMOTE_USER" ] || [ -z "$REMOTE_HOST" ] || [ -z "$SSH_KEY_PATH" ]; the
 fi
 
 echo "Following logs (Ctrl+C to exit)..."
-ssh -t -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && docker-compose logs -f"
+ssh -t -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && docker compose logs -f"
