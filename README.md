@@ -14,12 +14,13 @@ Associated [Youtube video](https://youtu.be/7P3MwTRjy2I)
 - **Lock-free data structures**: Triple buffer for orderbook, atomic position reads
 - **OBI Strategy**: Order Book Imbalance based quotes with volatility scaling and position skew
 - **Binance orderbook alpha**: Uses Binance Futures OBI for alpha signal, with automatic StandX fallback
+- **Binance BBO feed**: Real-time best bid/offer from Binance Futures bookTicker stream
 - **Multi-level quoting**: 1-2 order levels per side with configurable spread multipliers
 - **Dynamic equity-based sizing**: Order size and position limits derived from account equity with leverage support
 - **Modular design**: `QuoteStrategy` trait for easy strategy swapping
 - **WebSocket trading**: Low-latency order execution (5-50ms)
 - **Position management**: Background polling with lock-free reads
-- **Auto-reconnection**: Exponential backoff on disconnect
+- **Auto-reconnection**: Exponential backoff on disconnect; proactive reconnection for JWT token refresh
 - **Graceful shutdown**: Cancels all orders on Ctrl+C
 
 ## Architecture
@@ -235,6 +236,17 @@ Edit `config.json`:
 | `enabled` | Enable automatic tick/lot size detection from API | `true` |
 | `poll_interval_secs` | Polling interval to check for tick size changes | `30` |
 
+### WebSocket (`websocket` section)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `url` | Market data WebSocket URL | `wss://perps.standx.com/ws-stream/v1` |
+| `api_url` | Order API WebSocket URL | `wss://perps.standx.com/ws-api/v1` |
+| `reconnect_delay_secs` | Initial reconnection delay | `5` |
+| `max_reconnect_delay_secs` | Maximum reconnection delay | `60` |
+| `connect_timeout_secs` | Connection timeout | `30` |
+| `stale_timeout_secs` | Force reconnect if no message received | `60` |
+
 When `enabled`, the bot:
 1. Fetches `tick_size` and `lot_size` from the exchange API on startup
 2. Polls periodically to detect runtime changes (e.g., tick size updates)
@@ -360,6 +372,7 @@ ask_price = clamp(fair_price + ask_depth, min=best_ask)
 - **Safety pause recovery**: Auto-recovers from duplicate/stuck order states after configurable delay
 - **Stale connection detection**: Force reconnects WebSocket if no message received within timeout
 - **Open orders checker**: Background polling detects stale/imbalanced orders on exchange
+- **Proactive JWT refresh**: Forces order WebSocket reconnection before token expiry (~2 hours remaining) to prevent silent authentication failure
 - **Auto-reconnect**: WebSocket reconnection with exponential backoff (retries indefinitely by default)
 
 ## License

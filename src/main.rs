@@ -21,6 +21,7 @@ use standx_orderbook::{
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
     SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
+    SharedBbo, BinanceBboPollerHandle, start_binance_bbo_poller,
 };
 use standx_orderbook::trading::SharedEquity;
 use standx_orderbook::trading::TradingStats;
@@ -227,6 +228,9 @@ struct App {
     shared_equity: Arc<SharedEquity>,
     /// Shared Binance alpha for lock-free reads (optional)
     shared_binance_alpha: Option<Arc<SharedAlpha>>,
+    /// Shared Binance BBO for lock-free reads (optional)
+    #[allow(dead_code)]
+    shared_binance_bbo: Option<Arc<SharedBbo>>,
     /// Order managers per symbol
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
@@ -260,6 +264,7 @@ impl App {
         config: Config,
         symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
         shared_binance_alpha: Option<Arc<SharedAlpha>>,
+        shared_binance_bbo: Option<Arc<SharedBbo>>,
     ) -> Self {
         let store = Arc::new(OrderbookStore::new(
             &config.symbols,
@@ -358,6 +363,7 @@ impl App {
             symbol_infos,
             shared_equity,
             shared_binance_alpha,
+            shared_binance_bbo,
             order_managers,
             order_tx: None,
             symbol_arcs,
@@ -833,8 +839,26 @@ async fn main() -> anyhow::Result<()> {
         info!("Alpha source: StandX (Binance alpha disabled)");
     }
 
-    // Create application with symbol info and Binance alpha
-    let mut app = App::new(config.clone(), symbol_infos, shared_binance_alpha);
+    // Create SharedBbo for Binance BBO integration (lock-free reads from hot path)
+    let shared_binance_bbo: Option<Arc<SharedBbo>> = if config.strategy.alpha_source == "binance" {
+        Some(Arc::new(SharedBbo::new()))
+    } else {
+        None
+    };
+
+    // Start Binance BBO poller if configured
+    let mut binance_bbo_handle: Option<BinanceBboPollerHandle> = None;
+    if let Some(ref shared_bbo) = shared_binance_bbo {
+        let binance_symbol = "btcusdt";
+        info!("Starting Binance BBO poller (symbol={})", binance_symbol);
+        binance_bbo_handle = Some(start_binance_bbo_poller(
+            binance_symbol,
+            Arc::clone(shared_bbo),
+        ));
+    }
+
+    // Create application with symbol info and Binance alpha/BBO
+    let mut app = App::new(config.clone(), symbol_infos, shared_binance_alpha, shared_binance_bbo);
 
     // Create shared auth manager if any feature needs it
     // IMPORTANT: Use a SINGLE AuthManager for all features to ensure consistent ed25519 keypair
@@ -1541,6 +1565,37 @@ async fn main() -> anyhow::Result<()> {
                 // Check pending order timeouts (independent of market data)
                 app.check_order_timeouts();
 
+                // Proactive JWT refresh: force WS reconnect before token expires.
+                // The ed25519 keypair is stable across refreshes, so re-authentication
+                // after reconnect will work seamlessly with the same signing key.
+                // Check every periodic tick (1s) but only act when token is near expiry.
+                if let Some(ref auth) = shared_auth {
+                    if let Ok(auth_guard) = auth.try_lock() {
+                        let remaining = auth_guard.token_remaining_secs();
+                        // Reconnect when < 2 hours remaining (well before 1-hour HTTP refresh threshold)
+                        if remaining > 0 && remaining < 7200 {
+                            drop(auth_guard);
+                            if let Some(ref oc) = order_client {
+                                if oc.is_connected() {
+                                    warn!(
+                                        "JWT token expires in {}s, forcing order WS reconnect for re-authentication",
+                                        remaining
+                                    );
+                                    // Pause order managers while reconnecting
+                                    for (_, manager) in app.order_managers_mut() {
+                                        manager.pause();
+                                        manager.clear_all_orders();
+                                    }
+                                    let oc_clone = Arc::clone(oc);
+                                    tokio::spawn(async move {
+                                        oc_clone.force_reconnect().await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Check circuit breaker auto-recovery
                 app.check_circuit_breaker_recovery();
 
@@ -1577,6 +1632,12 @@ async fn main() -> anyhow::Result<()> {
     // Stop Binance alpha poller
     if let Some(handle) = binance_alpha_handle {
         info!("Stopping Binance alpha poller...");
+        handle.stop();
+    }
+
+    // Stop Binance BBO poller
+    if let Some(handle) = binance_bbo_handle {
+        info!("Stopping Binance BBO poller...");
         handle.stop();
     }
 
