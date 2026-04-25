@@ -608,9 +608,15 @@ impl Config {
         }
 
         // Validate strategy config
-        if self.strategy.tick_size <= 0.0 {
+        if !self.strategy.tick_size.is_finite() || self.strategy.tick_size <= 0.0 {
             return Err(ConfigError::ValidationError(
                 "strategy.tick_size must be positive".to_string()
+            ));
+        }
+
+        if self.strategy.step_ns == 0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.step_ns must be greater than 0".to_string()
             ));
         }
 
@@ -620,7 +626,16 @@ impl Config {
             ));
         }
 
-        if self.strategy.looking_depth <= 0.0 || self.strategy.looking_depth >= 1.0 {
+        if self.strategy.update_interval_steps == 0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.update_interval_steps must be greater than 0".to_string()
+            ));
+        }
+
+        if !self.strategy.looking_depth.is_finite()
+            || self.strategy.looking_depth <= 0.0
+            || self.strategy.looking_depth >= 1.0
+        {
             return Err(ConfigError::ValidationError(
                 "strategy.looking_depth must be between 0 and 1".to_string()
             ));
@@ -632,31 +647,84 @@ impl Config {
             ));
         }
 
-        if self.strategy.spread_level_multiplier <= 1.0 {
+        if !self.strategy.spread_level_multiplier.is_finite()
+            || self.strategy.spread_level_multiplier <= 1.0
+        {
             return Err(ConfigError::ValidationError(
                 "strategy.spread_level_multiplier must be greater than 1.0".to_string()
             ));
         }
 
-        if self.strategy.vol_to_half_spread < 0.0 {
+        if !self.strategy.vol_to_half_spread.is_finite()
+            || self.strategy.vol_to_half_spread < 0.0
+        {
             return Err(ConfigError::ValidationError(
                 "strategy.vol_to_half_spread must be non-negative".to_string()
             ));
         }
 
-        if self.strategy.min_order_qty_dollar <= 0.0 {
+        if !self.strategy.half_spread.is_finite() || self.strategy.half_spread < 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.half_spread must be non-negative".to_string()
+            ));
+        }
+
+        if !self.strategy.half_spread_bps.is_finite() || self.strategy.half_spread_bps < 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.half_spread_bps must be non-negative".to_string()
+            ));
+        }
+
+        if !self.strategy.min_half_spread_bps.is_finite()
+            || self.strategy.min_half_spread_bps < 0.0
+        {
+            return Err(ConfigError::ValidationError(
+                "strategy.min_half_spread_bps must be non-negative".to_string()
+            ));
+        }
+
+        if !self.strategy.min_order_qty_dollar.is_finite()
+            || self.strategy.min_order_qty_dollar <= 0.0
+        {
             return Err(ConfigError::ValidationError(
                 "strategy.min_order_qty_dollar must be positive".to_string()
             ));
         }
 
-        if self.strategy.skew < 0.0 {
+        if !self.strategy.lot_size.is_finite() || self.strategy.lot_size <= 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.lot_size must be positive".to_string()
+            ));
+        }
+
+        if !self.strategy.skew.is_finite() || self.strategy.skew < 0.0 {
             return Err(ConfigError::ValidationError(
                 "strategy.skew must be non-negative".to_string()
             ));
         }
 
-        if self.strategy.leverage < 1.0 || self.strategy.leverage > 5.0 {
+        if !self.strategy.c1.is_finite() || self.strategy.c1 < 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.c1 must be non-negative".to_string()
+            ));
+        }
+
+        if !self.strategy.c1_ticks.is_finite() || self.strategy.c1_ticks < 0.0 {
+            return Err(ConfigError::ValidationError(
+                "strategy.c1_ticks must be non-negative".to_string()
+            ));
+        }
+
+        if self.strategy.alpha_source != "binance" && self.strategy.alpha_source != "standx" {
+            return Err(ConfigError::ValidationError(
+                "strategy.alpha_source must be 'binance' or 'standx'".to_string()
+            ));
+        }
+
+        if !self.strategy.leverage.is_finite()
+            || self.strategy.leverage < 1.0
+            || self.strategy.leverage > 5.0
+        {
             return Err(ConfigError::ValidationError(
                 "strategy.leverage must be between 1.0 and 5.0".to_string()
             ));
@@ -705,5 +773,24 @@ mod tests {
 
         let json = r#"{"history_minutes": 0}"#;
         assert!(Config::from_str(json).is_err());
+    }
+
+    #[test]
+    fn test_invalid_strategy_hot_path_assumptions() {
+        let mut config = Config::default();
+        config.strategy.step_ns = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.strategy.update_interval_steps = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.strategy.alpha_source = "unknown".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.strategy.lot_size = f64::NAN;
+        assert!(config.validate().is_err());
     }
 }

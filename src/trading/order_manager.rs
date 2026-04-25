@@ -398,13 +398,13 @@ impl OrderManager {
                 // At max long - cancel any existing bid at this level
                 if let Some(bid) = &self.bid_orders[level] {
                     if bid.state != OrderState::Canceling {
+                        let cl_ord_id = bid.cl_ord_id.clone();
                         debug!(
                             "[{}] At max long position ({:.2} > {:.2}), canceling bid L{}",
                             self.config.symbol, position_dollar, max_position, level
                         );
-                        decisions.push(OrderDecision::Cancel {
-                            cl_ord_id: bid.cl_ord_id.clone(),
-                        });
+                        self.set_order_canceling(Side::Buy, level, current_time_ns);
+                        decisions.push(OrderDecision::Cancel { cl_ord_id });
                     }
                 }
             }
@@ -424,13 +424,13 @@ impl OrderManager {
                 // At max short - cancel any existing ask at this level
                 if let Some(ask) = &self.ask_orders[level] {
                     if ask.state != OrderState::Canceling {
+                        let cl_ord_id = ask.cl_ord_id.clone();
                         debug!(
                             "[{}] At max short position ({:.2} < -{:.2}), canceling ask L{}",
                             self.config.symbol, position_dollar, max_position, level
                         );
-                        decisions.push(OrderDecision::Cancel {
-                            cl_ord_id: ask.cl_ord_id.clone(),
-                        });
+                        self.set_order_canceling(Side::Sell, level, current_time_ns);
+                        decisions.push(OrderDecision::Cancel { cl_ord_id });
                     }
                 }
             }
@@ -901,7 +901,7 @@ impl OrderManager {
     }
 
     /// Called when an order is canceled.
-    pub fn on_order_canceled(&mut self, order_id: i64) {
+    pub fn on_order_canceled(&mut self, order_id: i64) -> bool {
         // Get info for logging before clearing - search all levels
         let mut order_info: Option<(String, Side, usize, OrderState)> = None;
 
@@ -925,19 +925,21 @@ impl OrderManager {
                 "[{}] {} L{} order canceled: {} (order_id={}, was {:?}) - slot freed",
                 self.config.symbol, side, level, cl_ord_id, order_id, state
             );
+            self.clear_order_by_exchange_id(order_id);
+            self.stats.orders_canceled += 1;
+            true
         } else {
             // Order not found - may have been force-cleared or already canceled
             debug!(
                 "[{}] Cancel confirmation for unknown order_id={} - already cleared?",
                 self.config.symbol, order_id
             );
+            false
         }
-        self.clear_order_by_exchange_id(order_id);
-        self.stats.orders_canceled += 1;
     }
 
     /// Called when an order cancel is confirmed by client order ID.
-    pub fn on_order_canceled_by_cl_ord_id(&mut self, cl_ord_id: &str) {
+    pub fn on_order_canceled_by_cl_ord_id(&mut self, cl_ord_id: &str) -> bool {
         // Get info for logging before clearing
         let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.level, o.state));
 
@@ -946,14 +948,16 @@ impl OrderManager {
                 "[{}] {} L{} order canceled: {} (was {:?}) - slot freed",
                 self.config.symbol, side, level, cl_ord_id, state
             );
+            self.clear_order_by_cl_ord_id(cl_ord_id);
+            self.stats.orders_canceled += 1;
+            true
         } else {
             debug!(
                 "[{}] Cancel confirmation for unknown cl_ord_id={} - already cleared?",
                 self.config.symbol, cl_ord_id
             );
+            false
         }
-        self.clear_order_by_cl_ord_id(cl_ord_id);
-        self.stats.orders_canceled += 1;
     }
 
     /// Called when a cancel request fails.
@@ -1461,6 +1465,67 @@ mod tests {
         // Should only place ask (sell), not bid (buy) since at max long
         assert!(decisions.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Sell, .. })));
         assert!(!decisions.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Buy, .. })));
+    }
+
+    #[test]
+    fn test_position_limit_cancel_is_not_repeated() {
+        let position = create_test_position();
+        let equity = create_test_equity(500.0);
+        let config = OrderManagerConfig::default();
+        let mut manager = OrderManager::new(config, Arc::clone(&position), equity);
+
+        // Place both sides while below the position limit.
+        let quote = create_test_quote(100000.0, 100100.0, 0.001);
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+        for (idx, decision) in decisions.iter().enumerate() {
+            if let OrderDecision::Send { cl_ord_id, .. } = decision {
+                manager.on_order_accepted(cl_ord_id, 2000 + idx as i64);
+            }
+        }
+
+        // Move over max long; the bid should be canceled exactly once and
+        // marked Canceling so the next quote does not emit a duplicate cancel.
+        position.set(0.006);
+        let first = manager.on_quote(&quote, 2_000_000_000);
+        let second = manager.on_quote(&quote, 3_000_000_000);
+
+        assert_eq!(
+            first.iter()
+                .filter(|d| matches!(d, OrderDecision::Cancel { .. }))
+                .count(),
+            1,
+            "first over-limit quote should cancel the bid"
+        );
+        assert!(
+            second.iter()
+                .all(|d| !matches!(d, OrderDecision::Cancel { .. })),
+            "cancel should not repeat while the order is Canceling"
+        );
+    }
+
+    #[test]
+    fn test_cancel_handlers_report_real_matches_only() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let config = OrderManagerConfig::default();
+        let mut manager = OrderManager::new(config, position, equity);
+
+        let quote = create_test_quote(100000.0, 100100.0, 0.001);
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+        let first_cl_ord_id = match &decisions[0] {
+            OrderDecision::Send { cl_ord_id, .. } => cl_ord_id.clone(),
+            _ => panic!("expected send decision"),
+        };
+        manager.on_order_accepted(&first_cl_ord_id, 3001);
+
+        assert!(!manager.on_order_canceled(9999));
+        assert_eq!(manager.stats().orders_canceled, 0);
+
+        assert!(manager.on_order_canceled(3001));
+        assert_eq!(manager.stats().orders_canceled, 1);
+
+        assert!(!manager.on_order_canceled_by_cl_ord_id(&first_cl_ord_id));
+        assert_eq!(manager.stats().orders_canceled, 1);
     }
 
     #[test]

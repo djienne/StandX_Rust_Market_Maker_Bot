@@ -115,6 +115,22 @@ impl SharedEquity {
     /// This ensures at max position we still have margin for all bid orders,
     /// preventing order rejections due to insufficient available margin.
     pub fn set_equity(&self, equity: f64) {
+        if !equity.is_finite() || equity <= 0.0 {
+            self.equity_bits.store(0.0f64.to_bits(), Ordering::Release);
+            self.order_qty_dollar_bits
+                .store(0.0f64.to_bits(), Ordering::Release);
+            self.max_position_dollar_bits
+                .store(0.0f64.to_bits(), Ordering::Release);
+            self.last_update_ms.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                Ordering::Release,
+            );
+            return;
+        }
+
         self.equity_bits.store(equity.to_bits(), Ordering::Release);
 
         // Apply leverage to get effective capital
@@ -228,16 +244,27 @@ mod tests {
 
     #[test]
     fn test_shared_equity_zero() {
-        // Test with zero equity
-        // order_qty floors to min_order_qty_dollar = 10.0
-        // order_reserve: $10 * 2 = $20
-        // max_position: ($0 - $20) * 0.9 = -$18 -> floored to 0
+        // Zero equity should not publish a usable order size.
         let equity = SharedEquity::new(2, 10.0, 1.0);
         equity.set_equity(0.0);
 
         assert!(!equity.is_initialized());
-        assert_eq!(equity.order_qty_dollar(), 10.0); // Falls back to min
-        assert_eq!(equity.max_position_dollar(), 0.0); // Floored at 0
+        assert_eq!(equity.order_qty_dollar(), 0.0);
+        assert_eq!(equity.max_position_dollar(), 0.0);
+    }
+
+    #[test]
+    fn test_shared_equity_rejects_non_finite() {
+        let equity = SharedEquity::new(2, 10.0, 1.0);
+        equity.set_equity(500.0);
+        assert!(equity.is_initialized());
+
+        equity.set_equity(f64::INFINITY);
+
+        assert!(!equity.is_initialized());
+        assert_eq!(equity.equity(), 0.0);
+        assert_eq!(equity.order_qty_dollar(), 0.0);
+        assert_eq!(equity.max_position_dollar(), 0.0);
     }
 
     #[test]

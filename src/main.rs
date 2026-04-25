@@ -597,12 +597,14 @@ impl App {
 
                         // Process quote if we got one
                         if let Some(quote) = quote_result {
-                            // Log quote using formatter
-                            self.quote_formatter.log_quote(&quote);
                             self.stats.quote_count += 1;
 
                             // Process quote through order manager if enabled
-                            if self.config.order.enabled {
+                            if self.config.order.enabled
+                                && quote.valid_for_trading
+                                && quote.mid_price.is_finite()
+                                && quote.mid_price > 0.0
+                            {
                                 if let Some(order_manager) = self.order_managers.get_mut(&data.symbol) {
                                     // Use system time for order creation to match timeout checks
                                     use std::time::{SystemTime, UNIX_EPOCH};
@@ -638,6 +640,10 @@ impl App {
                                     }
                                 }
                             }
+
+                            // Log quote after trading decisions are dispatched so formatting
+                            // never sits in front of the order hot path.
+                            self.quote_formatter.log_quote(&quote);
                         }
 
                         // Log periodic orderbook updates if verbose
@@ -1255,16 +1261,19 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref cl_ord_id) = cl_ord_id {
                             if let Some(symbol) = QuoteOrderManager::extract_symbol_from_cl_ord_id(cl_ord_id) {
                                 if let Some(manager) = app.get_order_manager_mut(symbol) {
-                                    manager.on_order_canceled_by_cl_ord_id(cl_ord_id);
-                                    matched_symbol = Some(symbol.to_string());
+                                    if manager.on_order_canceled_by_cl_ord_id(cl_ord_id) {
+                                        matched_symbol = Some(symbol.to_string());
+                                    }
                                 }
                             }
                         }
                         // Fallback: scan all managers by order_id
                         if matched_symbol.is_none() {
                             for (sym, manager) in app.order_managers_mut() {
-                                manager.on_order_canceled(order_id);
-                                matched_symbol = Some(sym.clone());
+                                if manager.on_order_canceled(order_id) {
+                                    matched_symbol = Some(sym.clone());
+                                    break;
+                                }
                             }
                         }
 
