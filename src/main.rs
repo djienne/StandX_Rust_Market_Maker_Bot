@@ -226,8 +226,6 @@ struct App {
     symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
     /// Shared equity for automatic order sizing (lock-free reads)
     shared_equity: Arc<SharedEquity>,
-    /// Shared Binance alpha for lock-free reads (optional)
-    shared_binance_alpha: Option<Arc<SharedAlpha>>,
     /// Shared Binance BBO for lock-free reads (optional)
     #[allow(dead_code)]
     shared_binance_bbo: Option<Arc<SharedBbo>>,
@@ -266,6 +264,9 @@ impl App {
         shared_binance_alpha: Option<Arc<SharedAlpha>>,
         shared_binance_bbo: Option<Arc<SharedBbo>>,
     ) -> Self {
+        // shared_binance_alpha is consumed locally and threaded into each ObiStrategy
+        // (line ~291 below). It is not stored on App because no method other than
+        // App::new reads it; the strategy holds its own Arc clone.
         let store = Arc::new(OrderbookStore::new(
             &config.symbols,
             config.history_buffer_size,
@@ -362,7 +363,6 @@ impl App {
             positions,
             symbol_infos,
             shared_equity,
-            shared_binance_alpha,
             shared_binance_bbo,
             order_managers,
             order_tx: None,
@@ -601,8 +601,15 @@ impl App {
                             self.quote_formatter.log_quote(&quote);
                             self.stats.quote_count += 1;
 
-                            // Process quote through order manager if enabled
-                            if self.config.order.enabled {
+                            // Process quote through order manager only when the executor
+                            // is actually ready: config flag + channel + WS authenticated.
+                            // Without this gate, on_quote() would mutate state into Pending
+                            // while decisions silently dropped, blocking real placements
+                            // for ~pending_timeout_secs once auth eventually came up.
+                            if self.config.order.enabled
+                                && self.order_tx.is_some()
+                                && self.order_ws_authenticated
+                            {
                                 if let Some(order_manager) = self.order_managers.get_mut(&data.symbol) {
                                     // Use system time for order creation to match timeout checks
                                     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1255,16 +1262,21 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref cl_ord_id) = cl_ord_id {
                             if let Some(symbol) = QuoteOrderManager::extract_symbol_from_cl_ord_id(cl_ord_id) {
                                 if let Some(manager) = app.get_order_manager_mut(symbol) {
-                                    manager.on_order_canceled_by_cl_ord_id(cl_ord_id);
-                                    matched_symbol = Some(symbol.to_string());
+                                    if manager.on_order_canceled_by_cl_ord_id(cl_ord_id) {
+                                        matched_symbol = Some(symbol.to_string());
+                                    }
                                 }
                             }
                         }
-                        // Fallback: scan all managers by order_id
+                        // Fallback: scan all managers by order_id, stop at the first that owns it.
+                        // Without the break, every manager's stats double-counted and
+                        // pending-replacement logic ran on a non-deterministic symbol.
                         if matched_symbol.is_none() {
                             for (sym, manager) in app.order_managers_mut() {
-                                manager.on_order_canceled(order_id);
-                                matched_symbol = Some(sym.clone());
+                                if manager.on_order_canceled(order_id) {
+                                    matched_symbol = Some(sym.clone());
+                                    break;
+                                }
                             }
                         }
 
@@ -1520,6 +1532,25 @@ async fn main() -> anyhow::Result<()> {
                 // This is O(1) try_recv - zero latency impact on hot path
                 if let Some(ref mut rx) = clear_orders_rx {
                     while let Ok(signal) = rx.try_recv() {
+                        // Skip non-severe stale signals (e.g. "0 orders") when we have
+                        // no local state to clear — this happens during warmup before
+                        // the bot has placed anything, or transiently right after fills.
+                        // Severe signals (pause_trading=true: >2 orders detected) always
+                        // act, since exchange-side orders we don't track are dangerous.
+                        if !signal.pause_trading {
+                            let nothing_to_clear = app
+                                .get_order_manager_mut(&signal.symbol)
+                                .map(|m| !m.has_any_tracked_orders())
+                                .unwrap_or(true);
+                            if nothing_to_clear {
+                                debug!(
+                                    "[{}] Ignoring stale signal '{}' - no tracked orders to clear",
+                                    signal.symbol, signal.reason
+                                );
+                                continue;
+                            }
+                        }
+
                         if signal.pause_trading {
                             // CRITICAL: >2 orders detected - this is a safety limit violation
                             error!(
@@ -1533,12 +1564,14 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
 
-                        // 1. Clear internal state and trigger safety pause if needed
+                        // 1. Pause BEFORE clearing internal state so the quote loop
+                        //    cannot place fresh orders while the spawned cancel_all_orders
+                        //    is still in flight against the exchange. Auto-recovery via
+                        //    check_safety_pause_recovery (safety_pause_recovery_secs)
+                        //    handles resume in both severity branches.
                         if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
+                            manager.trigger_safety_pause(&signal.reason);
                             manager.clear_all_orders();
-                            if signal.pause_trading {
-                                manager.trigger_safety_pause(&signal.reason);
-                            }
                         }
 
                         // 2. Cancel orders on exchange (spawn to avoid blocking)
