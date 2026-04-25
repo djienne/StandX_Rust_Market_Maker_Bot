@@ -129,6 +129,9 @@ struct WsResponse {
     /// Result field used by StandX responses (alternative to data)
     #[serde(default)]
     result: Option<serde_json::Value>,
+    /// Request ID to correlate responses
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -691,6 +694,15 @@ impl OrderWsClient {
             .and_then(|v| v.as_str())
             .unwrap_or("0")
             .to_string()
+    }
+
+    /// Check if data has a client order ID field.
+    #[inline]
+    fn has_cl_ord_id(data: &serde_json::Value) -> bool {
+        data.get("cl_ord_id").is_some()
+            || data.get("clOrdId").is_some()
+            || data.get("clientOrderId").is_some()
+            || data.get("client_order_id").is_some()
     }
 
     // ========== Response Handlers ==========

@@ -22,6 +22,8 @@ struct PollResult {
     sells: usize,
     /// Oldest order age in seconds (based on local tracking)
     oldest_age_secs: Option<u64>,
+    /// Order IDs seen in this poll
+    order_ids: Vec<i64>,
 }
 
 /// Signal sent when internal order state should be cleared.
@@ -286,6 +288,7 @@ impl OpenOrdersChecker {
             buys,
             sells,
             oldest_age_secs,
+            order_ids: current_ids,
         })
     }
 }

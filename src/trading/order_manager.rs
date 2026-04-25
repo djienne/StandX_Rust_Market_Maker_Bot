@@ -395,23 +395,17 @@ impl OrderManager {
                     decisions.push(decision);
                 }
             } else {
-                // At max long - cancel any existing bid at this level.
-                // Mark as Canceling so the same cancel isn't emitted on every
-                // subsequent quote until the exchange confirms.
-                let cancel_id = self.bid_orders[level].as_ref().and_then(|o| {
-                    if o.state != OrderState::Canceling {
-                        Some(o.cl_ord_id.clone())
-                    } else {
-                        None
+                // At max long - cancel any existing bid at this level
+                if let Some(bid) = &self.bid_orders[level] {
+                    if bid.state != OrderState::Canceling {
+                        debug!(
+                            "[{}] At max long position ({:.2} > {:.2}), canceling bid L{}",
+                            self.config.symbol, position_dollar, max_position, level
+                        );
+                        decisions.push(OrderDecision::Cancel {
+                            cl_ord_id: bid.cl_ord_id.clone(),
+                        });
                     }
-                });
-                if let Some(cl_ord_id) = cancel_id {
-                    debug!(
-                        "[{}] At max long position ({:.2} > {:.2}), canceling bid L{}",
-                        self.config.symbol, position_dollar, max_position, level
-                    );
-                    self.set_order_canceling(Side::Buy, level, current_time_ns);
-                    decisions.push(OrderDecision::Cancel { cl_ord_id });
                 }
             }
 
@@ -427,23 +421,17 @@ impl OrderManager {
                     decisions.push(decision);
                 }
             } else {
-                // At max short - cancel any existing ask at this level.
-                // Mark as Canceling so the same cancel isn't emitted on every
-                // subsequent quote until the exchange confirms.
-                let cancel_id = self.ask_orders[level].as_ref().and_then(|o| {
-                    if o.state != OrderState::Canceling {
-                        Some(o.cl_ord_id.clone())
-                    } else {
-                        None
+                // At max short - cancel any existing ask at this level
+                if let Some(ask) = &self.ask_orders[level] {
+                    if ask.state != OrderState::Canceling {
+                        debug!(
+                            "[{}] At max short position ({:.2} < -{:.2}), canceling ask L{}",
+                            self.config.symbol, position_dollar, max_position, level
+                        );
+                        decisions.push(OrderDecision::Cancel {
+                            cl_ord_id: ask.cl_ord_id.clone(),
+                        });
                     }
-                });
-                if let Some(cl_ord_id) = cancel_id {
-                    debug!(
-                        "[{}] At max short position ({:.2} < -{:.2}), canceling ask L{}",
-                        self.config.symbol, position_dollar, max_position, level
-                    );
-                    self.set_order_canceling(Side::Sell, level, current_time_ns);
-                    decisions.push(OrderDecision::Cancel { cl_ord_id });
                 }
             }
         }
@@ -913,12 +901,7 @@ impl OrderManager {
     }
 
     /// Called when an order is canceled.
-    ///
-    /// Returns `true` if the order was found in this manager's state and cleared.
-    /// Returns `false` if the order_id did not match any tracked order — callers
-    /// fanning out across multiple managers should use this to stop scanning.
-    #[must_use]
-    pub fn on_order_canceled(&mut self, order_id: i64) -> bool {
+    pub fn on_order_canceled(&mut self, order_id: i64) {
         // Get info for logging before clearing - search all levels
         let mut order_info: Option<(String, Side, usize, OrderState)> = None;
 
@@ -942,25 +925,19 @@ impl OrderManager {
                 "[{}] {} L{} order canceled: {} (order_id={}, was {:?}) - slot freed",
                 self.config.symbol, side, level, cl_ord_id, order_id, state
             );
-            self.clear_order_by_exchange_id(order_id);
-            self.stats.orders_canceled += 1;
-            true
         } else {
-            // Order not found - may belong to another symbol's manager, or was
-            // already force-cleared. Do NOT increment stats or clear state.
+            // Order not found - may have been force-cleared or already canceled
             debug!(
-                "[{}] Cancel confirmation for unknown order_id={} - not tracked here",
+                "[{}] Cancel confirmation for unknown order_id={} - already cleared?",
                 self.config.symbol, order_id
             );
-            false
         }
+        self.clear_order_by_exchange_id(order_id);
+        self.stats.orders_canceled += 1;
     }
 
     /// Called when an order cancel is confirmed by client order ID.
-    ///
-    /// Returns `true` if the cl_ord_id matched a tracked order, `false` otherwise.
-    #[must_use]
-    pub fn on_order_canceled_by_cl_ord_id(&mut self, cl_ord_id: &str) -> bool {
+    pub fn on_order_canceled_by_cl_ord_id(&mut self, cl_ord_id: &str) {
         // Get info for logging before clearing
         let order_info = self.find_order(cl_ord_id).map(|o| (o.side, o.level, o.state));
 
@@ -969,16 +946,14 @@ impl OrderManager {
                 "[{}] {} L{} order canceled: {} (was {:?}) - slot freed",
                 self.config.symbol, side, level, cl_ord_id, state
             );
-            self.clear_order_by_cl_ord_id(cl_ord_id);
-            self.stats.orders_canceled += 1;
-            true
         } else {
             debug!(
-                "[{}] Cancel confirmation for unknown cl_ord_id={} - not tracked here",
+                "[{}] Cancel confirmation for unknown cl_ord_id={} - already cleared?",
                 self.config.symbol, cl_ord_id
             );
-            false
         }
+        self.clear_order_by_cl_ord_id(cl_ord_id);
+        self.stats.orders_canceled += 1;
     }
 
     /// Called when a cancel request fails.
@@ -1232,22 +1207,6 @@ impl OrderManager {
     /// Check if trading is paused (any reason).
     pub fn is_paused(&self) -> bool {
         self.pause_reasons.load(Ordering::Acquire) != 0
-    }
-
-    /// Whether any order is currently tracked in internal state.
-    ///
-    /// Used to filter spurious "0 orders on exchange" stale signals during
-    /// warmup or after fills, when there's nothing locally that needs clearing.
-    pub fn has_any_tracked_orders(&self) -> bool {
-        for level in 0..MAX_ORDER_LEVELS {
-            if self.bid_orders[level].is_some() || self.ask_orders[level].is_some() {
-                return true;
-            }
-            if self.pending_bid_prices[level].is_some() || self.pending_ask_prices[level].is_some() {
-                return true;
-            }
-        }
-        false
     }
 
     // ========== Shutdown ==========
@@ -1589,124 +1548,5 @@ mod tests {
             .filter(|d| matches!(d, OrderDecision::Send { side: Side::Sell, .. }))
             .count();
         assert_eq!(sell_count, 2, "Should have 2 sell orders (one per level) when at max long");
-    }
-
-    #[test]
-    fn test_on_order_canceled_returns_match() {
-        let position = create_test_position();
-        let equity = create_test_equity_high_limit();
-        let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position, equity);
-
-        // Place initial orders, accept the bid so it has an order_id.
-        let quote = create_test_quote(100000.0, 100100.0, 0.001);
-        let decisions = manager.on_quote(&quote, 1_000_000_000);
-        let bid_cl_ord_id = decisions.iter().find_map(|d| match d {
-            OrderDecision::Send { side: Side::Buy, cl_ord_id, .. } => Some(cl_ord_id.clone()),
-            _ => None,
-        }).expect("expected bid Send decision");
-        manager.on_order_accepted(&bid_cl_ord_id, 4242);
-
-        // Unknown order_id: must return false and not touch stats.
-        let stats_before = manager.stats().orders_canceled;
-        assert!(!manager.on_order_canceled(9999), "unknown order_id should return false");
-        assert_eq!(manager.stats().orders_canceled, stats_before,
-            "non-matching cancel must not increment stats");
-
-        // Matching order_id: must return true, increment stats, free the slot.
-        assert!(manager.on_order_canceled(4242), "matching order_id should return true");
-        assert_eq!(manager.stats().orders_canceled, stats_before + 1,
-            "matching cancel must increment stats once");
-        assert!(manager.bid_order().is_none(), "bid slot should be freed after cancel");
-    }
-
-    #[test]
-    fn test_position_limit_cancel_marks_canceling() {
-        // Reproduces the bug where at max long, the bid cancel was emitted
-        // on every quote because state was never transitioned to Canceling.
-        let position = create_test_position();
-        let equity = create_test_equity(500.0);
-        let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position.clone(), equity);
-
-        // First, place + accept bid and ask while within the limit.
-        let quote = create_test_quote(100000.0, 100100.0, 0.001);
-        let initial = manager.on_quote(&quote, 1_000_000_000);
-        for d in &initial {
-            if let OrderDecision::Send { cl_ord_id, side, .. } = d {
-                let exch_id = match side { Side::Buy => 7001, Side::Sell => 7002 };
-                manager.on_order_accepted(cl_ord_id, exch_id);
-            }
-        }
-        assert!(manager.bid_order().is_some(), "should have a live bid");
-
-        // Now push position over the long limit (0.006 BTC * $100k = $600 > $500 max).
-        position.set(0.006);
-
-        // First over-limit quote: should emit exactly one bid Cancel and mark Canceling.
-        let cancels1 = manager.on_quote(&quote, 2_000_000_000);
-        let bid_cancels1 = cancels1.iter().filter(|d| matches!(d, OrderDecision::Cancel { .. })).count();
-        assert_eq!(bid_cancels1, 1, "first over-limit quote should emit exactly one cancel");
-        assert_eq!(
-            manager.bid_order().map(|o| o.state),
-            Some(OrderState::Canceling),
-            "bid should be Canceling after position-limit cancel"
-        );
-
-        // Second over-limit quote: state already Canceling, must NOT re-emit.
-        let cancels2 = manager.on_quote(&quote, 3_000_000_000);
-        let bid_cancels2 = cancels2.iter().filter(|d| matches!(d, OrderDecision::Cancel { .. })).count();
-        assert_eq!(bid_cancels2, 0,
-            "subsequent over-limit quotes must not re-emit the cancel while it's in flight");
-    }
-
-    #[test]
-    fn test_has_any_tracked_orders() {
-        // Used to filter spurious "0 orders" stale signals during warmup.
-        let position = create_test_position();
-        let equity = create_test_equity_high_limit();
-        let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position, equity);
-
-        // Fresh manager: no tracked orders.
-        assert!(!manager.has_any_tracked_orders(),
-            "fresh manager must report no tracked orders");
-
-        // Place an order: now there are tracked orders.
-        let quote = create_test_quote(100000.0, 100100.0, 0.001);
-        let _ = manager.on_quote(&quote, 1_000_000_000);
-        assert!(manager.has_any_tracked_orders(),
-            "manager with pending orders must report tracked orders");
-
-        // Clear: back to no tracked orders.
-        manager.clear_all_orders();
-        assert!(!manager.has_any_tracked_orders(),
-            "manager after clear_all_orders must report no tracked orders");
-    }
-
-    #[test]
-    fn test_on_order_canceled_by_cl_ord_id_returns_match() {
-        let position = create_test_position();
-        let equity = create_test_equity_high_limit();
-        let config = OrderManagerConfig::default();
-        let mut manager = OrderManager::new(config, position, equity);
-
-        let quote = create_test_quote(100000.0, 100100.0, 0.001);
-        let decisions = manager.on_quote(&quote, 1_000_000_000);
-        let bid_cl_ord_id = decisions.iter().find_map(|d| match d {
-            OrderDecision::Send { side: Side::Buy, cl_ord_id, .. } => Some(cl_ord_id.clone()),
-            _ => None,
-        }).expect("expected bid Send decision");
-
-        let stats_before = manager.stats().orders_canceled;
-        assert!(!manager.on_order_canceled_by_cl_ord_id("not_a_real_id"),
-            "unknown cl_ord_id should return false");
-        assert_eq!(manager.stats().orders_canceled, stats_before,
-            "non-matching cancel must not increment stats");
-
-        assert!(manager.on_order_canceled_by_cl_ord_id(&bid_cl_ord_id),
-            "matching cl_ord_id should return true");
-        assert_eq!(manager.stats().orders_canceled, stats_before + 1);
-        assert!(manager.bid_order().is_none());
     }
 }
