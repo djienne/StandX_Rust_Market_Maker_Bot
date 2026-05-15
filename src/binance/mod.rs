@@ -290,25 +290,24 @@ pub fn start_binance_alpha_poller(
             looking_depth * 100.0
         );
 
-        // Run connection loop with reconnection
+        // The inner BinanceClient::connection_loop reconnects on its own (indefinitely,
+        // via ReconnectConfig::for_orderbook). We only recreate the client if its task
+        // exits (rx returns None) — never on a transient Disconnected event, which would
+        // orphan the inner task and accumulate leaked reconnect loops over time.
         loop {
             if stop_flag_clone.load(Ordering::Acquire) {
                 info!("Binance alpha poller stopping (stop requested)");
                 break;
             }
 
-            // Create client and OBI calculator
             let client = Arc::new(BinanceClient::new(&symbol));
             let mut obi_calc = BinanceObiCalculator::new(window_size, looking_depth);
 
-            // Reset shared alpha on reconnect (force warmup)
             shared_alpha.reset();
 
-            // Start client
             let mut rx = client.clone().run().await;
             let mut logged_warmup = false;
 
-            // Process events
             while let Some(event) = rx.recv().await {
                 if stop_flag_clone.load(Ordering::Acquire) {
                     client.stop();
@@ -317,12 +316,9 @@ pub fn start_binance_alpha_poller(
 
                 match event {
                     BinanceEvent::Snapshot(snapshot) => {
-                        // Update OBI calculator
                         if let Some((alpha, volatility)) = obi_calc.update(&snapshot) {
-                            // Update shared alpha atomically
                             shared_alpha.update(alpha, volatility);
 
-                            // Log warmup milestone once
                             if !logged_warmup && shared_alpha.is_warmed_up() {
                                 info!(
                                     "Binance alpha warmed up ({} samples) - alpha={:.3}, vol={:.6}",
@@ -339,10 +335,8 @@ pub fn start_binance_alpha_poller(
                     }
                     BinanceEvent::Disconnected(reason) => {
                         warn!("Binance alpha poller disconnected: {}", reason);
-                        // Reset OBI calculator on disconnect (will re-warmup)
                         obi_calc.clear();
-                        // Break to reconnect
-                        break;
+                        shared_alpha.reset();
                     }
                     BinanceEvent::Error(err) => {
                         debug!("Binance alpha poller error: {}", err);
@@ -350,13 +344,13 @@ pub fn start_binance_alpha_poller(
                 }
             }
 
-            // Check if we should stop before reconnecting
             if stop_flag_clone.load(Ordering::Acquire) {
                 break;
             }
 
-            // Wait before reconnecting
-            info!("Binance alpha poller reconnecting in 5 seconds...");
+            // rx returned None — inner task exited (max retries exceeded or panic).
+            // Recreate after backoff.
+            warn!("Binance alpha poller inner task exited, recreating in 5s");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
@@ -409,6 +403,11 @@ pub fn start_binance_bbo_poller(
     tokio::spawn(async move {
         info!("Binance BBO poller starting for {}", symbol);
 
+        // The inner BinanceBookTickerClient::connection_loop reconnects on its own
+        // (indefinitely, via ReconnectConfig::for_orderbook). We only recreate the
+        // client if its task exits (rx returns None) — never on a transient Disconnected
+        // event, which would orphan the inner task and accumulate leaked reconnect loops
+        // over time.
         loop {
             if stop_flag_clone.load(Ordering::Acquire) {
                 info!("Binance BBO poller stopping (stop requested)");
@@ -417,7 +416,6 @@ pub fn start_binance_bbo_poller(
 
             let client = Arc::new(BinanceBookTickerClient::new(&symbol));
 
-            // Reset shared BBO on reconnect
             shared_bbo.reset();
 
             let mut rx = client.clone().run().await;
@@ -431,7 +429,6 @@ pub fn start_binance_bbo_poller(
 
                 match event {
                     BookTickerEvent::Update(ticker) => {
-                        // Parse f64 values
                         let bid = match ticker.bid_price_f64() {
                             Ok(v) => v,
                             Err(e) => {
@@ -473,7 +470,7 @@ pub fn start_binance_bbo_poller(
                     }
                     BookTickerEvent::Disconnected(reason) => {
                         warn!("Binance BBO poller disconnected: {}", reason);
-                        break;
+                        shared_bbo.reset();
                     }
                     BookTickerEvent::Error(err) => {
                         debug!("Binance BBO poller error: {}", err);
@@ -485,7 +482,9 @@ pub fn start_binance_bbo_poller(
                 break;
             }
 
-            info!("Binance BBO poller reconnecting in 5 seconds...");
+            // rx returned None — inner task exited (max retries exceeded or panic).
+            // Recreate after backoff.
+            warn!("Binance BBO poller inner task exited, recreating in 5s");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
