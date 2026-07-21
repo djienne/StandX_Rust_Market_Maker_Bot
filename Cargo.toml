@@ -35,7 +35,6 @@ anyhow = "1.0"
 # Lock-free data structures
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
-smallvec = "1.15"
 
 # URL parsing
 url = "2.5"

@@ -99,6 +99,80 @@ async fn run_reconciliation_worker(
     }
 }
 
+/// Account-wide cleanup used at lifecycle boundaries. Success means the REST
+/// open-order query returned an empty account after cancellation.
+async fn cancel_all_and_verify(
+    auth: &Arc<Mutex<AuthManager>>,
+    context: &str,
+    max_attempts: u32,
+) -> bool {
+    for attempt in 1..=max_attempts {
+        let outcome = {
+            let mut auth = auth.lock().await;
+            match auth.cancel_all_orders(None).await {
+                Ok(canceled) => auth
+                    .query_open_orders(None)
+                    .await
+                    .map(|remaining| (canceled, remaining.len())),
+                Err(error) => Err(error),
+            }
+        };
+
+        match outcome {
+            Ok((canceled, 0)) => {
+                info!(
+                    "{} cleanup verified: canceled {} order(s), zero account orders remain",
+                    context, canceled
+                );
+                return true;
+            }
+            Ok((canceled, remaining)) => {
+                error!(
+                    "{} cleanup attempt {}/{} canceled {} order(s), but {} remain",
+                    context, attempt, max_attempts, canceled, remaining
+                );
+            }
+            Err(error) => {
+                error!(
+                    "{} cleanup attempt {}/{} failed: {}",
+                    context, attempt, max_attempts, error
+                );
+            }
+        }
+
+        if attempt < max_attempts {
+            tokio::time::sleep(Duration::from_secs(1_u64 << (attempt - 1).min(3))).await;
+        }
+    }
+
+    error!(
+        "CRITICAL: {} cleanup could not verify zero open account orders",
+        context
+    );
+    false
+}
+
+async fn log_account_positions(auth: &Arc<Mutex<AuthManager>>, context: &str) {
+    let result = auth.lock().await.query_positions(None).await;
+    match result {
+        Ok(positions) if positions.is_empty() => info!("{} position: flat", context),
+        Ok(positions) => {
+            for position in positions {
+                info!(
+                    "{} position: symbol={}, qty={}, status={}, entry_price={:?}, mark_price={:?}",
+                    context,
+                    position.symbol,
+                    position.qty,
+                    position.status,
+                    position.entry_price,
+                    position.mark_price
+                );
+            }
+        }
+        Err(error) => error!("Failed to query {} position: {}", context, error),
+    }
+}
+
 /// Statistics tracker for monitoring throughput and rates.
 /// Extracted from App to reduce struct bloat and separate concerns.
 struct StatsTracker {
@@ -315,6 +389,8 @@ struct App {
     reconciliation_generation: u64,
     /// Pre-allocated Arc<str> per symbol for hot path (avoids allocation on each decision)
     symbol_arcs: HashMap<String, Arc<str>>,
+    /// Reused decision buffers per symbol; no per-quote allocation.
+    decision_buffers: HashMap<String, Vec<OrderDecision>>,
     /// Quote formatter
     quote_formatter: QuoteFormatter,
     /// Statistics tracker (extracted to reduce App struct size)
@@ -371,6 +447,7 @@ impl App {
         let mut positions = HashMap::new();
         let mut order_managers = HashMap::new();
         let mut symbol_arcs = HashMap::new();
+        let mut decision_buffers = HashMap::new();
 
         for symbol in &config.symbols {
             // Create strategy with shared symbol info, shared equity, and optional Binance alpha
@@ -438,6 +515,7 @@ impl App {
 
             // Pre-allocate Arc<str> for hot path (avoids allocation per decision)
             symbol_arcs.insert(symbol.clone(), Arc::from(symbol.as_str()));
+            decision_buffers.insert(symbol.clone(), Vec::with_capacity(8));
         }
 
         // Determine price precision from tick_size (use first symbol's info if available)
@@ -465,6 +543,7 @@ impl App {
             reconciliation_tx: None,
             reconciliation_generation: 0,
             symbol_arcs,
+            decision_buffers,
             quote_formatter: QuoteFormatter::new(price_precision, 4),
             stats: StatsTracker::new(),
             last_received_at_ns: 0,
@@ -633,6 +712,7 @@ impl App {
             );
         }
 
+        let mut dispatch_failed = false;
         for (symbol, manager) in &mut self.order_managers {
             let timeout_decisions = manager.check_timeouts_now(current_time_ns);
             if !timeout_decisions.is_empty() {
@@ -643,12 +723,26 @@ impl App {
                         .unwrap_or_else(|| Arc::from(symbol.as_str()));
                     for decision in timeout_decisions {
                         self.stats.order_decision_count += 1;
-                        if tx.try_send((Arc::clone(&symbol_arc), decision)).is_err() {
-                            warn!("[{}] Order decision channel full, dropping timeout cancel", symbol);
+                        if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), decision)) {
+                            let (_, failed_decision) = error.into_inner();
+                            manager.on_dispatch_failed(&failed_decision);
+                            manager.trigger_safety_pause("timeout cancel could not reach executor");
+                            dispatch_failed = true;
+                            error!("[{}] Timeout cancel could not reach executor", symbol);
                         }
                     }
+                } else {
+                    for decision in timeout_decisions {
+                        manager.on_dispatch_failed(&decision);
+                    }
+                    manager.trigger_safety_pause("timeout cancel has no executor");
+                    dispatch_failed = true;
+                    error!("[{}] Timeout cancel has no executor", symbol);
                 }
             }
+        }
+        if dispatch_failed {
+            self.begin_account_reconciliation("timeout cancel could not reach executor");
         }
     }
 
@@ -802,11 +896,19 @@ impl App {
                                         .duration_since(UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_nanos() as i64;
-                                    let decisions = order_manager.on_quote_inline(&quote, system_time_ns);
+                                    let decisions = self
+                                        .decision_buffers
+                                        .get_mut(&data.symbol)
+                                        .expect("decision buffer created for every configured symbol");
+                                    order_manager.on_quote_into(
+                                        &quote,
+                                        system_time_ns,
+                                        decisions,
+                                    );
 
                                     // Send decisions to executor via channel
                                     if let Some(tx) = &self.order_tx {
-                                        for decision in decisions {
+                                        for decision in decisions.drain(..) {
                                             self.stats.order_decision_count += 1;
                                             // Non-blocking send (Arc::clone is just a refcount increment)
                                             if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), decision)) {
@@ -819,7 +921,17 @@ impl App {
                                                 self.stats.consecutive_channel_drops = 0;
                                             }
                                         }
+                                    } else if !decisions.is_empty() {
+                                        for decision in decisions.drain(..) {
+                                            order_manager.on_dispatch_failed(&decision);
+                                        }
+                                        order_manager.trigger_safety_pause(
+                                            "order decision has no executor",
+                                        );
+                                        dispatch_failed = true;
+                                        error!("[{}] Order decision has no executor", data.symbol);
                                     }
+                                    decisions.clear();
                                 }
                             }
 
@@ -1221,28 +1333,12 @@ async fn main() -> anyhow::Result<()> {
                 error!("Order management disabled (authentication failed)");
                 (None, None)
             } else {
-                // Cancel all existing orders before starting (cleanup from previous sessions)
-                {
-                    let mut auth_guard = auth.lock().await;
-                    match auth_guard.cancel_all_orders(None).await {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!("Canceled {} orphaned order(s) from previous session", count);
-                            } else {
-                                info!("No orphaned orders to cancel");
-                            }
-                            let remaining = auth_guard.query_open_orders(None).await?;
-                            if !remaining.is_empty() {
-                                anyhow::bail!(
-                                    "startup reconciliation left {} open account order(s)",
-                                    remaining.len()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            anyhow::bail!("failed startup account reconciliation: {}", e);
-                        }
-                    }
+                // Cancel all existing account orders before starting and prove
+                // that cleanup completed before the order socket is created.
+                if !cancel_all_and_verify(auth, "startup", 3).await {
+                    anyhow::bail!(
+                        "startup reconciliation could not verify zero open account orders"
+                    );
                 }
 
                 // Create OrderWsClient with auto-reconnection using config values
@@ -1608,7 +1704,9 @@ async fn main() -> anyhow::Result<()> {
                         }
 
                         // Check for pending replacement orders and execute immediately
+                        let mut pending_dispatch_failed = false;
                         if let Some(symbol) = matched_symbol {
+                            let order_tx = app.order_tx.clone();
                             if let Some(manager) = app.get_order_manager_mut(&symbol) {
                                 use std::time::{SystemTime, UNIX_EPOCH};
                                 let now_ns = SystemTime::now()
@@ -1618,13 +1716,34 @@ async fn main() -> anyhow::Result<()> {
                                 let pending_decisions = manager.check_pending_orders(now_ns);
                                 for decision in pending_decisions {
                                     let symbol_arc: Arc<str> = Arc::from(symbol.as_str());
-                                    if let Some(ref order_tx) = app.order_tx {
-                                        if let Err(e) = order_tx.send((symbol_arc, decision)).await {
-                                            warn!("[{}] Failed to send pending order: {}", symbol, e);
+                                    if let Some(ref order_tx) = order_tx {
+                                        if let Err(error) = order_tx.send((symbol_arc, decision)).await {
+                                            let (_, failed_decision) = error.0;
+                                            manager.on_dispatch_failed(&failed_decision);
+                                            manager.trigger_safety_pause(
+                                                "replacement order could not reach executor",
+                                            );
+                                            pending_dispatch_failed = true;
+                                            error!(
+                                                "[{}] Replacement order could not reach executor",
+                                                symbol
+                                            );
                                         }
+                                    } else {
+                                        manager.on_dispatch_failed(&decision);
+                                        manager.trigger_safety_pause(
+                                            "replacement order has no executor",
+                                        );
+                                        pending_dispatch_failed = true;
+                                        error!("[{}] Replacement order has no executor", symbol);
                                     }
                                 }
                             }
+                        }
+                        if pending_dispatch_failed {
+                            app.begin_account_reconciliation(
+                                "replacement order could not reach executor",
+                            );
                         }
                     }
                     OrderEvent::CancelFailed { order_id, reason } => {
@@ -1675,19 +1794,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     OrderEvent::MaxRetriesExceeded => {
                         error!("Order WebSocket max retries exceeded, initiating shutdown");
-                        // Cancel all orders via HTTP - CRITICAL: must handle errors
+                        app.shutdown_order_managers();
                         if let Some(auth) = &shared_auth {
-                            let mut auth_guard = auth.lock().await;
-                            match auth_guard.cancel_all_orders(None).await {
-                                Ok(count) => {
-                                    info!("Canceled {} order(s) before shutdown", count);
-                                }
-                                Err(e) => {
-                                    // CRITICAL: Log prominently so operator knows orders may remain active
-                                    error!("CRITICAL: Failed to cancel orders before shutdown: {}", e);
-                                    error!("WARNING: Orders may remain active on exchange! Manual intervention required.");
-                                }
-                            }
+                            cancel_all_and_verify(auth, "order WebSocket failure", 5).await;
+                            log_account_positions(auth, "order WebSocket failure").await;
                         }
                         // Stop the market data WebSocket and exit
                         client.stop();
@@ -1727,16 +1837,10 @@ async fn main() -> anyhow::Result<()> {
                             error!("FATAL: Order executor task panicked: {} - initiating shutdown", e);
                         }
                     }
-                    // Pause all order managers immediately
-                    for manager in app.order_managers_mut().values_mut() {
-                        manager.pause();
-                    }
-                    // Cancel all orders via HTTP
+                    app.shutdown_order_managers();
                     if let Some(auth) = &shared_auth {
-                        let mut auth_guard = auth.lock().await;
-                        if let Err(e) = auth_guard.cancel_all_orders(None).await {
-                            error!("Failed to cancel orders after executor crash: {}", e);
-                        }
+                        cancel_all_and_verify(auth, "order executor failure", 5).await;
+                        log_account_positions(auth, "order executor failure").await;
                     }
                     break;
                 }
@@ -1746,44 +1850,15 @@ async fn main() -> anyhow::Result<()> {
             _ = signal::ctrl_c() => {
                 info!("Received shutdown signal");
 
-                // Cancel all live orders before shutdown
+                // Stop local order creation first, then perform account-wide
+                // cancellation even if local tracking currently has no orders.
                 let orders_to_cancel = app.shutdown_order_managers();
-                if !orders_to_cancel.is_empty() {
-                    info!("Canceling {} live order(s)...", orders_to_cancel.len());
-
-                    // Use HTTP batch cancel with retry for reliability
+                info!("Local state tracks {} order(s) at shutdown", orders_to_cancel.len());
+                if config.order.enabled {
                     if let Some(auth) = &shared_auth {
-                        let mut canceled = false;
-                        for attempt in 1..=3 {
-                            let mut auth_guard = auth.lock().await;
-                            match auth_guard.cancel_orders_by_client_id(&orders_to_cancel).await {
-                                Ok(_) => {
-                                    info!("Successfully canceled orders on shutdown");
-                                    canceled = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!("Failed to cancel orders on shutdown (attempt {}/3): {}", attempt, e);
-                                    drop(auth_guard);
-                                    if attempt < 3 {
-                                        tokio::time::sleep(Duration::from_secs(1)).await;
-                                    }
-                                }
-                            }
-                        }
-                        if !canceled {
-                            // Last resort: try cancel_all_orders (cancels everything, not just our IDs)
-                            let mut auth_guard = auth.lock().await;
-                            if let Err(e) = auth_guard.cancel_all_orders(None).await {
-                                error!("CRITICAL: Failed to cancel ALL orders on shutdown: {} - ORDERS MAY BE ORPHANED", e);
-                            } else {
-                                info!("Canceled all orders via fallback on shutdown");
-                            }
-                        }
+                        cancel_all_and_verify(auth, "shutdown", 5).await;
+                        log_account_positions(auth, "final").await;
                     }
-
-                    // Wait for cancels to process
-                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
 
                 // Disconnect order WebSocket
@@ -1818,11 +1893,6 @@ async fn main() -> anyhow::Result<()> {
                     signal.old_lot_size, signal.new_lot_size
                 );
 
-                // 1. Pause order manager immediately (atomic, prevents new orders)
-                if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
-                    manager.pause();
-                }
-
                 app.begin_account_reconciliation(format!(
                     "tick/lot size changed for {}",
                     signal.symbol
@@ -1835,7 +1905,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 info!(
-                    "[{}] Trading resumed with new tick_size={}, lot_size={} - awaiting warmup",
+                    "[{}] Tick/lot update applied: tick_size={}, lot_size={} - trading remains paused through reconciliation and warmup",
                     signal.symbol, signal.new_tick_size, signal.new_lot_size
                 );
             }

@@ -18,7 +18,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use smallvec::SmallVec;
 use tracing::{debug, error, info, warn};
 
 use crate::strategy::Quote;
@@ -120,8 +119,8 @@ pub enum OrderDecision {
     },
 }
 
-/// Inline decision buffer used by the latency-critical quote path.
-pub type OrderDecisions = SmallVec<[OrderDecision; 8]>;
+/// Reusable decision buffer used by the latency-critical quote path.
+pub type OrderDecisions = Vec<OrderDecision>;
 
 /// Order manager statistics.
 #[derive(Debug, Default, Clone)]
@@ -205,6 +204,10 @@ pub struct OrderManager {
     /// Configuration.
     config: OrderManagerConfig,
 
+    /// Precomputed once so the normal quote path needs only one predictable
+    /// branch before entering the optional hard-cap implementation.
+    guarded_limits: bool,
+
     /// Current bid orders per level (buy).
     bid_orders: [Option<LiveOrder>; MAX_ORDER_LEVELS],
 
@@ -272,9 +275,13 @@ impl OrderManager {
         // Generate session prefix including symbol for O(1) lookup by symbol in event handlers
         // Format: mm_<symbol>_<timestamp>
         let session_prefix = format!("mm_{}_{}", config.symbol, chrono::Utc::now().timestamp_millis() % 1_000_000);
+        let guarded_limits = config.absolute_max_position_dollar.is_some()
+            || config.max_order_qty_dollar.is_some()
+            || config.position_limit_from_start;
 
         Self {
             config,
+            guarded_limits,
             bid_orders: [None, None],
             ask_orders: [None, None],
             position,
@@ -372,35 +379,61 @@ impl OrderManager {
     /// which is called on every orderbook update, not just when quotes are generated.
     #[inline]
     pub fn on_quote(&mut self, quote: &Quote, current_time_ns: i64) -> Vec<OrderDecision> {
-        self.on_quote_inline(quote, current_time_ns).into_vec()
+        let mut decisions = Vec::with_capacity(self.config.num_levels * 4);
+        self.on_quote_into(quote, current_time_ns, &mut decisions);
+        decisions
     }
 
-    /// Allocation-free quote processing for the main market-data loop.
+    /// Allocation-free quote processing for callers that retain the buffer.
     #[inline]
-    pub fn on_quote_inline(&mut self, quote: &Quote, current_time_ns: i64) -> OrderDecisions {
+    pub fn on_quote_into(
+        &mut self,
+        quote: &Quote,
+        current_time_ns: i64,
+        decisions: &mut Vec<OrderDecision>,
+    ) {
+        decisions.clear();
         // Early exit if shutting down or paused (atomic, no latency)
         // Use Acquire ordering to ensure we see the Release store from shutdown()/pause()
         if self.shutdown.load(Ordering::Acquire) || self.pause_reasons.load(Ordering::Acquire) != 0 {
-            return OrderDecisions::new();
+            return;
         }
 
         // Early exit if quote not valid for trading
         if !quote.valid_for_trading {
-            return OrderDecisions::new();
+            return;
         }
 
         // Validate mid_price to prevent NaN/Inf from bypassing position limits
         // (NaN comparisons always return false, which would skip all limit checks)
         if !quote.mid_price.is_finite() || quote.mid_price <= 0.0 {
-            return OrderDecisions::new();
+            return;
         }
 
+        if !self.guarded_limits {
+            self.on_quote_uncapped(quote, current_time_ns, decisions);
+            return;
+        }
+
+        self.on_quote_guarded(quote, current_time_ns, decisions);
+    }
+
+    /// Optional hard-cap path, kept out of the instruction cache for the
+    /// normal uncapped production configuration.
+    #[cold]
+    #[inline(never)]
+    fn on_quote_guarded(
+        &mut self,
+        quote: &Quote,
+        current_time_ns: i64,
+        decisions: &mut Vec<OrderDecision>,
+    ) {
         // Calculate position in dollars (from poller - source of truth). Guarded
         // canaries can measure exposure relative to the first fresh position.
         let current_position = self.position.get();
         let position_for_limit = if self.config.position_limit_from_start {
             let Some(baseline) = self.position_baseline else {
-                return OrderDecisions::new();
+                return;
             };
             current_position - baseline
         } else {
@@ -412,16 +445,24 @@ impl OrderManager {
         // If equity not initialized (max_position = 0), don't enforce limits
         let dynamic_max_position = self.shared_equity.max_position_dollar();
         if !dynamic_max_position.is_finite() || dynamic_max_position <= 0.0 {
-            return OrderDecisions::new();
+            return;
         }
-        let max_position = self
-            .config
-            .absolute_max_position_dollar
+        let hard_position_cap = self.config.absolute_max_position_dollar;
+        let max_position = hard_position_cap
             .map(|cap| cap.min(dynamic_max_position))
             .unwrap_or(dynamic_max_position);
 
-        let worst_long = position_dollar + self.outstanding_notional(Side::Buy);
-        let worst_short = position_dollar - self.outstanding_notional(Side::Sell);
+        // Pending/live exposure accounting is needed only for the optional hard
+        // canary cap. Preserve the original constant-time production path when
+        // that cap is unset.
+        let (worst_long, worst_short) = if hard_position_cap.is_some() {
+            (
+                position_dollar + self.outstanding_notional(Side::Buy),
+                position_dollar - self.outstanding_notional(Side::Sell),
+            )
+        } else {
+            (position_dollar, position_dollar)
+        };
 
         // Use > and < (not >= and <=) so that at exactly the limit we can still
         // place orders on the opposite side to rebalance position
@@ -431,15 +472,14 @@ impl OrderManager {
         // Use the minimum of configured levels and quote levels
         let num_levels = self.config.num_levels.min(quote.num_levels);
 
-        let mut decisions = OrderDecisions::new();
-
         // Process each level
         for level in 0..num_levels {
             let bid_quantity = self.capped_quantity(quote.bid_prices[level], quote.quantity);
             let ask_quantity = self.capped_quantity(quote.ask_prices[level], quote.quantity);
             // Process BID side (buy) - skip if at max long position
             if !at_max_long {
-                let would_exceed = self.bid_orders[level].is_none()
+                let would_exceed = hard_position_cap.is_some()
+                    && self.bid_orders[level].is_none()
                     && self.outstanding_notional(Side::Buy)
                         + position_dollar
                         + quote.bid_prices[level] * bid_quantity
@@ -472,7 +512,8 @@ impl OrderManager {
 
             // Process ASK side (sell) - skip if at max short position
             if !at_max_short {
-                let would_exceed = self.ask_orders[level].is_none()
+                let would_exceed = hard_position_cap.is_some()
+                    && self.ask_orders[level].is_none()
                     && position_dollar
                         - self.outstanding_notional(Side::Sell)
                         - quote.ask_prices[level] * ask_quantity
@@ -504,7 +545,60 @@ impl OrderManager {
             }
         }
 
-        decisions
+    }
+
+    /// Original constant-time production path. Optional canary caps take the
+    /// guarded branch above; their additional exposure scans never run here.
+    #[inline(always)]
+    fn on_quote_uncapped(
+        &mut self,
+        quote: &Quote,
+        current_time_ns: i64,
+        decisions: &mut Vec<OrderDecision>,
+    ) {
+        let position_dollar = self.position.get() * quote.mid_price;
+        let max_position = self.shared_equity.max_position_dollar();
+        let at_max_long = max_position > 0.0 && position_dollar > max_position;
+        let at_max_short = max_position > 0.0 && position_dollar < -max_position;
+        let num_levels = self.config.num_levels.min(quote.num_levels);
+        for level in 0..num_levels {
+            if !at_max_long {
+                if let Some(decision) = self.process_side_level(
+                    Side::Buy,
+                    level,
+                    quote.bid_prices[level],
+                    quote.quantity,
+                    current_time_ns,
+                ) {
+                    decisions.push(decision);
+                }
+            } else if let Some(bid) = &self.bid_orders[level] {
+                if bid.state != OrderState::Canceling {
+                    let cl_ord_id = bid.cl_ord_id.clone();
+                    self.set_order_canceling(Side::Buy, level, current_time_ns);
+                    decisions.push(OrderDecision::Cancel { cl_ord_id });
+                }
+            }
+
+            if !at_max_short {
+                if let Some(decision) = self.process_side_level(
+                    Side::Sell,
+                    level,
+                    quote.ask_prices[level],
+                    quote.quantity,
+                    current_time_ns,
+                ) {
+                    decisions.push(decision);
+                }
+            } else if let Some(ask) = &self.ask_orders[level] {
+                if ask.state != OrderState::Canceling {
+                    let cl_ord_id = ask.cl_ord_id.clone();
+                    self.set_order_canceling(Side::Sell, level, current_time_ns);
+                    decisions.push(OrderDecision::Cancel { cl_ord_id });
+                }
+            }
+        }
+
     }
 
     #[inline]
@@ -558,10 +652,7 @@ impl OrderManager {
                 );
                 self.set_order_pending(side, level, cl_ord_id.clone(), new_price, qty, current_time_ns);
                 self.stats.orders_sent += 1;
-                self.last_order_sent_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                self.last_order_sent_at_ms = current_time_ns.max(0) as u64 / 1_000_000;
                 Some(OrderDecision::Send {
                     side,
                     level,
@@ -1109,10 +1200,11 @@ impl OrderManager {
                 if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
                     order.cancel_fail_count += 1;
 
-                    // If too many failures, forcefully clear the slot to break the loop
+                    // Repeated failures are ambiguous. Keep the slot and fail closed;
+                    // reconciliation will clear it only after REST verification.
                     if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
                         error!(
-                            "[{}] Ask L{} order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
+                            "[{}] Ask L{} order {} exceeded {} cancel failures - pausing for reconciliation (order_id={}, cl_ord_id={})",
                             self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
                             order_id, order.cl_ord_id
                         );
@@ -1153,10 +1245,7 @@ impl OrderManager {
                     );
                     self.set_order_pending(Side::Buy, level, cl_ord_id.clone(), price, qty, current_time_ns);
                     self.stats.orders_sent += 1;
-                    self.last_order_sent_at_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    self.last_order_sent_at_ms = current_time_ns.max(0) as u64 / 1_000_000;
                     decisions.push(OrderDecision::Send {
                         side: Side::Buy,
                         level,
@@ -1179,10 +1268,7 @@ impl OrderManager {
                     );
                     self.set_order_pending(Side::Sell, level, cl_ord_id.clone(), price, qty, current_time_ns);
                     self.stats.orders_sent += 1;
-                    self.last_order_sent_at_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    self.last_order_sent_at_ms = current_time_ns.max(0) as u64 / 1_000_000;
                     decisions.push(OrderDecision::Send {
                         side: Side::Sell,
                         level,

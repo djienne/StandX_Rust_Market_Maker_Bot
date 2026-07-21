@@ -1980,7 +1980,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
- "smallvec",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
