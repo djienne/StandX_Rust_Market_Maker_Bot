@@ -61,7 +61,7 @@ fn bench_order_manager(c: &mut Criterion) {
     c.bench_function("order_manager_initial_four_decisions", |b| {
         b.iter_batched(
             manager,
-            |mut manager| black_box(manager.on_quote(black_box(&quote), 1_000_000_000)),
+            |mut manager| black_box(manager.on_quote_inline(black_box(&quote), 1_000_000_000)),
             BatchSize::SmallInput,
         )
     });
@@ -73,7 +73,7 @@ fn bench_order_manager(c: &mut Criterion) {
         let mut now = 1_000_000_001_i64;
         b.iter(|| {
             now += 1;
-            black_box(pending.on_quote(black_box(&quote), black_box(now)))
+            black_box(pending.on_quote_inline(black_box(&quote), black_box(now)))
         })
     });
 
@@ -97,7 +97,7 @@ fn bench_order_manager(c: &mut Criterion) {
         let mut now = 1_000_000_001_i64;
         b.iter(|| {
             now += 1;
-            black_box(live.on_quote(black_box(&quote), black_box(now)))
+            black_box(live.on_quote_inline(black_box(&quote), black_box(now)))
         })
     });
 }

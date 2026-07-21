@@ -47,7 +47,7 @@ pub use client::{
     NewOrderRequest, OrderResponse, OpenOrder, CancelOrdersRequest,
 };
 pub use order_manager::{
-    OrderManager as QuoteOrderManager, OrderManagerConfig, OrderDecision,
+    OrderManager as QuoteOrderManager, OrderManagerConfig, OrderDecision, OrderDecisions,
     LiveOrder, OrderState, Side, OrderManagerStats,
 };
 pub use order_ws::{OrderWsClient, OrderWsError, OrderEvent};

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use standx_orderbook::{
-    Config, OrderbookStore, WsClientBuilder, WsEvent, StandXMessage,
+    Config, OrderbookSnapshot, OrderbookStore, WsClientBuilder, WsEvent, StandXMessage,
     ObiStrategy, QuoteFormatter, init_logging, QuoteStrategy,
     AuthManager, SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle,
     QuoteOrderManager, OrderManagerConfig, OrderDecision, Side,
@@ -235,6 +235,10 @@ struct App {
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
     order_tx: Option<mpsc::Sender<(Arc<str>, OrderDecision)>>,
+    /// Non-blocking diagnostic history channel; consumed off the quote path.
+    history_tx: mpsc::Sender<OrderbookSnapshot>,
+    /// History samples dropped because the cold-path recorder was saturated.
+    history_channel_drops: u64,
     /// Pre-allocated Arc<str> per symbol for hot path (avoids allocation on each decision)
     symbol_arcs: HashMap<String, Arc<str>>,
     /// Quote formatter
@@ -271,6 +275,15 @@ impl App {
             config.history_buffer_size,
             config.history_minutes,
         ));
+        let (history_tx, mut history_rx) = mpsc::channel::<OrderbookSnapshot>(4096);
+        let history_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            while let Some(snapshot) = history_rx.recv().await {
+                if let Some(orderbook) = history_store.get(snapshot.symbol.as_str()) {
+                    orderbook.record_history(snapshot);
+                }
+            }
+        });
 
         // Create SharedEquity for automatic order sizing
         let shared_equity = Arc::new(SharedEquity::new(
@@ -366,6 +379,8 @@ impl App {
             shared_binance_bbo,
             order_managers,
             order_tx: None,
+            history_tx,
+            history_channel_drops: 0,
             symbol_arcs,
             quote_formatter: QuoteFormatter::new(price_precision, 4),
             stats: StatsTracker::new(),
@@ -585,12 +600,6 @@ impl App {
                             self.stats.trading_stats.set_mid_price(mid);
                         }
 
-                        // Update orderbook store (still clones internally for history,
-                        // but we avoided the external clone by reordering operations)
-                        if let Some(ob) = self.store.get(&data.symbol) {
-                            ob.update(snapshot);
-                        }
-
                         // Note: Timeout checking is now consolidated in the periodic 1-second timer
                         // (check_order_timeouts). Both order creation and timeout checks use system
                         // time to avoid false timeouts when orderbook messages are sparse.
@@ -612,7 +621,7 @@ impl App {
                                         .duration_since(UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_nanos() as i64;
-                                    let decisions = order_manager.on_quote(&quote, system_time_ns);
+                                    let decisions = order_manager.on_quote_inline(&quote, system_time_ns);
 
                                     // Send decisions to executor via channel
                                     if let Some(tx) = &self.order_tx {
@@ -644,6 +653,23 @@ impl App {
                             // Log quote after trading decisions are dispatched so formatting
                             // never sits in front of the order hot path.
                             self.quote_formatter.log_quote(&quote);
+                        }
+
+                        // Storage and diagnostic history are cold-path work. Publish only
+                        // after order decisions have been sent to the executor.
+                        if let Some(ob) = self.store.get(&data.symbol) {
+                            ob.update_current(snapshot.clone());
+                        }
+                        if let Err(error) = self.history_tx.try_send(snapshot) {
+                            self.history_channel_drops = self.history_channel_drops.saturating_add(1);
+                            if self.history_channel_drops <= 3
+                                || self.history_channel_drops.is_power_of_two()
+                            {
+                                warn!(
+                                    "[{}] History recorder unavailable (drops={}): {}",
+                                    data.symbol, self.history_channel_drops, error
+                                );
+                            }
                         }
 
                         // Log periodic orderbook updates if verbose

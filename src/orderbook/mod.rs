@@ -47,10 +47,17 @@ impl SymbolOrderbook {
     ///
     /// Updates both the current state and adds to history.
     pub fn update(&self, snapshot: OrderbookSnapshot) {
-        // Update current state
-        self.current.update_snapshot(snapshot.clone());
+        self.update_current(snapshot.clone());
+        self.record_history(snapshot);
+    }
 
-        // Add to history
+    /// Publish the current snapshot for cold-path readers.
+    pub fn update_current(&self, snapshot: OrderbookSnapshot) {
+        self.current.update_snapshot(snapshot);
+    }
+
+    /// Record a diagnostic history sample.
+    pub fn record_history(&self, snapshot: OrderbookSnapshot) {
         self.history.push(snapshot);
     }
 

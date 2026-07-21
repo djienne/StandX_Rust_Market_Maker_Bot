@@ -18,6 +18,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use smallvec::SmallVec;
 use tracing::{debug, error, info, warn};
 
 use crate::strategy::Quote;
@@ -110,6 +111,9 @@ pub enum OrderDecision {
         qty: f64,
     },
 }
+
+/// Inline decision buffer used by the latency-critical quote path.
+pub type OrderDecisions = SmallVec<[OrderDecision; 8]>;
 
 /// Order manager statistics.
 #[derive(Debug, Default, Clone)]
@@ -347,21 +351,27 @@ impl OrderManager {
     /// which is called on every orderbook update, not just when quotes are generated.
     #[inline]
     pub fn on_quote(&mut self, quote: &Quote, current_time_ns: i64) -> Vec<OrderDecision> {
+        self.on_quote_inline(quote, current_time_ns).into_vec()
+    }
+
+    /// Allocation-free quote processing for the main market-data loop.
+    #[inline]
+    pub fn on_quote_inline(&mut self, quote: &Quote, current_time_ns: i64) -> OrderDecisions {
         // Early exit if shutting down or paused (atomic, no latency)
         // Use Acquire ordering to ensure we see the Release store from shutdown()/pause()
         if self.shutdown.load(Ordering::Acquire) || self.pause_reasons.load(Ordering::Acquire) != 0 {
-            return vec![];
+            return OrderDecisions::new();
         }
 
         // Early exit if quote not valid for trading
         if !quote.valid_for_trading {
-            return vec![];
+            return OrderDecisions::new();
         }
 
         // Validate mid_price to prevent NaN/Inf from bypassing position limits
         // (NaN comparisons always return false, which would skip all limit checks)
         if !quote.mid_price.is_finite() || quote.mid_price <= 0.0 {
-            return vec![];
+            return OrderDecisions::new();
         }
 
         // Calculate position in dollars (from poller - source of truth)
@@ -379,7 +389,7 @@ impl OrderManager {
         // Use the minimum of configured levels and quote levels
         let num_levels = self.config.num_levels.min(quote.num_levels);
 
-        let mut decisions = Vec::with_capacity(num_levels * 4); // 2 sides x 2 levels x 2 actions max
+        let mut decisions = OrderDecisions::new();
 
         // Process each level
         for level in 0..num_levels {
