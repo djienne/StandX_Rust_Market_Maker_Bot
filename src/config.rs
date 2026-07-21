@@ -589,6 +589,24 @@ impl Config {
             ));
         }
 
+        let mut unique_symbols = std::collections::HashSet::with_capacity(self.symbols.len());
+        for symbol in &self.symbols {
+            if symbol.is_empty()
+                || !symbol.is_ascii()
+                || symbol.len() > 15
+                || symbol.contains('_')
+            {
+                return Err(ConfigError::ValidationError(format!(
+                    "symbol '{symbol}' must be 1-15 ASCII bytes and cannot contain '_'"
+                )));
+            }
+            if !unique_symbols.insert(symbol) {
+                return Err(ConfigError::ValidationError(format!(
+                    "duplicate symbol '{symbol}'"
+                )));
+            }
+        }
+
         if self.orderbook_levels == 0 || self.orderbook_levels > 50 {
             return Err(ConfigError::ValidationError(
                 "orderbook_levels must be between 1 and 50".to_string()
@@ -792,5 +810,20 @@ mod tests {
         let mut config = Config::default();
         config.strategy.lot_size = f64::NAN;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_symbols_that_can_alias_client_order_ids() {
+        for symbols in [
+            vec!["".to_string()],
+            vec!["BTC_USD".to_string()],
+            vec!["1234567890123456".to_string()],
+            vec!["BTC-ÜSD".to_string()],
+            vec!["BTC-USD".to_string(), "BTC-USD".to_string()],
+        ] {
+            let mut config = Config::default();
+            config.symbols = symbols;
+            assert!(config.validate().is_err());
+        }
     }
 }

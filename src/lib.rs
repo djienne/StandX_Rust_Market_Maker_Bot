@@ -107,7 +107,7 @@ pub use trading::{
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
-pub use types::{OrderbookSnapshot, PriceLevel, Symbol, MAX_LEVELS};
+pub use types::{OrderbookSnapshot, PriceLevel, Symbol, SymbolError, MAX_LEVELS};
 pub use binance::{
     BinanceClient, BinanceClientConfig, BinanceEvent, BinanceObiCalculator,
     BinanceOrderbook, BinanceWsStats, BinanceWsStatsSnapshot,

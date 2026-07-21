@@ -1,49 +1,18 @@
-//! Lock-free triple buffer for current orderbook state.
+//! Thread-safe current orderbook storage.
 //!
-//! This module provides a triple buffer implementation that allows
-//! a single writer and multiple readers to access the current orderbook
-//! state without blocking each other.
-//!
-//! # Design
-//!
-//! The triple buffer uses three pre-allocated buffers and atomic indices:
-//! - Buffer 0, 1, 2: Three identical OrderbookSnapshot buffers
-//! - write_idx: Index of the buffer currently being written
-//! - read_idx: Index of the buffer available for reading
-//! - swap_idx: Index of the intermediate buffer for exchange
-//!
-//! Writer workflow:
-//! 1. Write to buffer[write_idx]
-//! 2. Atomically swap write_idx with swap_idx
-//!
-//! Reader workflow:
-//! 1. Atomically swap read_idx with swap_idx
-//! 2. Read from buffer[read_idx]
+//! Snapshot storage is deliberately kept off the quote-to-order path. A compact
+//! `parking_lot` lock makes the ownership rules explicit and supports the market
+//! stream and the infrequent REST sanity correction without unsafe aliasing.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::RwLock;
 
 use crate::types::{OrderbookSnapshot, Symbol};
 
-/// Lock-free triple buffer for the current orderbook state.
-///
-/// Provides wait-free read and write operations with guaranteed
-/// consistency. Writers never block readers and vice versa.
+/// Thread-safe storage for the most recently published orderbook snapshot.
 pub struct CurrentOrderbook {
-    /// Three pre-allocated buffers
-    buffers: [UnsafeCell<OrderbookSnapshot>; 3],
-
-    /// Index of the buffer being written (0, 1, or 2)
-    write_idx: AtomicU8,
-
-    /// Index of the buffer available for reading (0, 1, or 2)
-    read_idx: AtomicU8,
-
-    /// Index of the intermediate swap buffer (0, 1, or 2)
-    swap_idx: AtomicU8,
-
-    /// Flag indicating if any data has been written
-    has_data: AtomicU8,
+    snapshot: RwLock<Option<OrderbookSnapshot>>,
 
     /// Sequence number for updates
     update_sequence: AtomicU64,
@@ -56,15 +25,7 @@ impl CurrentOrderbook {
     /// Create a new triple buffer for the given symbol.
     pub fn new(symbol: Symbol) -> Self {
         Self {
-            buffers: [
-                UnsafeCell::new(OrderbookSnapshot::new(symbol)),
-                UnsafeCell::new(OrderbookSnapshot::new(symbol)),
-                UnsafeCell::new(OrderbookSnapshot::new(symbol)),
-            ],
-            write_idx: AtomicU8::new(0),
-            read_idx: AtomicU8::new(1),
-            swap_idx: AtomicU8::new(2),
-            has_data: AtomicU8::new(0),
+            snapshot: RwLock::new(None),
             update_sequence: AtomicU64::new(0),
             symbol,
         }
@@ -78,127 +39,70 @@ impl CurrentOrderbook {
 
     /// Update the current orderbook state.
     ///
-    /// This operation is wait-free and will not block readers.
-    /// The update function receives a mutable reference to the write buffer.
+    /// The update function receives exclusive access to the published snapshot.
     pub fn update<F>(&self, f: F)
     where
         F: FnOnce(&mut OrderbookSnapshot),
     {
-        let write_idx = self.write_idx.load(Ordering::Acquire) as usize;
-
-        // Get mutable access to the write buffer
-        // SAFETY: Only one writer at a time, and we own write_idx
-        let buffer = unsafe { &mut *self.buffers[write_idx].get() };
-
-        // Apply the update
+        let mut snapshot = self.snapshot.write();
+        let buffer = snapshot.get_or_insert_with(|| OrderbookSnapshot::new(self.symbol));
         f(buffer);
-
-        // Swap write buffer with swap buffer
-        // This makes the updated buffer available to readers via swap_idx
-        let old_swap = self.swap_idx.swap(write_idx as u8, Ordering::AcqRel);
-        self.write_idx.store(old_swap, Ordering::Release);
-
-        // Mark as having data
-        self.has_data.store(1, Ordering::Release);
-
-        // Increment sequence AFTER swap completes to ensure readers see
-        // consistent data. If sequence was incremented before swap, a reader
-        // could see the new sequence but read stale buffer data.
         self.update_sequence.fetch_add(1, Ordering::Release);
     }
 
     /// Update with a complete snapshot replacement.
     pub fn update_snapshot(&self, snapshot: OrderbookSnapshot) {
-        self.update(|buffer| {
-            *buffer = snapshot;
-        });
+        *self.snapshot.write() = Some(snapshot);
+        self.update_sequence.fetch_add(1, Ordering::Release);
     }
 
     /// Read the current orderbook state.
     ///
-    /// This operation is wait-free and returns a clone of the current state.
+    /// Returns a fixed-size clone of the current state.
     /// Returns `None` if no data has been written yet.
     pub fn read(&self) -> Option<OrderbookSnapshot> {
-        if self.has_data.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-
-        // Swap read buffer with swap buffer to get the latest
-        let old_swap = self.swap_idx.load(Ordering::Acquire);
-        let read_idx = self.read_idx.swap(old_swap, Ordering::AcqRel);
-        self.swap_idx.store(read_idx, Ordering::Release);
-
-        // Read from the buffer we just swapped in
-        let new_read_idx = self.read_idx.load(Ordering::Acquire) as usize;
-
-        // SAFETY: We now own this buffer for reading
-        let buffer = unsafe { &*self.buffers[new_read_idx].get() };
-        Some(buffer.clone())
+        self.snapshot.read().clone()
     }
 
-    /// Read the current state without swapping buffers.
-    ///
-    /// This is slightly faster but may return slightly older data
-    /// if the writer is active.
+    /// Read the current state. Kept as a compatibility alias for `read`.
     pub fn peek(&self) -> Option<OrderbookSnapshot> {
-        if self.has_data.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-
-        // Read from swap buffer (most recently completed write)
-        let swap_idx = self.swap_idx.load(Ordering::Acquire) as usize;
-
-        // SAFETY: Reading from swap buffer is safe, writer uses write_idx
-        let buffer = unsafe { &*self.buffers[swap_idx].get() };
-        Some(buffer.clone())
+        self.read()
     }
 
     /// Get the best bid price without copying the entire snapshot.
     #[inline]
     pub fn best_bid(&self) -> Option<f64> {
-        if self.has_data.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let swap_idx = self.swap_idx.load(Ordering::Acquire) as usize;
-        // SAFETY: Reading from swap buffer is safe
-        let buffer = unsafe { &*self.buffers[swap_idx].get() };
-        buffer.best_bid_price()
+        self.snapshot
+            .read()
+            .as_ref()
+            .and_then(OrderbookSnapshot::best_bid_price)
     }
 
     /// Get the best ask price without copying the entire snapshot.
     #[inline]
     pub fn best_ask(&self) -> Option<f64> {
-        if self.has_data.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let swap_idx = self.swap_idx.load(Ordering::Acquire) as usize;
-        // SAFETY: Reading from swap buffer is safe
-        let buffer = unsafe { &*self.buffers[swap_idx].get() };
-        buffer.best_ask_price()
+        self.snapshot
+            .read()
+            .as_ref()
+            .and_then(OrderbookSnapshot::best_ask_price)
     }
 
     /// Get the current spread without copying the entire snapshot.
     #[inline]
     pub fn spread(&self) -> Option<f64> {
-        if self.has_data.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let swap_idx = self.swap_idx.load(Ordering::Acquire) as usize;
-        // SAFETY: Reading from swap buffer is safe
-        let buffer = unsafe { &*self.buffers[swap_idx].get() };
-        buffer.spread()
+        self.snapshot
+            .read()
+            .as_ref()
+            .and_then(OrderbookSnapshot::spread)
     }
 
     /// Get the current mid price without copying the entire snapshot.
     #[inline]
     pub fn mid_price(&self) -> Option<f64> {
-        if self.has_data.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let swap_idx = self.swap_idx.load(Ordering::Acquire) as usize;
-        // SAFETY: Reading from swap buffer is safe
-        let buffer = unsafe { &*self.buffers[swap_idx].get() };
-        buffer.mid_price()
+        self.snapshot
+            .read()
+            .as_ref()
+            .and_then(OrderbookSnapshot::mid_price)
     }
 
     /// Get the update sequence number.
@@ -210,13 +114,9 @@ impl CurrentOrderbook {
     /// Check if data has been written.
     #[inline]
     pub fn has_data(&self) -> bool {
-        self.has_data.load(Ordering::Acquire) != 0
+        self.snapshot.read().is_some()
     }
 }
-
-// SAFETY: CurrentOrderbook uses atomic operations and UnsafeCell correctly
-unsafe impl Send for CurrentOrderbook {}
-unsafe impl Sync for CurrentOrderbook {}
 
 /// Manager for multiple symbols' orderbooks.
 ///
@@ -235,7 +135,10 @@ impl OrderbookManager {
         let symbols: Vec<Symbol> = symbols.iter().map(|s| Symbol::new(s)).collect();
         let orderbooks = symbols.iter().map(|s| CurrentOrderbook::new(*s)).collect();
 
-        Self { orderbooks, symbols }
+        Self {
+            orderbooks,
+            symbols,
+        }
     }
 
     /// Get the orderbook for a symbol.
@@ -272,6 +175,8 @@ impl OrderbookManager {
 mod tests {
     use super::*;
     use crate::types::PriceLevel;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_triple_buffer_basic() {
@@ -335,5 +240,45 @@ mod tests {
         assert_eq!(manager.get("TEST-USD").unwrap().best_bid(), Some(50000.0));
         assert_eq!(manager.get("ETH-USD").unwrap().best_bid(), Some(3000.0));
         assert!(manager.get("SOL-USD").is_none());
+    }
+
+    #[test]
+    fn concurrent_writers_and_readers_publish_coherent_snapshots() {
+        let orderbook = Arc::new(CurrentOrderbook::new(Symbol::new("TEST-USD")));
+        let writers_done = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+
+        for writer in 0..2_u64 {
+            let orderbook = Arc::clone(&orderbook);
+            let writers_done = Arc::clone(&writers_done);
+            threads.push(std::thread::spawn(move || {
+                for sequence in 1..=10_000_u64 {
+                    let value = writer * 10_000 + sequence;
+                    orderbook.update(|snapshot| {
+                        snapshot.sequence = value;
+                        snapshot.bids[0] = PriceLevel::new(value as f64, 1.0);
+                        snapshot.bid_count = 1;
+                    });
+                }
+                writers_done.fetch_add(1, Ordering::Release);
+            }));
+        }
+
+        for _ in 0..4 {
+            let orderbook = Arc::clone(&orderbook);
+            let writers_done = Arc::clone(&writers_done);
+            threads.push(std::thread::spawn(move || {
+                while writers_done.load(Ordering::Acquire) < 2 {
+                    if let Some(snapshot) = orderbook.read() {
+                        assert_eq!(snapshot.best_bid_price(), Some(snapshot.sequence as f64));
+                    }
+                }
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(orderbook.sequence(), 20_000);
     }
 }

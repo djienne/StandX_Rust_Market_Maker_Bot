@@ -58,22 +58,50 @@ pub struct Symbol {
     len: u8,
 }
 
+/// Error returned when a symbol cannot be represented without truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolError;
+
+impl fmt::Display for SymbolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "symbol must be at most 15 UTF-8 bytes")
+    }
+}
+
+impl std::error::Error for SymbolError {}
+
 impl Symbol {
     /// Create a new symbol from a string slice.
-    /// Truncates if longer than 15 characters.
+    ///
+    /// This compatibility constructor truncates at a valid UTF-8 boundary. Runtime
+    /// configuration should use [`Symbol::try_new`] so aliases cannot be introduced.
     pub fn new(s: &str) -> Self {
         let bytes = s.as_bytes();
-        let len = bytes.len().min(15) as u8;
+        let mut len = bytes.len().min(15);
+        while !s.is_char_boundary(len) {
+            len -= 1;
+        }
         let mut data = [0u8; 16];
-        data[..len as usize].copy_from_slice(&bytes[..len as usize]);
-        Self { data, len }
+        data[..len].copy_from_slice(&bytes[..len]);
+        Self {
+            data,
+            len: len as u8,
+        }
+    }
+
+    /// Create a symbol without truncation.
+    pub fn try_new(s: &str) -> Result<Self, SymbolError> {
+        if s.len() > 15 {
+            return Err(SymbolError);
+        }
+        Ok(Self::new(s))
     }
 
     /// Get the symbol as a string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
-        // SAFETY: We only store valid UTF-8 from the constructor
-        unsafe { std::str::from_utf8_unchecked(&self.data[..self.len as usize]) }
+        std::str::from_utf8(&self.data[..self.len as usize])
+            .expect("Symbol constructors preserve UTF-8 boundaries")
     }
 
     /// Get the length of the symbol.
@@ -662,6 +690,14 @@ mod tests {
         assert_eq!(ob.spread(), Some(1.0));
         assert_eq!(ob.mid_price(), Some(100.5));
         assert!(ob.is_valid());
+    }
+
+    #[test]
+    fn symbol_truncates_only_at_utf8_boundary() {
+        let symbol = Symbol::new("12345678901234é");
+        assert_eq!(symbol.as_str(), "12345678901234");
+        assert!(Symbol::try_new("12345678901234é").is_err());
+        assert_eq!(Symbol::try_new("BTC-USD").unwrap().as_str(), "BTC-USD");
     }
 
     #[test]

@@ -1,61 +1,22 @@
-//! Lock-free ring buffer for orderbook history.
-//!
-//! This module provides a high-performance, lock-free ring buffer for storing
-//! orderbook snapshots. It uses atomic operations for synchronization,
-//! allowing concurrent reads and writes without blocking.
-//!
-//! # Design
-//!
-//! The buffer uses a monotonically increasing write position with wrap-around.
-//! Readers can safely iterate over recent entries by tracking the write position
-//! and checking sequence numbers for consistency.
-//!
-//! # Memory Layout
-//!
-//! The buffer is pre-allocated at initialization time to avoid runtime allocations.
-//! Each slot contains an OrderbookSnapshot plus a generation counter for
-//! detecting overwrites during reads.
+//! Thread-safe, pre-allocated ring buffer for diagnostic orderbook history.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use parking_lot::RwLock;
 
 use crate::types::{OrderbookSnapshot, Symbol};
 
-/// A slot in the ring buffer containing a snapshot and its generation.
-struct HistorySlot {
-    /// The orderbook snapshot stored in this slot
-    snapshot: OrderbookSnapshot,
-    /// Generation counter incremented on each write to detect overwrites
-    generation: AtomicU64,
+struct HistoryState {
+    buffer: Box<[OrderbookSnapshot]>,
+    initialized: Box<[bool]>,
+    write_pos: u64,
+    total_writes: u64,
 }
 
-impl Default for HistorySlot {
-    fn default() -> Self {
-        Self {
-            snapshot: OrderbookSnapshot::default(),
-            generation: AtomicU64::new(0),
-        }
-    }
-}
-
-/// Lock-free ring buffer for orderbook history.
-///
-/// Provides O(1) write operations and O(n) iteration over recent snapshots
-/// within the retention window.
+/// Provides O(1) writes and owned diagnostic reads. The main loop records into
+/// this structure only after order decisions have been dispatched.
 pub struct OrderbookHistory {
-    /// Pre-allocated buffer of slots
-    buffer: Box<[HistorySlot]>,
-    /// Buffer capacity
+    state: RwLock<HistoryState>,
     capacity: usize,
-    /// Current write position (monotonically increasing, wraps via modulo)
-    write_pos: AtomicU64,
-    /// Retention window in nanoseconds
     retention_ns: u64,
-    /// Startup time for relative timestamps
-    #[allow(dead_code)]
-    start_time: Instant,
-    /// Statistics: total writes
-    total_writes: AtomicU64,
 }
 
 impl OrderbookHistory {
@@ -68,83 +29,47 @@ impl OrderbookHistory {
     pub fn new(capacity: usize, retention_minutes: u64) -> Self {
         assert!(capacity > 0, "capacity must be greater than 0");
 
-        // Pre-allocate the buffer
-        let buffer: Vec<HistorySlot> = (0..capacity)
-            .map(|_| HistorySlot::default())
-            .collect();
-
         Self {
-            buffer: buffer.into_boxed_slice(),
+            state: RwLock::new(HistoryState {
+                buffer: vec![OrderbookSnapshot::default(); capacity].into_boxed_slice(),
+                initialized: vec![false; capacity].into_boxed_slice(),
+                write_pos: 0,
+                total_writes: 0,
+            }),
             capacity,
-            write_pos: AtomicU64::new(0),
             retention_ns: retention_minutes * 60 * 1_000_000_000,
-            start_time: Instant::now(),
-            total_writes: AtomicU64::new(0),
         }
     }
 
     /// Push a new snapshot into the buffer.
     ///
-    /// This operation is lock-free and will overwrite the oldest entry
-    /// when the buffer is full.
+    /// Overwrites the oldest entry when the buffer is full.
     pub fn push(&self, snapshot: OrderbookSnapshot) {
-        // Get current position and increment atomically
-        let pos = self.write_pos.fetch_add(1, Ordering::AcqRel);
+        let mut state = self.state.write();
+        let pos = state.write_pos;
         let idx = (pos as usize) % self.capacity;
-
-        // Get the slot
-        let slot = &self.buffer[idx];
-
-        // CAS loop: claim the slot by transitioning generation from even (stable) to odd (writing).
-        // This prevents data corruption if two writers target the same slot (e.g., after wrap-around).
-        loop {
-            let gen = slot.generation.load(Ordering::Acquire);
-            if gen % 2 != 0 {
-                // Slot is being written by another thread - spin wait
-                std::hint::spin_loop();
-                continue;
-            }
-            // Try to claim: even → odd
-            if slot.generation.compare_exchange(
-                gen, gen + 1, Ordering::AcqRel, Ordering::Relaxed
-            ).is_ok() {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
-        // Write the snapshot (we own the slot - generation is odd)
-        // SAFETY: The CAS above guarantees exclusive write access to this slot
-        let slot_ptr = slot as *const HistorySlot as *mut HistorySlot;
-        unsafe {
-            (*slot_ptr).snapshot = snapshot;
-        }
-
-        // Memory barrier to ensure snapshot is visible before generation update
-        std::sync::atomic::fence(Ordering::Release);
-
-        // Mark slot as stable (odd → even) - readers can now safely read
-        slot.generation.fetch_add(1, Ordering::Release);
-
-        self.total_writes.fetch_add(1, Ordering::Relaxed);
+        state.buffer[idx] = snapshot;
+        state.initialized[idx] = true;
+        state.write_pos = pos.wrapping_add(1);
+        state.total_writes = state.total_writes.wrapping_add(1);
     }
 
     /// Get the most recent snapshot.
     ///
     /// Returns `None` if no snapshots have been written.
     pub fn latest(&self) -> Option<OrderbookSnapshot> {
-        let pos = self.write_pos.load(Ordering::Acquire);
-        if pos == 0 {
+        let state = self.state.read();
+        if state.write_pos == 0 {
             return None;
         }
-
-        let idx = ((pos - 1) as usize) % self.capacity;
-        self.read_slot(idx)
+        let idx = ((state.write_pos - 1) as usize) % self.capacity;
+        state.initialized[idx].then(|| state.buffer[idx].clone())
     }
 
     /// Get the most recent snapshot for a specific symbol.
     pub fn latest_for_symbol(&self, symbol: &Symbol) -> Option<OrderbookSnapshot> {
-        let pos = self.write_pos.load(Ordering::Acquire);
+        let state = self.state.read();
+        let pos = state.write_pos;
         if pos == 0 {
             return None;
         }
@@ -155,64 +80,37 @@ impl OrderbookHistory {
 
         for i in 0..search_count {
             let idx = ((start - i as u64) as usize) % self.capacity;
-            if let Some(snapshot) = self.read_slot(idx) {
-                if &snapshot.symbol == symbol {
-                    return Some(snapshot);
-                }
+            if state.initialized[idx] && &state.buffer[idx].symbol == symbol {
+                return Some(state.buffer[idx].clone());
             }
         }
 
         None
     }
 
-    /// Read a snapshot from a slot with consistency check.
-    ///
-    /// Returns `None` if the slot was being written during the read.
-    fn read_slot(&self, idx: usize) -> Option<OrderbookSnapshot> {
-        let slot = &self.buffer[idx];
-
-        // Read generation before reading snapshot
-        let gen_before = slot.generation.load(Ordering::Acquire);
-
-        // If generation is odd, slot is being written
-        if gen_before % 2 != 0 {
-            return None;
-        }
-
-        // Read the snapshot
-        let snapshot = slot.snapshot.clone();
-
-        // Memory barrier
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        // Read generation after reading snapshot
-        let gen_after = slot.generation.load(Ordering::Acquire);
-
-        // If generation changed, the read was inconsistent
-        if gen_after != gen_before {
-            return None;
-        }
-
-        Some(snapshot)
-    }
-
     /// Iterate over snapshots within the retention window.
     ///
     /// Returns an iterator yielding snapshots from newest to oldest.
     /// Snapshots that were being written during iteration are skipped.
-    pub fn recent_snapshots(&self) -> impl Iterator<Item = OrderbookSnapshot> + '_ {
+    pub fn recent_snapshots(&self) -> impl Iterator<Item = OrderbookSnapshot> {
         let now_ns = self.current_time_ns();
         let cutoff_ns = now_ns.saturating_sub(self.retention_ns as i64);
-
-        let pos = self.write_pos.load(Ordering::Acquire);
+        let state = self.state.read();
+        let pos = state.write_pos;
         let count = self.capacity.min(pos as usize);
-
-        RecentSnapshotsIter {
-            history: self,
-            current_pos: pos,
-            remaining: count,
-            cutoff_ns,
+        let mut snapshots = Vec::with_capacity(count);
+        for offset in 0..count {
+            let idx = ((pos - 1 - offset as u64) as usize) % self.capacity;
+            if !state.initialized[idx] {
+                continue;
+            }
+            let snapshot = &state.buffer[idx];
+            if snapshot.timestamp_ns < cutoff_ns {
+                break;
+            }
+            snapshots.push(snapshot.clone());
         }
+        snapshots.into_iter()
     }
 
     /// Get snapshots for a specific symbol within the retention window.
@@ -233,18 +131,17 @@ impl OrderbookHistory {
 
     /// Get the number of snapshots currently in the buffer.
     pub fn len(&self) -> usize {
-        let pos = self.write_pos.load(Ordering::Relaxed);
-        self.capacity.min(pos as usize)
+        self.capacity.min(self.state.read().write_pos as usize)
     }
 
     /// Check if the buffer is empty.
     pub fn is_empty(&self) -> bool {
-        self.write_pos.load(Ordering::Relaxed) == 0
+        self.state.read().write_pos == 0
     }
 
     /// Get the total number of writes since creation.
     pub fn total_writes(&self) -> u64 {
-        self.total_writes.load(Ordering::Relaxed)
+        self.state.read().total_writes
     }
 
     /// Get the buffer capacity.
@@ -258,47 +155,10 @@ impl OrderbookHistory {
     }
 }
 
-/// Iterator over recent snapshots.
-struct RecentSnapshotsIter<'a> {
-    history: &'a OrderbookHistory,
-    current_pos: u64,
-    remaining: usize,
-    cutoff_ns: i64,
-}
-
-impl<'a> Iterator for RecentSnapshotsIter<'a> {
-    type Item = OrderbookSnapshot;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.remaining > 0 && self.current_pos > 0 {
-            self.current_pos -= 1;
-            self.remaining -= 1;
-
-            let idx = (self.current_pos as usize) % self.history.capacity;
-
-            if let Some(snapshot) = self.history.read_slot(idx) {
-                // Check if within retention window
-                if snapshot.timestamp_ns >= self.cutoff_ns {
-                    return Some(snapshot);
-                } else {
-                    // Past the retention window, stop iterating
-                    return None;
-                }
-            }
-            // Slot was being written, skip and try next
-        }
-
-        None
-    }
-}
-
-// SAFETY: OrderbookHistory uses atomic operations for all shared state
-unsafe impl Send for OrderbookHistory {}
-unsafe impl Sync for OrderbookHistory {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_push_and_latest() {
@@ -355,5 +215,39 @@ mod tests {
 
         let latest_eth = history.latest_for_symbol(&Symbol::new("ETH-USD")).unwrap();
         assert_eq!(latest_eth.sequence, 2);
+    }
+
+    #[test]
+    fn concurrent_push_and_read_is_safe() {
+        let history = Arc::new(OrderbookHistory::new(256, 10));
+        let mut threads = Vec::new();
+
+        for writer in 0..2_u64 {
+            let history = Arc::clone(&history);
+            threads.push(std::thread::spawn(move || {
+                for sequence in 1..=5_000_u64 {
+                    let mut snapshot = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
+                    snapshot.sequence = writer * 5_000 + sequence;
+                    history.push(snapshot);
+                }
+            }));
+        }
+
+        for _ in 0..4 {
+            let history = Arc::clone(&history);
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..5_000 {
+                    if let Some(snapshot) = history.latest() {
+                        assert!(snapshot.sequence > 0);
+                    }
+                }
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(history.total_writes(), 10_000);
+        assert_eq!(history.len(), 256);
     }
 }
