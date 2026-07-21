@@ -263,6 +263,10 @@ pub struct OrderManager {
 
     /// Position baseline used by guarded canaries.
     position_baseline: Option<f64>,
+
+    /// A correlated fill blocks replacement orders until two later position
+    /// polls have published, closing the fill-to-poller exposure window.
+    resume_after_position_version: Option<u64>,
 }
 
 impl OrderManager {
@@ -299,6 +303,7 @@ impl OrderManager {
             safety_pause_triggered_at_ms: 0,
             last_order_sent_at_ms: 0,
             position_baseline: None,
+            resume_after_position_version: None,
         }
     }
 
@@ -1127,29 +1132,43 @@ impl OrderManager {
         &mut self,
         order_id: i64,
         cl_ord_id: Option<&str>,
-        fill_quantity: f64,
+        _fill_quantity: f64,
         fully_filled: bool,
     ) -> bool {
-        for orders in [&mut self.bid_orders, &mut self.ask_orders] {
-            for slot in orders.iter_mut() {
-                let matches = slot.as_ref().is_some_and(|order| {
+        let mut matched_slot = None;
+        for level in 0..MAX_ORDER_LEVELS {
+            for (side, slot) in [
+                (Side::Buy, &self.bid_orders[level]),
+                (Side::Sell, &self.ask_orders[level]),
+            ] {
+                if slot.as_ref().is_some_and(|order| {
                     (order_id != 0 && order.order_id == Some(order_id))
                         || cl_ord_id.is_some_and(|id| order.cl_ord_id == id)
-                });
-                if matches {
-                    if fully_filled {
-                        *slot = None;
-                    } else if let Some(order) = slot {
-                        order.quantity = (order.quantity - fill_quantity.max(0.0)).max(0.0);
-                        if order.quantity == 0.0 {
-                            *slot = None;
-                        }
-                    }
-                    return true;
+                }) {
+                    matched_slot = Some((side, level));
+                    break;
                 }
             }
+            if matched_slot.is_some() {
+                break;
+            }
         }
-        false
+
+        if let Some((side, level)) = matched_slot {
+            self.require_position_refresh_after_fill();
+            if fully_filled {
+                match side {
+                    Side::Buy => self.bid_orders[level] = None,
+                    Side::Sell => self.ask_orders[level] = None,
+                }
+            } else {
+                // The exchange fill quantity may be cumulative. Keep the slot
+                // intact until reconciliation cancels and verifies the remainder.
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Called when a cancel request fails.
@@ -1459,6 +1478,30 @@ impl OrderManager {
         if self.position_baseline.is_none() {
             self.position_baseline = Some(self.position.get());
         }
+    }
+
+    /// Block new decisions until two successful position publications occur
+    /// after a fill. This is conservative across REST eventual consistency.
+    pub fn require_position_refresh_after_fill(&mut self) {
+        let required = self.position.update_version().saturating_add(2);
+        self.resume_after_position_version = Some(
+            self.resume_after_position_version
+                .map(|current| current.max(required))
+                .unwrap_or(required),
+        );
+        self.set_pause_reason(PauseReason::RiskData);
+    }
+
+    /// Called from the one-second cold risk loop, never from quote processing.
+    pub fn position_refresh_after_fill_complete(&mut self) -> bool {
+        let Some(required) = self.resume_after_position_version else {
+            return true;
+        };
+        if self.position.update_version() < required {
+            return false;
+        }
+        self.resume_after_position_version = None;
+        true
     }
 
     /// Enter reconciliation before any exchange cleanup begins.
@@ -1866,7 +1909,12 @@ mod tests {
 
         let (order_id, client_id) = filled_client_id.unwrap();
         assert!(manager.on_order_fill(order_id, Some(&client_id), 0.00025, true));
+        assert!(manager.has_pause_reason(PauseReason::RiskData));
         position.set(0.00025);
+        assert!(!manager.position_refresh_after_fill_complete());
+        position.set(0.00025);
+        assert!(manager.position_refresh_after_fill_complete());
+        manager.clear_pause_reason(PauseReason::RiskData);
         let refill = manager.on_quote(&quote, 2_000_000_000);
         assert!(!refill.iter().any(|decision| matches!(
             decision,
@@ -1875,6 +1923,39 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn partial_fill_keeps_slot_and_requires_position_refresh() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let mut manager = OrderManager::new(
+            OrderManagerConfig::default(),
+            Arc::clone(&position),
+            equity,
+        );
+        let quote = create_test_quote(99_999.0, 100_001.0, 0.001);
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+        let (client_id, order_id) = decisions
+            .into_iter()
+            .find_map(|decision| match decision {
+                OrderDecision::Send {
+                    side: Side::Buy,
+                    cl_ord_id,
+                    ..
+                } => Some((cl_ord_id, 42)),
+                _ => None,
+            })
+            .unwrap();
+        manager.on_order_accepted(&client_id, order_id);
+
+        assert!(manager.on_order_fill(order_id, Some(&client_id), 0.0004, false));
+        assert!(manager.find_order(&client_id).is_some());
+        assert!(manager.has_pause_reason(PauseReason::RiskData));
+        position.set(0.0004);
+        assert!(!manager.position_refresh_after_fill_complete());
+        position.set(0.0004);
+        assert!(manager.position_refresh_after_fill_complete());
     }
 
     #[test]

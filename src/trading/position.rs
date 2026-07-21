@@ -24,6 +24,8 @@ pub struct SharedPosition {
     position_bits: AtomicU64,
     /// Last update timestamp (Unix millis)
     last_update_ms: AtomicU64,
+    /// Monotonic count of successful position-poller publications.
+    update_version: AtomicU64,
     /// Symbol being tracked
     symbol: String,
 }
@@ -34,6 +36,7 @@ impl SharedPosition {
         Self {
             position_bits: AtomicU64::new(0.0f64.to_bits()),
             last_update_ms: AtomicU64::new(0),
+            update_version: AtomicU64::new(0),
             symbol: symbol.into(),
         }
     }
@@ -55,6 +58,14 @@ impl SharedPosition {
                 .unwrap_or(0),
             Ordering::Release,
         );
+        self.update_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Successful publication count. An Acquire load also observes the
+    /// position written before that publication.
+    #[inline]
+    pub fn update_version(&self) -> u64 {
+        self.update_version.load(Ordering::Acquire)
     }
 
     /// Get the symbol being tracked.
@@ -279,9 +290,11 @@ mod tests {
 
         pos.set(1.5);
         assert_eq!(pos.get(), 1.5);
+        assert_eq!(pos.update_version(), 1);
 
         pos.set(-0.25);
         assert_eq!(pos.get(), -0.25);
+        assert_eq!(pos.update_version(), 2);
     }
 
     #[test]

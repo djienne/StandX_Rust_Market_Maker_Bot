@@ -588,18 +588,25 @@ impl App {
                     )
                 })
                 .unwrap_or(false);
+            let sources_fresh = equity_fresh && position_fresh;
+            let fill_position_current = manager.position_refresh_after_fill_complete();
             let was_stale = manager.has_pause_reason(PauseReason::RiskData);
-            if equity_fresh && position_fresh {
+            if sources_fresh && fill_position_current {
                 manager.initialize_position_baseline();
                 manager.clear_pause_reason(PauseReason::RiskData);
             } else {
                 manager.set_pause_reason(PauseReason::RiskData);
-                if !was_stale {
+                if !sources_fresh && !was_stale {
                     manager.begin_reconciliation();
                     became_stale = true;
                     error!(
                         "[{}] Risk data became stale (position_fresh={}, equity_fresh={})",
                         symbol, position_fresh, equity_fresh
+                    );
+                } else if sources_fresh && !fill_position_current {
+                    debug!(
+                        "[{}] Waiting for post-fill position confirmation",
+                        symbol
                     );
                 }
             }
@@ -1642,7 +1649,20 @@ async fn main() -> anyhow::Result<()> {
                             "partial" | "partially_filled" | "partially-filled"
                         );
 
+                        if !fill_quantity.is_finite() || fill_quantity <= 0.0 {
+                            for manager in app.order_managers_mut().values_mut() {
+                                manager.require_position_refresh_after_fill();
+                            }
+                            app.begin_account_reconciliation(
+                                "fill response had an invalid quantity",
+                            );
+                            continue;
+                        }
+
                         if !fully_filled && !partial {
+                            for manager in app.order_managers_mut().values_mut() {
+                                manager.require_position_refresh_after_fill();
+                            }
                             app.begin_account_reconciliation(
                                 "fill response lacked an unambiguous status",
                             );
@@ -1676,8 +1696,15 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         if !matched {
+                            for manager in app.order_managers_mut().values_mut() {
+                                manager.require_position_refresh_after_fill();
+                            }
                             app.begin_account_reconciliation(
                                 "fill could not be matched to a tracked order",
+                            );
+                        } else if partial {
+                            app.begin_account_reconciliation(
+                                "partial fill requires verified remainder cleanup",
                             );
                         }
                     }
