@@ -105,6 +105,7 @@ pub use trading::{
     QuoteOrderManager, OrderManagerConfig, OrderDecision, OrderDecisions, LiveOrder, OrderState, PauseReason, Side, OrderManagerStats,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
+    OpenOrdersSnapshot,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
 };
 pub use types::{OrderbookSnapshot, PriceLevel, Symbol, SymbolError, MAX_LEVELS};

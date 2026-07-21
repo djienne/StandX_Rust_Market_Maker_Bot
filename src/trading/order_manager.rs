@@ -879,11 +879,27 @@ impl OrderManager {
     // ========== Event Handlers (called from async context) ==========
 
     /// Called when an order is accepted by the exchange.
-    pub fn on_order_accepted(&mut self, cl_ord_id: &str, order_id: i64) {
-        // Reset circuit breaker on successful acceptance
+    /// Returns false when the client ID is not tracked or conflicts with an
+    /// exchange ID already bound to it. Callers must reconcile in that case.
+    pub fn on_order_accepted(&mut self, cl_ord_id: &str, order_id: i64) -> bool {
+        let existing_order_id = match self.find_order(cl_ord_id) {
+            Some(order) => order.order_id,
+            None => return false,
+        };
+
+        if order_id != 0
+            && existing_order_id.is_some_and(|existing| existing != 0 && existing != order_id)
+        {
+            error!(
+                "[{}] Order identity conflict for {}: local={:?}, exchange={}",
+                self.config.symbol, cl_ord_id, existing_order_id, order_id
+            );
+            return false;
+        }
+
+        // Reset circuit breaker only after correlating the acceptance.
         self.consecutive_rejections = 0;
 
-        // Warn if order_id is 0 or negative (some exchanges like StandX return 0 normally)
         if order_id < 0 {
             warn!(
                 "[{}] Order {} accepted with negative order_id={} - cancellation by order_id may fail",
@@ -896,8 +912,11 @@ impl OrderManager {
             let prev_state = order.state;
             let sent_at_ns = order.sent_at_ns;
 
-            // Always update order_id (needed for cancel matching)
-            order.order_id = Some(order_id);
+            // A correlated response-stream success has no numeric order ID and
+            // uses zero as a sentinel. Keep None until REST supplies the ID.
+            if order_id != 0 {
+                order.order_id = Some(order_id);
+            }
 
             // Only transition to Live if still Pending
             // If already Canceling, keep it Canceling (cancel is in flight)
@@ -920,13 +939,17 @@ impl OrderManager {
             } else if prev_state == OrderState::Canceling {
                 // Order was already being canceled when acceptance arrived
                 // Keep in Canceling state - cancel request is in flight
-                warn!(
-                    "[{}] {} order {} accepted while Canceling (order_id={}) - keeping Canceling state",
-                    self.config.symbol, side, cl_ord_id, order_id
-                );
-                self.stats.orders_accepted += 1;
+                if existing_order_id.is_none() {
+                    warn!(
+                        "[{}] {} order {} accepted while Canceling (order_id={}) - keeping Canceling state",
+                        self.config.symbol, side, cl_ord_id, order_id
+                    );
+                    self.stats.orders_accepted += 1;
+                }
             }
         }
+
+        true
     }
 
     /// Called when an order is rejected.
@@ -1340,6 +1363,56 @@ impl OrderManager {
         None
     }
 
+    /// Whether a client order ID currently occupies a local slot.
+    /// Used only by REST reconciliation on the cold path.
+    pub fn has_tracked_order(&self, cl_ord_id: &str) -> bool {
+        self.find_order(cl_ord_id).is_some()
+    }
+
+    /// Find a REST-identified local order that is absent from a later REST
+    /// open-orders snapshot. Absence can mean a fill, so callers must refresh
+    /// position state before quoting again.
+    pub fn first_missing_rest_order(&self, observed_order_ids: &[i64]) -> Option<(String, i64)> {
+        for level in 0..MAX_ORDER_LEVELS {
+            for order in [&self.bid_orders[level], &self.ask_orders[level]]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(order_id) = order.order_id {
+                    if !observed_order_ids.contains(&order_id) {
+                        return Some((order.cl_ord_id.clone(), order_id));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find an accepted order that REST has not identified within the allowed
+    /// propagation window. Such an order may have filled or been rejected
+    /// before the first open-orders poll observed it.
+    pub fn first_stale_unconfirmed_rest_order(
+        &self,
+        observed_cl_ord_ids: &[&str],
+        observed_at_ns: i64,
+        grace_ns: i64,
+    ) -> Option<String> {
+        for level in 0..MAX_ORDER_LEVELS {
+            for order in [&self.bid_orders[level], &self.ask_orders[level]]
+                .into_iter()
+                .flatten()
+            {
+                if order.order_id.is_none()
+                    && !observed_cl_ord_ids.contains(&order.cl_ord_id.as_str())
+                    && observed_at_ns.saturating_sub(order.sent_at_ns) > grace_ns
+                {
+                    return Some(order.cl_ord_id.clone());
+                }
+            }
+        }
+        None
+    }
+
     #[inline]
     fn find_order_mut(&mut self, cl_ord_id: &str) -> Option<&mut LiveOrder> {
         // First find which array and level contains the order
@@ -1533,20 +1606,19 @@ impl OrderManager {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    /// Get all live order client IDs for batch cancel on shutdown.
+    /// Get all tracked order client IDs for batch cancel on shutdown.
+    ///
+    /// Canceling orders remain potentially live until the exchange confirms
+    /// their absence, so they must be included here too.
     pub fn get_all_live_order_ids(&self) -> Vec<String> {
         let mut ids = Vec::with_capacity(MAX_ORDER_LEVELS * 2);
 
         for level in 0..MAX_ORDER_LEVELS {
             if let Some(order) = &self.bid_orders[level] {
-                if matches!(order.state, OrderState::Live | OrderState::Pending) {
-                    ids.push(order.cl_ord_id.clone());
-                }
+                ids.push(order.cl_ord_id.clone());
             }
             if let Some(order) = &self.ask_orders[level] {
-                if matches!(order.state, OrderState::Live | OrderState::Pending) {
-                    ids.push(order.cl_ord_id.clone());
-                }
+                ids.push(order.cl_ord_id.clone());
             }
         }
 
@@ -1697,6 +1769,65 @@ mod tests {
 
         assert!(has_buy, "Should have buy order");
         assert!(has_sell, "Should have sell order");
+    }
+
+    #[test]
+    fn request_ack_can_be_enriched_by_rest_without_double_counting() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let mut manager = OrderManager::new(OrderManagerConfig::default(), position, equity);
+        let decisions = manager.on_quote(
+            &create_test_quote(99_000.0, 101_000.0, 0.001),
+            1_000_000_000,
+        );
+        let cl_ord_id = decisions
+            .iter()
+            .find_map(|decision| match decision {
+                OrderDecision::Send {
+                    side: Side::Buy,
+                    cl_ord_id,
+                    ..
+                } => Some(cl_ord_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(manager.on_order_accepted(&cl_ord_id, 0));
+        assert_eq!(manager.find_order(&cl_ord_id).unwrap().state, OrderState::Live);
+        assert_eq!(manager.find_order(&cl_ord_id).unwrap().order_id, None);
+        assert_eq!(manager.stats().orders_accepted, 1);
+        let all_client_ids: Vec<&str> = decisions
+            .iter()
+            .filter_map(|decision| match decision {
+                OrderDecision::Send { cl_ord_id, .. } => Some(cl_ord_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(manager
+            .first_stale_unconfirmed_rest_order(
+                &all_client_ids,
+                11_000_000_000,
+                9_000_000_000,
+            )
+            .is_none());
+        assert!(manager
+            .first_stale_unconfirmed_rest_order(
+                &[],
+                11_000_000_000,
+                9_000_000_000,
+            )
+            .is_some());
+
+        assert!(manager.on_order_accepted(&cl_ord_id, 42));
+        assert_eq!(manager.find_order(&cl_ord_id).unwrap().order_id, Some(42));
+        assert_eq!(manager.stats().orders_accepted, 1);
+        assert!(manager.first_missing_rest_order(&[42]).is_none());
+        assert_eq!(
+            manager.first_missing_rest_order(&[]),
+            Some((cl_ord_id.clone(), 42))
+        );
+        assert!(!manager.on_order_accepted(&cl_ord_id, 43));
+        assert!(!manager.on_order_accepted("mm_TEST-USD_unknown", 44));
     }
 
     #[test]

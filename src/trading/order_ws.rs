@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
@@ -60,6 +61,9 @@ pub enum OrderEvent {
     Authenticated,
     /// Order accepted by exchange.
     OrderAccepted { cl_ord_id: String, order_id: i64 },
+    /// Exchange accepted an order submission request but omitted order identity.
+    /// The order remains Pending until authenticated REST observation confirms it.
+    OrderSubmissionAcknowledged,
     /// Order rejected by exchange.
     OrderRejected { cl_ord_id: String, reason: String },
     /// Order fill/update with correlation and status where supplied.
@@ -72,6 +76,9 @@ pub enum OrderEvent {
     },
     /// Order canceled.
     OrderCanceled { order_id: i64, cl_ord_id: Option<String> },
+    /// Exchange accepted a cancel request but omitted order identity.
+    /// Local state remains Canceling until an identified update or REST cleanup.
+    CancelSubmissionAcknowledged,
     /// Cancel request failed.
     CancelFailed { order_id: i64, reason: String },
     /// WebSocket disconnected (will attempt reconnect).
@@ -142,8 +149,15 @@ struct WsResponse {
     #[serde(default)]
     result: Option<serde_json::Value>,
     /// Request ID to correlate responses
-    #[serde(default)]
+    #[serde(default, alias = "requestId", alias = "x-request-id")]
     request_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingRequest {
+    New { cl_ord_id: String },
+    CancelByClientId { cl_ord_id: String },
+    CancelByOrderId { order_id: i64 },
 }
 
 type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -171,6 +185,8 @@ pub struct OrderWsClient {
     reconnect_config: ReconnectConfig,
     /// Pending cancel cl_ord_ids (to distinguish cancel confirmations from order acceptances)
     pending_cancels: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Top-level WebSocket request IDs mapped to the operation they identify.
+    pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>>,
 }
 
 impl OrderWsClient {
@@ -186,7 +202,8 @@ impl OrderWsClient {
             session_id: format!("session_{}", chrono::Utc::now().timestamp_millis()),
             message_counter: AtomicU64::new(0),
             reconnect_config: ReconnectConfig::for_orders(), // Max 10 retries
-            pending_cancels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_cancels: Arc::new(Mutex::new(std::collections::HashSet::with_capacity(8))),
+            pending_requests: Arc::new(Mutex::new(HashMap::with_capacity(8))),
         }
     }
 
@@ -206,7 +223,8 @@ impl OrderWsClient {
             session_id: format!("session_{}", chrono::Utc::now().timestamp_millis()),
             message_counter: AtomicU64::new(0),
             reconnect_config,
-            pending_cancels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_cancels: Arc::new(Mutex::new(std::collections::HashSet::with_capacity(8))),
+            pending_requests: Arc::new(Mutex::new(HashMap::with_capacity(8))),
         }
     }
 
@@ -290,6 +308,7 @@ impl OrderWsClient {
             self.connected.store(false, Ordering::Release);
             self.ws_authenticated.store(false, Ordering::Release);
             self.pending_cancels.lock().await.clear();
+            self.pending_requests.lock().await.clear();
 
             if !self.running.load(Ordering::Acquire) {
                 break;
@@ -383,7 +402,13 @@ impl OrderWsClient {
                                         "Order WS response: method={:?}, code={:?}, request_id={:?}",
                                         response.method, response.code, response.request_id
                                     );
-                                    Self::handle_response(response, tx, &self.pending_cancels).await;
+                                    Self::handle_response(
+                                        response,
+                                        tx,
+                                        &self.pending_cancels,
+                                        &self.pending_requests,
+                                    )
+                                    .await;
                                 }
                                 Err(error) => {
                                     let _ = tx
@@ -579,32 +604,49 @@ impl OrderWsClient {
         let params_json = serde_json::to_string(&request)
             .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
-        let (request_id, timestamp_ms, signature) = {
+        let (signing_request_id, timestamp_ms, signature) = {
             let auth = self.auth.lock().await;
             auth.sign_request(&params_json)?
         };
+        let response_request_id = self.next_request_id();
 
         // Build WebSocket message
         let msg = WsOrderMessage {
             session_id: Some(self.session_id.clone()),
-            request_id: Some(request_id.clone()),
+            request_id: Some(response_request_id.clone()),
             method: "order:new".to_string(),
             header: Some(WsHeader {
-                request_id,
+                request_id: signing_request_id,
                 timestamp: timestamp_ms.to_string(),
                 signature,
             }),
             params: WsParams(params_json),
         };
 
-        self.send_message_internal(&msg).await?;
+        self.pending_requests.lock().await.insert(
+            response_request_id.clone(),
+            PendingRequest::New {
+                cl_ord_id: cl_ord_id.clone(),
+            },
+        );
+        if let Err(error) = self.send_message_internal(&msg).await {
+            self.pending_requests
+                .lock()
+                .await
+                .remove(&response_request_id);
+            return Err(error);
+        }
 
         Ok(cl_ord_id)
     }
 
     /// Cancel an order by order ID.
     pub async fn cancel_order(&self, order_id: i64) -> Result<(), OrderWsError> {
-        self.send_cancel(json!({ "order_id": order_id })).await
+        self.send_cancel(
+            json!({ "order_id": order_id }),
+            PendingRequest::CancelByOrderId { order_id },
+        )
+        .await
     }
 
     /// Cancel an order by client order ID.
@@ -614,7 +656,14 @@ impl OrderWsClient {
             let mut pending = self.pending_cancels.lock().await;
             pending.insert(cl_ord_id.to_string());
         }
-        let result = self.send_cancel(json!({ "cl_ord_id": cl_ord_id })).await;
+        let result = self
+            .send_cancel(
+                json!({ "cl_ord_id": cl_ord_id }),
+                PendingRequest::CancelByClientId {
+                    cl_ord_id: cl_ord_id.to_string(),
+                },
+            )
+            .await;
         if result.is_err() {
             self.pending_cancels.lock().await.remove(cl_ord_id);
         }
@@ -626,8 +675,33 @@ impl OrderWsClient {
         Arc::clone(&self.pending_cancels)
     }
 
+    /// Drop request-correlation state after REST has proved that the account
+    /// has no open orders. Any later response is stale and will fail closed.
+    pub async fn clear_pending_tracking(&self) {
+        self.pending_cancels.lock().await.clear();
+        self.pending_requests.lock().await.clear();
+    }
+
+    /// Remove new-order requests that authenticated REST has identified.
+    /// Uses try_lock so a cold-path snapshot can never stall the main event loop.
+    pub fn try_clear_rest_confirmed_requests(&self, cl_ord_ids: &[&str]) {
+        let Ok(mut pending) = self.pending_requests.try_lock() else {
+            return;
+        };
+        pending.retain(|_, request| match request {
+            PendingRequest::New { cl_ord_id } => !cl_ord_ids.contains(&cl_ord_id.as_str()),
+            PendingRequest::CancelByClientId { .. } | PendingRequest::CancelByOrderId { .. } => {
+                true
+            }
+        });
+    }
+
     /// Internal helper to send a cancel request.
-    async fn send_cancel(&self, params: serde_json::Value) -> Result<(), OrderWsError> {
+    async fn send_cancel(
+        &self,
+        params: serde_json::Value,
+        pending_request: PendingRequest,
+    ) -> Result<(), OrderWsError> {
         if !self.is_connected() {
             return Err(OrderWsError::NotConnected);
         }
@@ -638,24 +712,37 @@ impl OrderWsClient {
         let params_json = serde_json::to_string(&params)
             .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
-        let (request_id, timestamp_ms, signature) = {
+        let (signing_request_id, timestamp_ms, signature) = {
             let auth = self.auth.lock().await;
             auth.sign_request(&params_json)?
         };
+        let response_request_id = self.next_request_id();
 
         let msg = WsOrderMessage {
             session_id: Some(self.session_id.clone()),
-            request_id: Some(request_id.clone()),
+            request_id: Some(response_request_id.clone()),
             method: "order:cancel".to_string(),
             header: Some(WsHeader {
-                request_id,
+                request_id: signing_request_id,
                 timestamp: timestamp_ms.to_string(),
                 signature,
             }),
             params: WsParams(params_json),
         };
 
-        self.send_message_internal(&msg).await
+        self.pending_requests
+            .lock()
+            .await
+            .insert(response_request_id.clone(), pending_request);
+        if let Err(error) = self.send_message_internal(&msg).await {
+            self.pending_requests
+                .lock()
+                .await
+                .remove(&response_request_id);
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     /// Disconnect the WebSocket gracefully (permanent shutdown).
@@ -754,10 +841,27 @@ impl OrderWsClient {
         response: WsResponse,
         event_tx: &mpsc::Sender<OrderEvent>,
         pending_cancels: &Arc<Mutex<std::collections::HashSet<String>>>,
+        pending_requests: &Arc<Mutex<HashMap<String, PendingRequest>>>,
     ) {
         let method = response.method.as_deref().unwrap_or("");
         let code = response.code.unwrap_or(0);
         let request_id = response.request_id.clone();
+
+        if let Some(id) = request_id.as_deref() {
+            let pending_request = pending_requests.lock().await.remove(id);
+            if let Some(pending_request) = pending_request {
+                Self::handle_correlated_response(
+                    id,
+                    pending_request,
+                    response.code,
+                    response.message.as_deref(),
+                    event_tx,
+                    pending_cancels,
+                )
+                .await;
+                return;
+            }
+        }
 
         // Use result field if data is not present (StandX API uses "result")
         let data = response.data.or(response.result);
@@ -766,8 +870,20 @@ impl OrderWsClient {
         match method {
             "order:new" => {
                 debug!("Routing: order:new response (code={})", code);
+                if response.code.is_none() {
+                    let _ = event_tx
+                        .send(OrderEvent::AmbiguousResponse {
+                            request_id,
+                            code: None,
+                            reason: "order:new response omitted its result code".to_string(),
+                        })
+                        .await;
+                    return;
+                }
                 if let Some(data) = data {
                     Self::handle_order_response(data, code, &response.message, event_tx).await;
+                } else if code == 0 {
+                    let _ = event_tx.send(OrderEvent::OrderSubmissionAcknowledged).await;
                 } else {
                     let _ = event_tx
                         .send(OrderEvent::AmbiguousResponse {
@@ -782,6 +898,16 @@ impl OrderWsClient {
             }
             "order:cancel" => {
                 debug!("Routing: order:cancel response (code={})", code);
+                if response.code.is_none() {
+                    let _ = event_tx
+                        .send(OrderEvent::AmbiguousResponse {
+                            request_id,
+                            code: None,
+                            reason: "order:cancel response omitted its result code".to_string(),
+                        })
+                        .await;
+                    return;
+                }
                 if let Some(data) = data {
                     // Remove from pending cancels
                     if let Some(cl_ord_id) = Self::extract_cl_ord_id(&data) {
@@ -789,6 +915,8 @@ impl OrderWsClient {
                         pending.remove(&cl_ord_id);
                     }
                     Self::handle_cancel_response(data, code, &response.message, event_tx).await;
+                } else if code == 0 {
+                    let _ = event_tx.send(OrderEvent::CancelSubmissionAcknowledged).await;
                 } else {
                     let _ = event_tx
                         .send(OrderEvent::AmbiguousResponse {
@@ -832,8 +960,46 @@ impl OrderWsClient {
             _ => {}
         }
 
+        // Some deployed response variants omit or fail to echo the top-level
+        // request ID. A code-zero response can still be classified when every
+        // outstanding request is the same operation type, but it cannot promote
+        // or clear any individual order without REST confirmation.
+        if data.is_none() && response.code == Some(0) {
+            let pending = pending_requests.lock().await;
+            let has_new = pending
+                .values()
+                .any(|request| matches!(request, PendingRequest::New { .. }));
+            let has_cancel = pending.values().any(|request| {
+                matches!(
+                    request,
+                    PendingRequest::CancelByClientId { .. }
+                        | PendingRequest::CancelByOrderId { .. }
+                )
+            });
+            drop(pending);
+
+            if has_new && !has_cancel {
+                let _ = event_tx.send(OrderEvent::OrderSubmissionAcknowledged).await;
+                return;
+            }
+            if has_cancel && !has_new {
+                let _ = event_tx.send(OrderEvent::CancelSubmissionAcknowledged).await;
+                return;
+            }
+        }
+
         // Handle responses WITHOUT method field (StandX API style)
         if let Some(data) = data {
+            if response.code.is_none() {
+                let _ = event_tx
+                    .send(OrderEvent::AmbiguousResponse {
+                        request_id,
+                        code: None,
+                        reason: "order response omitted its result code".to_string(),
+                    })
+                    .await;
+                return;
+            }
             let cl_ord_id = Self::extract_cl_ord_id(&data);
 
             // Check if this cl_ord_id is in our pending cancels list
@@ -883,6 +1049,81 @@ impl OrderWsClient {
             .await;
     }
 
+    /// Handle the documented StandX response shape, which carries only a
+    /// top-level request ID, result code, and message.
+    async fn handle_correlated_response(
+        request_id: &str,
+        pending_request: PendingRequest,
+        code: Option<i32>,
+        message: Option<&str>,
+        event_tx: &mpsc::Sender<OrderEvent>,
+        pending_cancels: &Arc<Mutex<std::collections::HashSet<String>>>,
+    ) {
+        let Some(code) = code else {
+            let _ = event_tx
+                .send(OrderEvent::AmbiguousResponse {
+                    request_id: Some(request_id.to_string()),
+                    code: None,
+                    reason: "correlated order response omitted its result code".to_string(),
+                })
+                .await;
+            return;
+        };
+        let reason = message.unwrap_or("exchange rejected request").to_string();
+
+        match pending_request {
+            PendingRequest::New { cl_ord_id } => {
+                if code == 0 {
+                    // StandX's response stream does not include an exchange order
+                    // ID. Client ID correlation is sufficient because cancels use
+                    // that same ID; REST will bind the numeric ID on its next poll.
+                    let _ = event_tx
+                        .send(OrderEvent::OrderAccepted {
+                            cl_ord_id,
+                            order_id: 0,
+                        })
+                        .await;
+                } else {
+                    let _ = event_tx
+                        .send(OrderEvent::OrderRejected { cl_ord_id, reason })
+                        .await;
+                }
+            }
+            PendingRequest::CancelByClientId { cl_ord_id } => {
+                pending_cancels.lock().await.remove(&cl_ord_id);
+                if code == 0 {
+                    let _ = event_tx
+                        .send(OrderEvent::OrderCanceled {
+                            order_id: 0,
+                            cl_ord_id: Some(cl_ord_id),
+                        })
+                        .await;
+                } else {
+                    let _ = event_tx
+                        .send(OrderEvent::CancelFailed {
+                            order_id: 0,
+                            reason,
+                        })
+                        .await;
+                }
+            }
+            PendingRequest::CancelByOrderId { order_id } => {
+                if code == 0 {
+                    let _ = event_tx
+                        .send(OrderEvent::OrderCanceled {
+                            order_id,
+                            cl_ord_id: None,
+                        })
+                        .await;
+                } else {
+                    let _ = event_tx
+                        .send(OrderEvent::CancelFailed { order_id, reason })
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Handle order new/accepted response.
     #[inline]
     async fn handle_order_response(
@@ -897,11 +1138,7 @@ impl OrderWsClient {
         if code == 0 {
             if cl_ord_id.is_empty() || order_id == 0 {
                 let _ = event_tx
-                    .send(OrderEvent::AmbiguousResponse {
-                        request_id: None,
-                        code: Some(code),
-                        reason: "order acceptance lacked client or exchange order ID".to_string(),
-                    })
+                    .send(OrderEvent::OrderSubmissionAcknowledged)
                     .await;
                 return;
             }
@@ -938,12 +1175,7 @@ impl OrderWsClient {
         if code == 0 {
             if order_id == 0 && cl_ord_id.is_none() {
                 let _ = event_tx
-                    .send(OrderEvent::AmbiguousResponse {
-                        request_id: None,
-                        code: Some(code),
-                        reason: "cancel confirmation lacked client and exchange order IDs"
-                            .to_string(),
-                    })
+                    .send(OrderEvent::CancelSubmissionAcknowledged)
                     .await;
                 return;
             }
@@ -1001,8 +1233,9 @@ mod tests {
         .unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
-        OrderWsClient::handle_response(response, &tx, &pending).await;
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
 
         assert!(matches!(
             rx.recv().await,
@@ -1015,6 +1248,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn documented_success_response_correlates_by_request_id() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "code": 0,
+            "message": "success",
+            "request_id": "unique-request-id"
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::from([(
+            "unique-request-id".to_string(),
+            PendingRequest::New {
+                cl_ord_id: "mm_TEST-USD_1_0_1".to_string(),
+            },
+        )])));
+
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::OrderAccepted {
+                ref cl_ord_id,
+                order_id: 0
+            }) if cl_ord_id == "mm_TEST-USD_1_0_1"
+        ));
+        assert!(pending_requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn documented_rejection_response_preserves_client_id() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "code": 400,
+            "message": "alo order rejected",
+            "requestId": "unique-request-id"
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::from([(
+            "unique-request-id".to_string(),
+            PendingRequest::New {
+                cl_ord_id: "mm_TEST-USD_1_0_1".to_string(),
+            },
+        )])));
+
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::OrderRejected {
+                ref cl_ord_id,
+                ref reason
+            }) if cl_ord_id == "mm_TEST-USD_1_0_1" && reason == "alo order rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn un_echoed_success_with_only_new_requests_waits_for_rest() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "code": 0,
+            "message": "success",
+            "request_id": "unexpected-signing-id"
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::from([(
+            "unique-request-id".to_string(),
+            PendingRequest::New {
+                cl_ord_id: "mm_TEST-USD_1_0_1".to_string(),
+            },
+        )])));
+
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::OrderSubmissionAcknowledged)
+        ));
+        assert_eq!(pending_requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn data_rich_order_response_preserves_correlation() {
         let response: WsResponse = serde_json::from_value(json!({
             "method": "order:new",
@@ -1024,12 +1340,75 @@ mod tests {
         .unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
-        OrderWsClient::handle_response(response, &tx, &pending).await;
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
 
         assert!(matches!(
             rx.recv().await,
             Some(OrderEvent::OrderAccepted { order_id: 42, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn identified_success_without_order_ids_waits_for_rest_confirmation() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "method": "order:new",
+            "code": 0,
+            "message": "success",
+            "data": {}
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::OrderSubmissionAcknowledged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn identified_success_without_cancel_ids_waits_for_rest_cleanup() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "method": "order:cancel",
+            "code": 0,
+            "message": "success",
+            "data": {}
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::CancelSubmissionAcknowledged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn identified_response_without_result_code_fails_closed() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "method": "order:new",
+            "message": "success",
+            "data": {}
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+
+        OrderWsClient::handle_response(response, &tx, &pending, &pending_requests).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::AmbiguousResponse { code: None, .. })
         ));
     }
 

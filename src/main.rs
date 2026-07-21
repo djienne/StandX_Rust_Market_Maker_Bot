@@ -19,6 +19,7 @@ use standx_orderbook::{
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OrderbookSanityChecker, SanityCheckerConfig, SanityCheckerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
+    OpenOrdersSnapshot,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
     SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
     SharedBbo, BinanceBboPollerHandle, start_binance_bbo_poller,
@@ -627,6 +628,13 @@ impl App {
     /// Pause every manager before scheduling account-wide cleanup.
     fn begin_account_reconciliation(&mut self, reason: impl Into<String>) {
         for manager in self.order_managers.values_mut() {
+            // Any cleanup can race an execution. Require two successful
+            // position polls after reconciliation begins before quotes resume.
+            // Do not advance the gate again for duplicate signals belonging to
+            // the same in-flight reconciliation.
+            if !manager.has_pause_reason(PauseReason::Reconciliation) {
+                manager.require_position_refresh_after_fill();
+            }
             manager.begin_reconciliation();
         }
         let reason = reason.into();
@@ -688,6 +696,104 @@ impl App {
         self.order_managers.get_mut(symbol)
     }
 
+    /// Promote locally pending orders only when an authenticated REST snapshot
+    /// contains the exact client ID. This runs from the one-second cold path.
+    fn apply_open_orders_snapshot(
+        &mut self,
+        snapshot: &OpenOrdersSnapshot,
+    ) -> Result<usize, String> {
+        let manager = self
+            .order_managers
+            .get_mut(&snapshot.symbol)
+            .ok_or_else(|| format!("no order manager for REST symbol {}", snapshot.symbol))?;
+        if manager.has_pause_reason(PauseReason::Reconciliation) {
+            return Ok(0);
+        }
+        let mut confirmed = 0usize;
+        let observed_order_ids: Vec<i64> = snapshot
+            .orders
+            .iter()
+            .map(|order| order.order_id)
+            .collect();
+        let observed_cl_ord_ids: Vec<&str> = snapshot
+            .orders
+            .iter()
+            .filter_map(|order| order.cl_ord_id.as_deref())
+            .collect();
+
+        if let Some((cl_ord_id, order_id)) =
+            manager.first_missing_rest_order(&observed_order_ids)
+        {
+            manager.require_position_refresh_after_fill();
+            return Err(format!(
+                "REST no longer reports tracked order {} ({}) for {}; possible fill",
+                order_id, cl_ord_id, snapshot.symbol
+            ));
+        }
+        const REST_CONFIRMATION_GRACE_NS: i64 = 9_000_000_000;
+        if let Some(cl_ord_id) = manager.first_stale_unconfirmed_rest_order(
+            &observed_cl_ord_ids,
+            snapshot.observed_at_ns,
+            REST_CONFIRMATION_GRACE_NS,
+        ) {
+            manager.require_position_refresh_after_fill();
+            return Err(format!(
+                "REST did not confirm accepted order {} for {} within 9s; possible fill or rejection",
+                cl_ord_id, snapshot.symbol
+            ));
+        }
+
+        for observed in &snapshot.orders {
+            let cl_ord_id = observed.cl_ord_id.as_deref().ok_or_else(|| {
+                format!(
+                    "REST open order {} for {} omitted its client ID",
+                    observed.order_id, snapshot.symbol
+                )
+            })?;
+            // A snapshot can have been polled just before a correlated cancel
+            // response freed the slot. Ignore that short-lived stale view.
+            if !manager.has_tracked_order(cl_ord_id) {
+                debug!(
+                    "[{}] REST snapshot still contains untracked order {} ({})",
+                    snapshot.symbol, observed.order_id, cl_ord_id
+                );
+                continue;
+            }
+            if let Some(fill_qty) = observed.fill_qty.as_deref() {
+                let parsed_fill = fill_qty.parse::<f64>().map_err(|error| {
+                    manager.require_position_refresh_after_fill();
+                    format!(
+                        "REST open order {} for {} has invalid fill quantity {:?}: {}",
+                        observed.order_id, snapshot.symbol, fill_qty, error
+                    )
+                })?;
+                if !parsed_fill.is_finite() || parsed_fill < 0.0 {
+                    manager.require_position_refresh_after_fill();
+                    return Err(format!(
+                        "REST open order {} for {} has unsafe fill quantity {:?}",
+                        observed.order_id, snapshot.symbol, fill_qty
+                    ));
+                }
+                if parsed_fill > 0.0 {
+                    manager.require_position_refresh_after_fill();
+                    return Err(format!(
+                        "REST detected partial fill {} on order {} ({}) for {}",
+                        fill_qty, observed.order_id, cl_ord_id, snapshot.symbol
+                    ));
+                }
+            }
+            if !manager.on_order_accepted(cl_ord_id, observed.order_id) {
+                return Err(format!(
+                    "REST found untracked or conflicting order {} ({}) for {}",
+                    observed.order_id, cl_ord_id, snapshot.symbol
+                ));
+            }
+            confirmed += 1;
+        }
+
+        Ok(confirmed)
+    }
+
     /// Check pending order timeouts for all symbols.
     /// Called periodically from the main event loop to ensure timeouts are
     /// enforced even when market data updates are sparse.
@@ -720,9 +826,11 @@ impl App {
         }
 
         let mut dispatch_failed = false;
+        let mut timed_out = false;
         for (symbol, manager) in &mut self.order_managers {
             let timeout_decisions = manager.check_timeouts_now(current_time_ns);
             if !timeout_decisions.is_empty() {
+                timed_out = true;
                 if let Some(tx) = &self.order_tx {
                     // Use pre-allocated Arc<str> for hot path (avoids allocation)
                     let symbol_arc = self.symbol_arcs.get(symbol)
@@ -750,6 +858,11 @@ impl App {
         }
         if dispatch_failed {
             self.begin_account_reconciliation("timeout cancel could not reach executor");
+        } else if timed_out {
+            // A timeout means the exchange outcome is unknown. The manager may
+            // clear its local slot, so pause before another quote event can use
+            // that slot and prove account-wide cleanup through REST.
+            self.begin_account_reconciliation("order or cancel response timed out");
         }
     }
 
@@ -1492,13 +1605,17 @@ async fn main() -> anyhow::Result<()> {
     // Start open orders checker if order management is enabled
     // This detects when exchange has no orders but internal state thinks we do,
     // allowing immediate new order placement instead of waiting for timeout.
-    let mut order_checker_handle: Option<OpenOrdersCheckerHandle> = None;
+    let mut order_checker_handles: Vec<OpenOrdersCheckerHandle> = Vec::new();
     let mut clear_orders_rx: Option<mpsc::Receiver<ClearOrdersSignal>> = None;
+    let mut open_orders_snapshot_rx: Option<mpsc::Receiver<OpenOrdersSnapshot>> = None;
     if config.order.enabled {
         if let Some(ref auth) = shared_auth {
             // Create channel for clear signals (small buffer, we only need latest)
-            let (tx, rx) = mpsc::channel::<ClearOrdersSignal>(10);
-            clear_orders_rx = Some(rx);
+            let (clear_tx, clear_rx) = mpsc::channel::<ClearOrdersSignal>(10);
+            clear_orders_rx = Some(clear_rx);
+            // REST identities are consumed only by the one-second cold path.
+            let (snapshot_tx, snapshot_rx) = mpsc::channel::<OpenOrdersSnapshot>(100);
+            open_orders_snapshot_rx = Some(snapshot_rx);
 
             // Start checker for each symbol
             for symbol in &config.symbols {
@@ -1512,9 +1629,10 @@ async fn main() -> anyhow::Result<()> {
                 let checker = OpenOrdersChecker::new(
                     Arc::clone(auth),
                     checker_config,
-                    tx.clone(),
+                    clear_tx.clone(),
+                    snapshot_tx.clone(),
                 );
-                order_checker_handle = Some(checker.start());
+                order_checker_handles.push(checker.start());
             }
             info!(
                 "Open orders checker started (interval: 3s, debounce: 2, max_age: {}s, levels: {})",
@@ -1585,6 +1703,9 @@ async fn main() -> anyhow::Result<()> {
                         "Account reconciliation verified after {} attempt(s): {}",
                         result.attempts, result.reason
                     );
+                    if let Some(ref client) = order_client {
+                        client.clear_pending_tracking().await;
+                    }
                     app.finish_account_reconciliation();
                 } else {
                     debug!(
@@ -1613,14 +1734,31 @@ async fn main() -> anyhow::Result<()> {
                         // O(1) lookup: extract symbol from cl_ord_id format: mm_<symbol>_<ts>_<seq>
                         match QuoteOrderManager::extract_symbol_from_cl_ord_id(&cl_ord_id) {
                             Some(symbol) => {
-                                if let Some(manager) = app.get_order_manager_mut(symbol) {
-                                    manager.on_order_accepted(&cl_ord_id, order_id);
+                                let matched = app
+                                    .get_order_manager_mut(symbol)
+                                    .is_some_and(|manager| {
+                                        manager.on_order_accepted(&cl_ord_id, order_id)
+                                    });
+                                if !matched {
+                                    app.begin_account_reconciliation(format!(
+                                        "accepted order could not be correlated: {}",
+                                        cl_ord_id
+                                    ));
                                 }
                             }
                             None => {
                                 warn!("Failed to extract symbol from cl_ord_id='{}', order_id={}", cl_ord_id, order_id);
+                                app.begin_account_reconciliation(format!(
+                                    "accepted order had invalid client ID: {}",
+                                    cl_ord_id
+                                ));
                             }
                         }
+                    }
+                    OrderEvent::OrderSubmissionAcknowledged => {
+                        debug!(
+                            "Order submission acknowledged without identity; awaiting REST confirmation"
+                        );
                     }
                     OrderEvent::OrderRejected { cl_ord_id, reason } => {
                         // O(1) lookup: extract symbol from cl_ord_id
@@ -1772,6 +1910,14 @@ async fn main() -> anyhow::Result<()> {
                                 "replacement order could not reach executor",
                             );
                         }
+                    }
+                    OrderEvent::CancelSubmissionAcknowledged => {
+                        // Without request or order identity, a successful response
+                        // proves submission only. Account-wide REST cleanup is the
+                        // safe way to establish the final cancel state.
+                        app.begin_account_reconciliation(
+                            "cancel submission acknowledged without identity",
+                        );
                     }
                     OrderEvent::CancelFailed { order_id, reason } => {
                         // Cancel failed - order is still live, revert state
@@ -1943,6 +2089,40 @@ async fn main() -> anyhow::Result<()> {
                     app.begin_account_reconciliation("position or equity data became stale");
                 }
 
+                // Bind successful, identity-less submission ACKs to exchange
+                // order IDs from authenticated REST. This is intentionally kept
+                // out of the quote hot path.
+                let mut rest_identity_fault = None;
+                if let Some(ref mut rx) = open_orders_snapshot_rx {
+                    while let Ok(snapshot) = rx.try_recv() {
+                        match app.apply_open_orders_snapshot(&snapshot) {
+                            Ok(confirmed) if confirmed > 0 => {
+                                if let Some(ref client) = order_client {
+                                    let client_ids: Vec<&str> = snapshot
+                                        .orders
+                                        .iter()
+                                        .filter_map(|order| order.cl_ord_id.as_deref())
+                                        .collect();
+                                    client.try_clear_rest_confirmed_requests(&client_ids);
+                                }
+                                debug!(
+                                    "[{}] REST confirmed {} tracked open order(s)",
+                                    snapshot.symbol, confirmed
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(reason) => {
+                                rest_identity_fault = Some(reason);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(reason) = rest_identity_fault {
+                    error!("REST order identity check failed: {}", reason);
+                    app.begin_account_reconciliation(reason);
+                }
+
                 // Check for clear order signals from OpenOrdersChecker (non-blocking)
                 // This is O(1) try_recv - zero latency impact on hot path
                 if let Some(ref mut rx) = clear_orders_rx {
@@ -2035,9 +2215,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Stop open orders checker
-    if let Some(handle) = order_checker_handle {
-        info!("Stopping open orders checker...");
-        handle.stop();
+    if !order_checker_handles.is_empty() {
+        info!("Stopping {} open orders checker(s)...", order_checker_handles.len());
+        for handle in order_checker_handles {
+            handle.stop();
+        }
     }
 
     // Stop symbol info pollers

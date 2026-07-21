@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -20,8 +20,31 @@ struct PollResult {
     total: usize,
     buys: usize,
     sells: usize,
+    /// Orders not carrying this bot's symbol-scoped client-ID prefix.
+    unowned: usize,
     /// Oldest order age in seconds (based on local tracking)
     oldest_age_secs: Option<u64>,
+    /// Exchange-confirmed identities used to promote locally pending orders.
+    orders: Vec<ObservedOpenOrder>,
+}
+
+/// Minimal order identity copied from an authenticated REST open-orders poll.
+///
+/// This intentionally excludes price and quantity. The snapshot is a cold-path
+/// confirmation mechanism, not an alternate source of quote state.
+#[derive(Debug, Clone)]
+pub struct ObservedOpenOrder {
+    pub order_id: i64,
+    pub cl_ord_id: Option<String>,
+    pub fill_qty: Option<String>,
+}
+
+/// Successful REST observation for one configured symbol.
+#[derive(Debug, Clone)]
+pub struct OpenOrdersSnapshot {
+    pub symbol: String,
+    pub orders: Vec<ObservedOpenOrder>,
+    pub observed_at_ns: i64,
 }
 
 /// Signal sent when internal order state should be cleared.
@@ -79,6 +102,8 @@ pub struct OpenOrdersChecker {
     running: Arc<AtomicBool>,
     /// Channel to send clear signals
     signal_tx: mpsc::Sender<ClearOrdersSignal>,
+    /// Channel to confirm pending order identities from REST.
+    snapshot_tx: mpsc::Sender<OpenOrdersSnapshot>,
 }
 
 impl OpenOrdersChecker {
@@ -87,12 +112,14 @@ impl OpenOrdersChecker {
         auth: Arc<Mutex<AuthManager>>,
         config: OpenOrdersCheckerConfig,
         signal_tx: mpsc::Sender<ClearOrdersSignal>,
+        snapshot_tx: mpsc::Sender<OpenOrdersSnapshot>,
     ) -> Self {
         Self {
             auth,
             config,
             running: Arc::new(AtomicBool::new(false)),
             signal_tx,
+            snapshot_tx,
         }
     }
 
@@ -137,18 +164,43 @@ impl OpenOrdersChecker {
                 Ok(result) => {
                     consecutive_errors = 0;
 
+                    let snapshot = OpenOrdersSnapshot {
+                        symbol: self.config.symbol.clone(),
+                        orders: result.orders.clone(),
+                        observed_at_ns: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as i64,
+                    };
+                    if let Err(error) = self.snapshot_tx.try_send(snapshot) {
+                        warn!(
+                            "[{}] Failed to publish REST open-orders snapshot: {}",
+                            self.config.symbol, error
+                        );
+                    }
+
                     // Log poll result for debugging
                     debug!(
-                        "[{}] Poll result: total={}, buys={}, sells={}, oldest_age={:?}s",
+                        "[{}] Poll result: total={}, buys={}, sells={}, unowned={}, oldest_age={:?}s",
                         self.config.symbol, result.total, result.buys, result.sells,
-                        result.oldest_age_secs
+                        result.unowned, result.oldest_age_secs
                     );
 
-                    // Detect stale state: >max orders (CRITICAL), 0 orders, imbalanced sides, or orders too old
+                    // Detect stale state: >max orders (CRITICAL), foreign orders,
+                    // 0 orders, imbalanced sides, or orders too old.
                     // Returns (is_stale, stale_reason, should_pause_trading)
                     let (is_stale, stale_reason, should_pause) = if result.total > max_orders {
                         // CRITICAL: More than expected max orders = duplicate/stuck state
                         (true, format!("too many orders: {} (max {})", result.total, max_orders), true)
+                    } else if result.unowned > 0 {
+                        (
+                            true,
+                            format!(
+                                "{} open order(s) do not carry this bot's client-ID prefix",
+                                result.unowned
+                            ),
+                            true,
+                        )
                     } else if result.total == 0 {
                         (true, "0 orders".to_string(), false)
                     } else if result.total >= self.config.expected_order_levels && (result.buys == 0 || result.sells == 0) {
@@ -258,6 +310,16 @@ impl OpenOrdersChecker {
             .iter()
             .filter(|o| o.side.eq_ignore_ascii_case("sell"))
             .count();
+        let expected_client_id_prefix = format!("mm_{}_", self.config.symbol);
+        let unowned = open_orders
+            .iter()
+            .filter(|order| {
+                !order
+                    .cl_ord_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(&expected_client_id_prefix))
+            })
+            .count();
 
         // Collect current order IDs
         let current_ids: Vec<i64> = open_orders.iter().map(|o| o.id).collect();
@@ -285,7 +347,16 @@ impl OpenOrdersChecker {
             total: open_orders.len(),
             buys,
             sells,
+            unowned,
             oldest_age_secs,
+            orders: open_orders
+                .into_iter()
+                .map(|order| ObservedOpenOrder {
+                    order_id: order.id,
+                    cl_ord_id: order.cl_ord_id,
+                    fill_qty: order.fill_qty,
+                })
+                .collect(),
         })
     }
 }

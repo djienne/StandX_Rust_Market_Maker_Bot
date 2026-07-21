@@ -57,7 +57,10 @@ pub use orders::{
 };
 pub use position::{SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle};
 pub use wallet_tracker::{WalletTracker, WalletTrackerConfig, WalletTrackerHandle};
-pub use order_checker::{OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal};
+pub use order_checker::{
+    ClearOrdersSignal, ObservedOpenOrder, OpenOrdersChecker, OpenOrdersCheckerConfig,
+    OpenOrdersCheckerHandle, OpenOrdersSnapshot,
+};
 pub use symbol_info::{SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal};
 pub use client::SymbolInfo;
 pub use equity::SharedEquity;
