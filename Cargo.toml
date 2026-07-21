@@ -61,6 +61,13 @@ ordered-float = "4.0"
 # Environment variables
 dotenvy = "0.15"
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hot_path"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
