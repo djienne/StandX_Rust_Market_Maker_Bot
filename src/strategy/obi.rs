@@ -475,12 +475,16 @@ impl ObiStrategy {
 
         // Get order_qty_dollar from SharedEquity (lock-free read, ~1ns)
         // Skip quote if no sizing available (equity not yet fetched)
-        let order_qty_dollar = self
+        let mut order_qty_dollar = self
             .shared_equity
             .as_ref()
             .filter(|eq| eq.is_initialized())
             .map(|eq| eq.order_qty_dollar())
             .unwrap_or(0.0);
+
+        if let Some(max_order_qty_dollar) = self.config.max_order_qty_dollar {
+            order_qty_dollar = order_qty_dollar.min(max_order_qty_dollar);
+        }
 
         if order_qty_dollar <= 0.0 {
             return None;
@@ -699,6 +703,7 @@ mod tests {
             c1_ticks: 160.0,
             looking_depth: 0.025,
             min_order_qty_dollar: 10.0,
+            max_order_qty_dollar: None,
             lot_size: 0.001,
             min_half_spread_bps: 2.0,
             order_levels: 1,
@@ -848,5 +853,36 @@ mod tests {
         let snapshot = create_snapshot(99.99, 100.01);
         let quote = strategy.update(&snapshot);
         assert!(quote.is_none(), "Should not generate quote without equity");
+    }
+
+    #[test]
+    fn trading_requires_ten_continuous_minutes_and_reset_restarts_clock() {
+        let config = default_config();
+        let shared_equity = test_shared_equity();
+        let mut strategy = ObiStrategy::with_required_history(config, shared_equity, 10);
+        let base = 1_800_000_000_000_000_000_i64;
+
+        for index in 0..=100_i64 {
+            let mut snapshot = create_snapshot(99.99, 100.01);
+            snapshot.timestamp_ns = base + index * 5_000_000_000;
+            let _ = strategy.update(&snapshot);
+        }
+        assert!(strategy.is_warmed_up());
+        assert!(!strategy.is_valid_for_trading());
+
+        let mut before_ten_minutes = create_snapshot(99.99, 100.01);
+        before_ten_minutes.timestamp_ns = base + 599_000_000_000;
+        let quote = strategy.update(&before_ten_minutes).unwrap();
+        assert!(!quote.valid_for_trading);
+
+        let mut at_ten_minutes = create_snapshot(99.99, 100.01);
+        at_ten_minutes.timestamp_ns = base + 600_000_000_000;
+        let quote = strategy.update(&at_ten_minutes).unwrap();
+        assert!(quote.valid_for_trading);
+
+        strategy.reset_state();
+        assert!(!strategy.is_warmed_up());
+        assert!(!strategy.is_valid_for_trading());
+        assert_eq!(strategy.history_duration_ns(), 0);
     }
 }

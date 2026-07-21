@@ -48,7 +48,7 @@ pub use client::{
 };
 pub use order_manager::{
     OrderManager as QuoteOrderManager, OrderManagerConfig, OrderDecision, OrderDecisions,
-    LiveOrder, OrderState, Side, OrderManagerStats,
+    LiveOrder, OrderState, PauseReason, Side, OrderManagerStats,
 };
 pub use order_ws::{OrderWsClient, OrderWsError, OrderEvent};
 pub use orders::{

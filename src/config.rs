@@ -169,6 +169,10 @@ pub struct StrategyConfig {
     #[serde(default = "default_min_order_qty_dollar")]
     pub min_order_qty_dollar: f64,
 
+    /// Optional per-order notional cap. Unset preserves dynamic sizing.
+    #[serde(default)]
+    pub max_order_qty_dollar: Option<f64>,
+
     /// FALLBACK lot size - only used if API fetch fails.
     /// The actual lot_size is automatically fetched from the exchange API.
     #[serde(default = "default_lot_size")]
@@ -239,6 +243,7 @@ impl Default for StrategyConfig {
             c1_ticks: default_c1_ticks(),
             looking_depth: default_looking_depth(),
             min_order_qty_dollar: default_min_order_qty_dollar(),
+            max_order_qty_dollar: None,
             lot_size: default_lot_size(),
             order_levels: default_order_levels(),
             spread_level_multiplier: default_spread_level_multiplier(),
@@ -350,6 +355,14 @@ pub struct OrderConfig {
     /// Set to 0 to disable auto-recovery (manual intervention required)
     #[serde(default = "default_safety_pause_recovery_secs")]
     pub safety_pause_recovery_secs: u64,
+
+    /// Optional absolute position/exposure limit in dollars.
+    #[serde(default)]
+    pub absolute_max_position_dollar: Option<f64>,
+
+    /// Measure the optional position cap relative to the first fresh position.
+    #[serde(default)]
+    pub position_limit_from_start: bool,
 }
 
 fn default_order_enabled() -> bool { false } // Disabled by default for safety
@@ -372,6 +385,8 @@ impl Default for OrderConfig {
             circuit_breaker_rejections: default_circuit_breaker_rejections(),
             circuit_breaker_recovery_secs: default_circuit_breaker_recovery_secs(),
             safety_pause_recovery_secs: default_safety_pause_recovery_secs(),
+            absolute_max_position_dollar: None,
+            position_limit_from_start: false,
         }
     }
 }
@@ -387,6 +402,10 @@ pub struct WalletConfig {
     #[serde(default = "default_wallet_interval")]
     pub poll_interval_secs: u64,
 
+    /// Equity is unsafe for trading after this many seconds without an update.
+    #[serde(default = "default_wallet_stale_threshold")]
+    pub stale_threshold_secs: u64,
+
     /// Path to the CSV file for wallet history
     #[serde(default = "default_wallet_csv_path")]
     pub csv_path: String,
@@ -394,6 +413,7 @@ pub struct WalletConfig {
 
 fn default_wallet_enabled() -> bool { false } // Disabled by default
 fn default_wallet_interval() -> u64 { 60 }
+fn default_wallet_stale_threshold() -> u64 { 120 }
 fn default_wallet_csv_path() -> String { "wallet_history.csv".to_string() }
 
 impl Default for WalletConfig {
@@ -401,6 +421,7 @@ impl Default for WalletConfig {
         Self {
             enabled: default_wallet_enabled(),
             poll_interval_secs: default_wallet_interval(),
+            stale_threshold_secs: default_wallet_stale_threshold(),
             csv_path: default_wallet_csv_path(),
         }
     }
@@ -709,6 +730,49 @@ impl Config {
             ));
         }
 
+
+        if let Some(max_order) = self.strategy.max_order_qty_dollar {
+            if !max_order.is_finite() || max_order < self.strategy.min_order_qty_dollar {
+                return Err(ConfigError::ValidationError(
+                    "strategy.max_order_qty_dollar must be finite and at least min_order_qty_dollar"
+                        .to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_position) = self.order.absolute_max_position_dollar {
+            if !max_position.is_finite() || max_position <= 0.0 {
+                return Err(ConfigError::ValidationError(
+                    "order.absolute_max_position_dollar must be finite and positive".to_string(),
+                ));
+            }
+        }
+
+        if self.order.enabled {
+            if !self.position.enabled {
+                return Err(ConfigError::ValidationError(
+                    "position.enabled must be true when order.enabled is true".to_string(),
+                ));
+            }
+            if !self.pnl_tracking.enabled {
+                return Err(ConfigError::ValidationError(
+                    "pnl_tracking.enabled must be true when order.enabled is true".to_string(),
+                ));
+            }
+            if self.position.stale_threshold_secs <= self.position.poll_interval_secs {
+                return Err(ConfigError::ValidationError(
+                    "position.stale_threshold_secs must exceed position.poll_interval_secs"
+                        .to_string(),
+                ));
+            }
+            if self.pnl_tracking.stale_threshold_secs <= self.pnl_tracking.poll_interval_secs {
+                return Err(ConfigError::ValidationError(
+                    "pnl_tracking.stale_threshold_secs must exceed pnl_tracking.poll_interval_secs"
+                        .to_string(),
+                ));
+            }
+        }
+
         if !self.strategy.lot_size.is_finite() || self.strategy.lot_size <= 0.0 {
             return Err(ConfigError::ValidationError(
                 "strategy.lot_size must be positive".to_string()
@@ -825,5 +889,22 @@ mod tests {
             config.symbols = symbols;
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn live_orders_require_fresh_position_and_equity_sources() {
+        let mut config = Config::default();
+        config.order.enabled = true;
+        config.pnl_tracking.enabled = true;
+        assert!(config.validate().is_ok());
+
+        config.position.enabled = false;
+        assert!(config.validate().is_err());
+        config.position.enabled = true;
+        config.pnl_tracking.enabled = false;
+        assert!(config.validate().is_err());
+        config.pnl_tracking.enabled = true;
+        config.pnl_tracking.stale_threshold_secs = config.pnl_tracking.poll_interval_secs;
+        assert!(config.validate().is_err());
     }
 }

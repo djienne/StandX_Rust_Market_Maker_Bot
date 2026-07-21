@@ -31,9 +31,17 @@ pub const MAX_ORDER_LEVELS: usize = 2;
 /// Pause reason bitfield values.
 /// Multiple pause reasons can be active simultaneously; trading resumes
 /// only when ALL reasons have been cleared.
-const PAUSE_WS_DISCONNECT: u8 = 1;
-const PAUSE_CIRCUIT_BREAKER: u8 = 2;
-const PAUSE_SAFETY: u8 = 4;
+/// Independent reasons that can block order generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PauseReason {
+    OrderWebSocket = 1,
+    CircuitBreaker = 2,
+    Safety = 4,
+    MarketData = 8,
+    RiskData = 16,
+    Reconciliation = 32,
+}
 
 /// Order side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +164,12 @@ pub struct OrderManagerConfig {
     pub circuit_breaker_rejections: u32,
     /// Number of order levels per side (1 or 2).
     pub num_levels: usize,
+    /// Optional hard position/exposure cap in dollars.
+    pub absolute_max_position_dollar: Option<f64>,
+    /// Measure the hard cap relative to the first fresh position.
+    pub position_limit_from_start: bool,
+    /// Optional hard notional cap per individual order.
+    pub max_order_qty_dollar: Option<f64>,
 }
 
 impl Default for OrderManagerConfig {
@@ -170,6 +184,9 @@ impl Default for OrderManagerConfig {
             debug: false,
             circuit_breaker_rejections: 5,     // Pause after 5 consecutive rejections
             num_levels: 1,                     // Default to single level
+            absolute_max_position_dollar: None,
+            position_limit_from_start: false,
+            max_order_qty_dollar: None,
         }
     }
 }
@@ -212,7 +229,7 @@ pub struct OrderManager {
     /// Shutdown flag.
     shutdown: AtomicBool,
 
-    /// Pause reasons bitfield (PAUSE_WS_DISCONNECT | PAUSE_CIRCUIT_BREAKER | PAUSE_SAFETY).
+    /// Pause reasons bitfield.
     /// Trading is paused when any bit is set. Each subsystem only clears its own bit,
     /// preventing one recovery from incorrectly resuming trading blocked by another reason.
     pause_reasons: AtomicU8,
@@ -240,6 +257,9 @@ pub struct OrderManager {
 
     /// Timestamp when last order was sent (Unix millis, 0 if never).
     last_order_sent_at_ms: u64,
+
+    /// Position baseline used by guarded canaries.
+    position_baseline: Option<f64>,
 }
 
 impl OrderManager {
@@ -271,6 +291,7 @@ impl OrderManager {
             circuit_breaker_triggered_at_ms: 0,
             safety_pause_triggered_at_ms: 0,
             last_order_sent_at_ms: 0,
+            position_baseline: None,
         }
     }
 
@@ -374,17 +395,38 @@ impl OrderManager {
             return OrderDecisions::new();
         }
 
-        // Calculate position in dollars (from poller - source of truth)
-        let position_dollar = self.position.get() * quote.mid_price;
+        // Calculate position in dollars (from poller - source of truth). Guarded
+        // canaries can measure exposure relative to the first fresh position.
+        let current_position = self.position.get();
+        let position_for_limit = if self.config.position_limit_from_start {
+            let Some(baseline) = self.position_baseline else {
+                return OrderDecisions::new();
+            };
+            current_position - baseline
+        } else {
+            current_position
+        };
+        let position_dollar = position_for_limit * quote.mid_price;
 
         // Get max_position from SharedEquity (lock-free read, ~1ns)
         // If equity not initialized (max_position = 0), don't enforce limits
-        let max_position = self.shared_equity.max_position_dollar();
+        let dynamic_max_position = self.shared_equity.max_position_dollar();
+        if !dynamic_max_position.is_finite() || dynamic_max_position <= 0.0 {
+            return OrderDecisions::new();
+        }
+        let max_position = self
+            .config
+            .absolute_max_position_dollar
+            .map(|cap| cap.min(dynamic_max_position))
+            .unwrap_or(dynamic_max_position);
+
+        let worst_long = position_dollar + self.outstanding_notional(Side::Buy);
+        let worst_short = position_dollar - self.outstanding_notional(Side::Sell);
 
         // Use > and < (not >= and <=) so that at exactly the limit we can still
         // place orders on the opposite side to rebalance position
-        let at_max_long = max_position > 0.0 && position_dollar > max_position;
-        let at_max_short = max_position > 0.0 && position_dollar < -max_position;
+        let at_max_long = worst_long > max_position;
+        let at_max_short = worst_short < -max_position;
 
         // Use the minimum of configured levels and quote levels
         let num_levels = self.config.num_levels.min(quote.num_levels);
@@ -393,16 +435,25 @@ impl OrderManager {
 
         // Process each level
         for level in 0..num_levels {
+            let bid_quantity = self.capped_quantity(quote.bid_prices[level], quote.quantity);
+            let ask_quantity = self.capped_quantity(quote.ask_prices[level], quote.quantity);
             // Process BID side (buy) - skip if at max long position
             if !at_max_long {
-                if let Some(decision) = self.process_side_level(
+                let would_exceed = self.bid_orders[level].is_none()
+                    && self.outstanding_notional(Side::Buy)
+                        + position_dollar
+                        + quote.bid_prices[level] * bid_quantity
+                        > max_position;
+                if !would_exceed && bid_quantity > 0.0 {
+                    if let Some(decision) = self.process_side_level(
                     Side::Buy,
                     level,
                     quote.bid_prices[level],
-                    quote.quantity,
+                    bid_quantity,
                     current_time_ns,
-                ) {
-                    decisions.push(decision);
+                    ) {
+                        decisions.push(decision);
+                    }
                 }
             } else {
                 // At max long - cancel any existing bid at this level
@@ -421,14 +472,21 @@ impl OrderManager {
 
             // Process ASK side (sell) - skip if at max short position
             if !at_max_short {
-                if let Some(decision) = self.process_side_level(
+                let would_exceed = self.ask_orders[level].is_none()
+                    && position_dollar
+                        - self.outstanding_notional(Side::Sell)
+                        - quote.ask_prices[level] * ask_quantity
+                        < -max_position;
+                if !would_exceed && ask_quantity > 0.0 {
+                    if let Some(decision) = self.process_side_level(
                     Side::Sell,
                     level,
                     quote.ask_prices[level],
-                    quote.quantity,
+                    ask_quantity,
                     current_time_ns,
-                ) {
-                    decisions.push(decision);
+                    ) {
+                        decisions.push(decision);
+                    }
                 }
             } else {
                 // At max short - cancel any existing ask at this level
@@ -447,6 +505,31 @@ impl OrderManager {
         }
 
         decisions
+    }
+
+    #[inline]
+    fn outstanding_notional(&self, side: Side) -> f64 {
+        let orders = match side {
+            Side::Buy => &self.bid_orders,
+            Side::Sell => &self.ask_orders,
+        };
+        orders
+            .iter()
+            .flatten()
+            .map(|order| order.price * order.quantity)
+            .sum()
+    }
+
+    #[inline]
+    fn capped_quantity(&self, price: f64, quantity: f64) -> f64 {
+        let Some(max_notional) = self.config.max_order_qty_dollar else {
+            return quantity;
+        };
+        if price * quantity <= max_notional {
+            return quantity;
+        }
+        let lots = (max_notional / price / self.config.lot_size).floor();
+        lots * self.config.lot_size
     }
 
     /// Process one side at a specific level and return decision.
@@ -776,7 +859,7 @@ impl OrderManager {
                 "[{}] CIRCUIT BREAKER: {} consecutive rejections - PAUSING trading",
                 self.config.symbol, self.consecutive_rejections
             );
-            self.pause_reasons.fetch_or(PAUSE_CIRCUIT_BREAKER, Ordering::Release);
+            self.set_pause_reason(PauseReason::CircuitBreaker);
             // Record when circuit breaker was triggered
             self.circuit_breaker_triggered_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -789,7 +872,7 @@ impl OrderManager {
     pub fn reset_circuit_breaker(&mut self) {
         self.consecutive_rejections = 0;
         self.circuit_breaker_triggered_at_ms = 0;
-        self.pause_reasons.fetch_and(!PAUSE_CIRCUIT_BREAKER, Ordering::Release);
+        self.clear_pause_reason(PauseReason::CircuitBreaker);
         let remaining = self.pause_reasons.load(Ordering::Acquire);
         if remaining == 0 {
             info!("[{}] Circuit breaker reset, trading resumed", self.config.symbol);
@@ -807,7 +890,7 @@ impl OrderManager {
         }
 
         // Only recover if circuit breaker bit is actually set
-        if self.pause_reasons.load(Ordering::Acquire) & PAUSE_CIRCUIT_BREAKER == 0 {
+        if !self.has_pause_reason(PauseReason::CircuitBreaker) {
             return false;
         }
 
@@ -818,14 +901,7 @@ impl OrderManager {
 
         let elapsed_secs = (now_ms - self.circuit_breaker_triggered_at_ms) / 1000;
 
-        if elapsed_secs >= recovery_secs {
-            warn!(
-                "[{}] CIRCUIT BREAKER AUTO-RECOVERY: {} seconds elapsed",
-                self.config.symbol, elapsed_secs
-            );
-            self.reset_circuit_breaker();
-            return true;
-        }
+        let _ = elapsed_secs;
 
         false
     }
@@ -840,7 +916,7 @@ impl OrderManager {
             "[{}] SAFETY PAUSE: {} - pausing trading",
             self.config.symbol, reason
         );
-        self.pause_reasons.fetch_or(PAUSE_SAFETY, Ordering::Release);
+        self.set_pause_reason(PauseReason::Safety);
         self.safety_pause_triggered_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -860,7 +936,7 @@ impl OrderManager {
         }
 
         // Only recover if safety pause bit is actually set
-        if self.pause_reasons.load(Ordering::Acquire) & PAUSE_SAFETY == 0 {
+        if !self.has_pause_reason(PauseReason::Safety) {
             return false;
         }
 
@@ -871,23 +947,7 @@ impl OrderManager {
 
         let elapsed_secs = (now_ms - self.safety_pause_triggered_at_ms) / 1000;
 
-        if elapsed_secs >= recovery_secs {
-            self.safety_pause_triggered_at_ms = 0;
-            self.pause_reasons.fetch_and(!PAUSE_SAFETY, Ordering::Release);
-            let remaining = self.pause_reasons.load(Ordering::Acquire);
-            if remaining == 0 {
-                warn!(
-                    "[{}] SAFETY PAUSE RECOVERY: {} seconds elapsed, resuming trading",
-                    self.config.symbol, elapsed_secs
-                );
-            } else {
-                warn!(
-                    "[{}] SAFETY PAUSE RECOVERY: {} seconds elapsed, but still paused (reasons: {:#04b})",
-                    self.config.symbol, elapsed_secs, remaining
-                );
-            }
-            return true;
-        }
+        let _ = elapsed_secs;
 
         false
     }
@@ -970,6 +1030,37 @@ impl OrderManager {
         }
     }
 
+    /// Apply a correlated fill. Full fills free the slot; partial fills reduce
+    /// the tracked remaining quantity.
+    pub fn on_order_fill(
+        &mut self,
+        order_id: i64,
+        cl_ord_id: Option<&str>,
+        fill_quantity: f64,
+        fully_filled: bool,
+    ) -> bool {
+        for orders in [&mut self.bid_orders, &mut self.ask_orders] {
+            for slot in orders.iter_mut() {
+                let matches = slot.as_ref().is_some_and(|order| {
+                    (order_id != 0 && order.order_id == Some(order_id))
+                        || cl_ord_id.is_some_and(|id| order.cl_ord_id == id)
+                });
+                if matches {
+                    if fully_filled {
+                        *slot = None;
+                    } else if let Some(order) = slot {
+                        order.quantity = (order.quantity - fill_quantity.max(0.0)).max(0.0);
+                        if order.quantity == 0.0 {
+                            *slot = None;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Called when a cancel request fails.
     ///
     /// The order is still live on the exchange, so we revert from Canceling
@@ -990,15 +1081,16 @@ impl OrderManager {
                 if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
                     order.cancel_fail_count += 1;
 
-                    // If too many failures, forcefully clear the slot to break the loop
+                    // Repeated failures are ambiguous. Keep the slot and fail closed;
+                    // reconciliation will clear it only after REST verification.
                     if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
                         error!(
-                            "[{}] Bid L{} order {} exceeded {} cancel failures - FORCE CLEARING SLOT (order_id={}, cl_ord_id={})",
+                            "[{}] Bid L{} order {} exceeded {} cancel failures - pausing for reconciliation (order_id={}, cl_ord_id={})",
                             self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
                             order_id, order.cl_ord_id
                         );
-                        self.bid_orders[level] = None;
-                        self.pending_bid_prices[level] = None; // Clear pending price too
+                        self.set_pause_reason(PauseReason::Safety);
+                        self.set_pause_reason(PauseReason::Reconciliation);
                     } else {
                         // Revert to Live for retry
                         order.state = OrderState::Live;
@@ -1024,8 +1116,8 @@ impl OrderManager {
                             self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
                             order_id, order.cl_ord_id
                         );
-                        self.ask_orders[level] = None;
-                        self.pending_ask_prices[level] = None; // Clear pending price too
+                        self.set_pause_reason(PauseReason::Safety);
+                        self.set_pause_reason(PauseReason::Reconciliation);
                     } else {
                         // Revert to Live for retry
                         order.state = OrderState::Live;
@@ -1197,11 +1289,40 @@ impl OrderManager {
         }
     }
 
+    /// Roll back state when a decision definitely never reached the executor.
+    pub fn on_dispatch_failed(&mut self, decision: &OrderDecision) {
+        match decision {
+            OrderDecision::Send { cl_ord_id, .. } => {
+                self.clear_order_by_cl_ord_id(cl_ord_id);
+            }
+            OrderDecision::Cancel { cl_ord_id }
+            | OrderDecision::CancelAndReplace {
+                cancel_id: cl_ord_id,
+                ..
+            } => {
+                for order in self
+                    .bid_orders
+                    .iter_mut()
+                    .chain(self.ask_orders.iter_mut())
+                    .flatten()
+                {
+                    if order.cl_ord_id == *cl_ord_id {
+                        order.state = OrderState::Live;
+                    }
+                }
+                if matches!(decision, OrderDecision::CancelAndReplace { .. }) {
+                    self.clear_all_pending_prices();
+                }
+            }
+            OrderDecision::NoAction => {}
+        }
+    }
+
     // ========== Pause/Resume (for WebSocket disconnection) ==========
 
     /// Pause trading due to WebSocket disconnection.
     pub fn pause(&self) {
-        self.pause_reasons.fetch_or(PAUSE_WS_DISCONNECT, Ordering::Release);
+        self.set_pause_reason(PauseReason::OrderWebSocket);
         info!("[{}] Order manager paused (WebSocket disconnected)", self.config.symbol);
     }
 
@@ -1209,7 +1330,7 @@ impl OrderManager {
     /// Only clears the WS disconnect pause reason; trading stays paused if
     /// circuit breaker or safety pause is also active.
     pub fn resume(&self) {
-        self.pause_reasons.fetch_and(!PAUSE_WS_DISCONNECT, Ordering::Release);
+        self.clear_pause_reason(PauseReason::OrderWebSocket);
         let remaining = self.pause_reasons.load(Ordering::Acquire);
         if remaining == 0 {
             info!("[{}] Order manager resumed (WebSocket reconnected)", self.config.symbol);
@@ -1221,6 +1342,53 @@ impl OrderManager {
     /// Check if trading is paused (any reason).
     pub fn is_paused(&self) -> bool {
         self.pause_reasons.load(Ordering::Acquire) != 0
+    }
+
+    /// Set one independent pause reason.
+    #[inline]
+    pub fn set_pause_reason(&self, reason: PauseReason) {
+        self.pause_reasons.fetch_or(reason as u8, Ordering::Release);
+    }
+
+    /// Clear one independent pause reason.
+    #[inline]
+    pub fn clear_pause_reason(&self, reason: PauseReason) {
+        self.pause_reasons.fetch_and(!(reason as u8), Ordering::Release);
+    }
+
+    /// Test one pause reason.
+    #[inline]
+    pub fn has_pause_reason(&self, reason: PauseReason) -> bool {
+        self.pause_reasons.load(Ordering::Acquire) & reason as u8 != 0
+    }
+
+    /// Return the active pause bitfield for diagnostics and tests.
+    #[inline]
+    pub fn pause_reason_bits(&self) -> u8 {
+        self.pause_reasons.load(Ordering::Acquire)
+    }
+
+    /// Capture the first fresh position as the incremental exposure baseline.
+    pub fn initialize_position_baseline(&mut self) {
+        if self.position_baseline.is_none() {
+            self.position_baseline = Some(self.position.get());
+        }
+    }
+
+    /// Enter reconciliation before any exchange cleanup begins.
+    pub fn begin_reconciliation(&self) {
+        self.set_pause_reason(PauseReason::Reconciliation);
+    }
+
+    /// Apply a verified account-wide reconciliation result.
+    pub fn finish_reconciliation(&mut self) {
+        self.clear_all_orders();
+        self.safety_pause_triggered_at_ms = 0;
+        self.circuit_breaker_triggered_at_ms = 0;
+        self.consecutive_rejections = 0;
+        self.clear_pause_reason(PauseReason::Safety);
+        self.clear_pause_reason(PauseReason::CircuitBreaker);
+        self.clear_pause_reason(PauseReason::Reconciliation);
     }
 
     // ========== Shutdown ==========
@@ -1556,6 +1724,67 @@ mod tests {
         // Should not place any orders after shutdown
         let decisions2 = manager.on_quote(&quote, 2_000_000_000);
         assert!(decisions2.is_empty(), "Should not place orders after shutdown");
+    }
+
+    #[test]
+    fn pause_reasons_clear_independently() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let manager = OrderManager::new(OrderManagerConfig::default(), position, equity);
+
+        manager.set_pause_reason(PauseReason::OrderWebSocket);
+        manager.set_pause_reason(PauseReason::MarketData);
+        manager.clear_pause_reason(PauseReason::OrderWebSocket);
+
+        assert!(manager.is_paused());
+        assert!(manager.has_pause_reason(PauseReason::MarketData));
+        assert!(!manager.has_pause_reason(PauseReason::OrderWebSocket));
+    }
+
+    #[test]
+    fn incremental_cap_accounts_for_position_and_live_same_side_orders() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let config = OrderManagerConfig {
+            num_levels: 2,
+            lot_size: 0.00001,
+            absolute_max_position_dollar: Some(50.0),
+            position_limit_from_start: true,
+            max_order_qty_dollar: Some(25.0),
+            ..OrderManagerConfig::default()
+        };
+        let mut manager = OrderManager::new(config, Arc::clone(&position), equity);
+        manager.initialize_position_baseline();
+        let quote = create_test_quote_2_levels(99_999.0, 100_001.0, 0.00025);
+
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+        assert_eq!(decisions.len(), 4);
+        let mut filled_client_id = None;
+        for (index, decision) in decisions.into_iter().enumerate() {
+            if let OrderDecision::Send {
+                side,
+                cl_ord_id,
+                ..
+            } = decision
+            {
+                manager.on_order_accepted(&cl_ord_id, 100 + index as i64);
+                if side == Side::Buy && filled_client_id.is_none() {
+                    filled_client_id = Some((100 + index as i64, cl_ord_id));
+                }
+            }
+        }
+
+        let (order_id, client_id) = filled_client_id.unwrap();
+        assert!(manager.on_order_fill(order_id, Some(&client_id), 0.00025, true));
+        position.set(0.00025);
+        let refill = manager.on_quote(&quote, 2_000_000_000);
+        assert!(!refill.iter().any(|decision| matches!(
+            decision,
+            OrderDecision::Send {
+                side: Side::Buy,
+                ..
+            }
+        )));
     }
 
     #[test]

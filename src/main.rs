@@ -15,7 +15,7 @@ use standx_orderbook::{
     Config, OrderbookSnapshot, OrderbookStore, WsClientBuilder, WsEvent, StandXMessage,
     ObiStrategy, QuoteFormatter, init_logging, QuoteStrategy,
     AuthManager, SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle,
-    QuoteOrderManager, OrderManagerConfig, OrderDecision, Side,
+    QuoteOrderManager, OrderManagerConfig, OrderDecision, PauseReason, Side,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OrderbookSanityChecker, SanityCheckerConfig, SanityCheckerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
@@ -26,6 +26,78 @@ use standx_orderbook::{
 use standx_orderbook::trading::SharedEquity;
 use standx_orderbook::trading::TradingStats;
 use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest, StandXClient};
+
+#[derive(Debug)]
+struct ReconciliationResult {
+    generation: u64,
+    reason: String,
+    attempts: u32,
+}
+
+#[derive(Debug)]
+struct ReconciliationRequest {
+    generation: u64,
+    reason: String,
+}
+
+async fn run_reconciliation_worker(
+    auth: Arc<Mutex<AuthManager>>,
+    mut requests: mpsc::UnboundedReceiver<ReconciliationRequest>,
+    results: mpsc::Sender<ReconciliationResult>,
+) {
+    while let Some(request) = requests.recv().await {
+        let mut generation = request.generation;
+        let mut reason = request.reason;
+        while let Ok(next_request) = requests.try_recv() {
+            reason.push_str("; ");
+            reason.push_str(&next_request.reason);
+            generation = generation.max(next_request.generation);
+        }
+
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let outcome = {
+                let mut auth = auth.lock().await;
+                match auth.cancel_all_orders(None).await {
+                    Ok(_) => auth
+                        .query_open_orders(None)
+                        .await
+                        .map(|orders| orders.is_empty()),
+                    Err(error) => Err(error),
+                }
+            };
+
+            match outcome {
+                Ok(true) => {
+                    let _ = results
+                        .send(ReconciliationResult {
+                            generation,
+                            reason: reason.clone(),
+                            attempts: attempt,
+                        })
+                        .await;
+                    break;
+                }
+                Ok(false) => {
+                    error!(
+                        "Reconciliation attempt {} left open orders; trading remains paused",
+                        attempt
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        "Reconciliation attempt {} failed: {}; trading remains paused",
+                        attempt, error
+                    );
+                }
+            }
+
+            let delay_secs = (1_u64 << attempt.min(5)).min(30);
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+    }
+}
 
 /// Statistics tracker for monitoring throughput and rates.
 /// Extracted from App to reduce struct bloat and separate concerns.
@@ -226,8 +298,6 @@ struct App {
     symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
     /// Shared equity for automatic order sizing (lock-free reads)
     shared_equity: Arc<SharedEquity>,
-    /// Shared Binance alpha for lock-free reads (optional)
-    shared_binance_alpha: Option<Arc<SharedAlpha>>,
     /// Shared Binance BBO for lock-free reads (optional)
     #[allow(dead_code)]
     shared_binance_bbo: Option<Arc<SharedBbo>>,
@@ -239,6 +309,9 @@ struct App {
     history_tx: mpsc::Sender<OrderbookSnapshot>,
     /// History samples dropped because the cold-path recorder was saturated.
     history_channel_drops: u64,
+    /// Cold-path account-wide reconciliation trigger.
+    reconciliation_tx: Option<mpsc::UnboundedSender<ReconciliationRequest>>,
+    reconciliation_generation: u64,
     /// Pre-allocated Arc<str> per symbol for hot path (avoids allocation on each decision)
     symbol_arcs: HashMap<String, Arc<str>>,
     /// Quote formatter
@@ -350,8 +423,16 @@ impl App {
                 debug: config.debug,
                 circuit_breaker_rejections: config.order.circuit_breaker_rejections,
                 num_levels: config.strategy.order_levels,
+                absolute_max_position_dollar: config.order.absolute_max_position_dollar,
+                position_limit_from_start: config.order.position_limit_from_start,
+                max_order_qty_dollar: config.strategy.max_order_qty_dollar,
             };
             let order_manager = QuoteOrderManager::new(om_config, position, Arc::clone(&shared_equity));
+            if config.order.enabled {
+                order_manager.set_pause_reason(PauseReason::OrderWebSocket);
+                order_manager.set_pause_reason(PauseReason::MarketData);
+                order_manager.set_pause_reason(PauseReason::RiskData);
+            }
             order_managers.insert(symbol.clone(), order_manager);
 
             // Pre-allocate Arc<str> for hot path (avoids allocation per decision)
@@ -375,12 +456,13 @@ impl App {
             positions,
             symbol_infos,
             shared_equity,
-            shared_binance_alpha,
             shared_binance_bbo,
             order_managers,
             order_tx: None,
             history_tx,
             history_channel_drops: 0,
+            reconciliation_tx: None,
+            reconciliation_generation: 0,
             symbol_arcs,
             quote_formatter: QuoteFormatter::new(price_precision, 4),
             stats: StatsTracker::new(),
@@ -403,9 +485,87 @@ impl App {
         }
     }
 
+    /// Refresh cold-path risk freshness and publish only pause bits to quoting.
+    /// Returns true when previously-fresh data becomes stale and reconciliation
+    /// must be scheduled.
+    fn update_risk_pauses(&mut self) -> bool {
+        if !self.config.order.enabled {
+            return false;
+        }
+
+        let equity_fresh = self.shared_equity.is_initialized()
+            && self.shared_equity.age_ms()
+                <= self.config.pnl_tracking.stale_threshold_secs.saturating_mul(1000);
+        let mut became_stale = false;
+
+        for (symbol, manager) in &mut self.order_managers {
+            let position_fresh = self
+                .positions
+                .get(symbol)
+                .map(|position| {
+                    !position.is_stale(
+                        self.config.position.stale_threshold_secs.saturating_mul(1000),
+                    )
+                })
+                .unwrap_or(false);
+            let was_stale = manager.has_pause_reason(PauseReason::RiskData);
+            if equity_fresh && position_fresh {
+                manager.initialize_position_baseline();
+                manager.clear_pause_reason(PauseReason::RiskData);
+            } else {
+                manager.set_pause_reason(PauseReason::RiskData);
+                if !was_stale {
+                    manager.begin_reconciliation();
+                    became_stale = true;
+                    error!(
+                        "[{}] Risk data became stale (position_fresh={}, equity_fresh={})",
+                        symbol, position_fresh, equity_fresh
+                    );
+                }
+            }
+        }
+
+        became_stale
+    }
+
     /// Set the order decision channel.
     fn set_order_tx(&mut self, tx: mpsc::Sender<(Arc<str>, OrderDecision)>) {
         self.order_tx = Some(tx);
+    }
+
+    fn set_reconciliation_tx(&mut self, tx: mpsc::UnboundedSender<ReconciliationRequest>) {
+        self.reconciliation_tx = Some(tx);
+    }
+
+    /// Pause every manager before scheduling account-wide cleanup.
+    fn begin_account_reconciliation(&mut self, reason: impl Into<String>) {
+        for manager in self.order_managers.values_mut() {
+            manager.begin_reconciliation();
+        }
+        let reason = reason.into();
+        self.reconciliation_generation = self.reconciliation_generation.wrapping_add(1);
+        let request = ReconciliationRequest {
+            generation: self.reconciliation_generation,
+            reason,
+        };
+        match &self.reconciliation_tx {
+            Some(tx) => {
+                if let Err(error) = tx.send(request) {
+                    error!("Failed to schedule reconciliation: {}", error);
+                }
+            }
+            None => error!("Reconciliation requested without an active worker"),
+        }
+    }
+
+    fn finish_account_reconciliation(&mut self) {
+        for manager in self.order_managers.values_mut() {
+            manager.finish_reconciliation();
+        }
+    }
+
+    fn reconciliation_generation(&self) -> u64 {
+        self.reconciliation_generation
     }
 
     /// Get positions map for position poller setup.
@@ -525,22 +685,35 @@ impl App {
     }
 
     /// Process a WebSocket event.
-    fn process_event(&mut self, event: WsEvent) {
+    fn process_event(&mut self, event: WsEvent) -> bool {
         match event {
             WsEvent::Connected => {
                 info!("Connected to StandX WebSocket");
+                false
             }
             WsEvent::Disconnected(reason) => {
                 warn!("Disconnected: {}", reason);
+                self.last_received_at_ns = 0;
+                for strategy in self.strategies.values_mut() {
+                    strategy.reset();
+                }
+                for manager in self.order_managers.values_mut() {
+                    manager.set_pause_reason(PauseReason::MarketData);
+                    manager.begin_reconciliation();
+                }
+                true
             }
             WsEvent::Message(msg, received_at) => {
                 self.process_message(msg, received_at);
+                false
             }
             WsEvent::ParseError(err) => {
                 debug!("Parse error: {}", err);
+                false
             }
             WsEvent::Error(err) => {
                 error!("WebSocket error: {}", err);
+                false
             }
         }
     }
@@ -607,6 +780,7 @@ impl App {
                         // Process quote if we got one
                         if let Some(quote) = quote_result {
                             self.stats.quote_count += 1;
+                            let mut dispatch_failed = false;
 
                             // Process quote through order manager if enabled
                             if self.config.order.enabled
@@ -614,7 +788,11 @@ impl App {
                                 && quote.mid_price.is_finite()
                                 && quote.mid_price > 0.0
                             {
+                                let symbol_arc = self.get_symbol_arc(&data.symbol);
                                 if let Some(order_manager) = self.order_managers.get_mut(&data.symbol) {
+                                    // `valid_for_trading` includes the full configured history
+                                    // duration (10 minutes in the live/canary configurations).
+                                    order_manager.clear_pause_reason(PauseReason::MarketData);
                                     // Use system time for order creation to match timeout checks
                                     use std::time::{SystemTime, UNIX_EPOCH};
                                     let system_time_ns = SystemTime::now()
@@ -625,29 +803,30 @@ impl App {
 
                                     // Send decisions to executor via channel
                                     if let Some(tx) = &self.order_tx {
-                                        // Use pre-allocated Arc<str> for hot path (avoids allocation)
-                                        let symbol_arc = self.get_symbol_arc(&data.symbol);
                                         for decision in decisions {
                                             self.stats.order_decision_count += 1;
                                             // Non-blocking send (Arc::clone is just a refcount increment)
-                                            if tx.try_send((Arc::clone(&symbol_arc), decision)).is_err() {
+                                            if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), decision)) {
+                                                let (_, failed_decision) = error.into_inner();
+                                                order_manager.on_dispatch_failed(&failed_decision);
                                                 self.stats.consecutive_channel_drops += 1;
-                                                if self.stats.consecutive_channel_drops <= 3 {
-                                                    warn!("[{}] Order decision channel full, dropping decision", data.symbol);
-                                                }
-                                                // After 10 consecutive drops, trigger safety pause (executor likely dead)
-                                                if self.stats.consecutive_channel_drops == 10 {
-                                                    error!("[{}] 10 consecutive channel drops - pausing all trading (executor may have crashed)", data.symbol);
-                                                    for (_, manager) in self.order_managers.iter_mut() {
-                                                        manager.trigger_safety_pause("executor channel blocked");
-                                                    }
-                                                }
+                                                dispatch_failed = true;
+                                                error!("[{}] Order executor channel unavailable", data.symbol);
                                             } else {
                                                 self.stats.consecutive_channel_drops = 0;
                                             }
                                         }
                                     }
                                 }
+                            }
+
+                            if dispatch_failed {
+                                for manager in self.order_managers.values_mut() {
+                                    manager.trigger_safety_pause("executor channel unavailable");
+                                }
+                                self.begin_account_reconciliation(
+                                    "order decision could not reach executor",
+                                );
                             }
 
                             // Log quote after trading decisions are dispatched so formatting
@@ -930,6 +1109,32 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    if config.order.enabled {
+        let auth = shared_auth
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("order.enabled requires valid credentials"))?;
+        if !auth.lock().await.is_authenticated() {
+            anyhow::bail!("order.enabled requires successful authentication");
+        }
+    }
+
+    let (reconciliation_tx, reconciliation_rx) =
+        mpsc::unbounded_channel::<ReconciliationRequest>();
+    let (reconciliation_result_tx, mut reconciliation_result_rx) =
+        mpsc::channel::<ReconciliationResult>(8);
+    if config.order.enabled {
+        let auth = Arc::clone(shared_auth.as_ref().expect("validated above"));
+        tokio::spawn(run_reconciliation_worker(
+            auth,
+            reconciliation_rx,
+            reconciliation_result_tx,
+        ));
+        app.set_reconciliation_tx(reconciliation_tx);
+    } else {
+        drop(reconciliation_rx);
+        drop(reconciliation_result_tx);
+    }
+
     // Ensure exchange leverage matches config for all symbols before trading
     // CRITICAL: If leverage cannot be verified/set, refuse to trade to prevent wrong-leverage risk
     let target_leverage = config.strategy.leverage as i32;
@@ -1000,6 +1205,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up order management if enabled
     let mut order_event_rx: Option<mpsc::Receiver<OrderEvent>> = None;
+    let (executor_fault_tx, mut executor_fault_rx) = mpsc::channel::<String>(32);
     let (order_client, executor_handle_opt): (Option<Arc<OrderWsClient>>, Option<tokio::task::JoinHandle<()>>) = if config.order.enabled {
         if let Some(ref auth) = shared_auth {
             // Check if auth succeeded
@@ -1022,9 +1228,16 @@ async fn main() -> anyhow::Result<()> {
                             } else {
                                 info!("No orphaned orders to cancel");
                             }
+                            let remaining = auth_guard.query_open_orders(None).await?;
+                            if !remaining.is_empty() {
+                                anyhow::bail!(
+                                    "startup reconciliation left {} open account order(s)",
+                                    remaining.len()
+                                );
+                            }
                         }
                         Err(e) => {
-                            warn!("Failed to cancel existing orders on startup: {}", e);
+                            anyhow::bail!("failed startup account reconciliation: {}", e);
                         }
                     }
                 }
@@ -1052,6 +1265,7 @@ async fn main() -> anyhow::Result<()> {
                 app.set_order_tx(order_tx);
 
                 let executor_client = Arc::clone(&ws_client);
+                let executor_fault_tx = executor_fault_tx.clone();
 
                 // Clone symbol_infos for executor to read dynamic tick_size/lot_size
                 let executor_symbol_infos = app.symbol_infos().clone();
@@ -1082,12 +1296,18 @@ async fn main() -> anyhow::Result<()> {
                                 debug!("[{}] Sending {} L{} order: {} @ {:.2}", symbol, side, level, cl_ord_id, price);
                                 if let Err(e) = executor_client.place_order(req).await {
                                     warn!("[{}] Failed to place order: {}", symbol, e);
+                                    let _ = executor_fault_tx
+                                        .send(format!("place {} {} failed: {}", symbol, cl_ord_id, e))
+                                        .await;
                                 }
                             }
                             OrderDecision::Cancel { cl_ord_id } => {
                                 debug!("[{}] Canceling order: {}", symbol, cl_ord_id);
                                 if let Err(e) = executor_client.cancel_order_by_client_id(&cl_ord_id).await {
                                     warn!("[{}] Failed to cancel order: {}", symbol, e);
+                                    let _ = executor_fault_tx
+                                        .send(format!("cancel {} {} failed: {}", symbol, cl_ord_id, e))
+                                        .await;
                                 }
                             }
                             OrderDecision::CancelAndReplace { cancel_id, level: _, new_price, qty: _ } => {
@@ -1095,6 +1315,9 @@ async fn main() -> anyhow::Result<()> {
                                 // Cancel only - new order will be placed on next quote cycle
                                 if let Err(e) = executor_client.cancel_order_by_client_id(&cancel_id).await {
                                     warn!("[{}] Failed to cancel order for replacement: {}", symbol, e);
+                                    let _ = executor_fault_tx
+                                        .send(format!("replace-cancel {} {} failed: {}", symbol, cancel_id, e))
+                                        .await;
                                 }
                             }
                             OrderDecision::NoAction => {}
@@ -1245,7 +1468,33 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             // Handle market data WebSocket events
             Some(event) = rx.recv() => {
-                app.process_event(event);
+                if app.process_event(event) {
+                    app.begin_account_reconciliation("market data disconnected; warm-up reset");
+                }
+            }
+
+            Some(result) = reconciliation_result_rx.recv(), if config.order.enabled => {
+                if result.generation == app.reconciliation_generation() {
+                    info!(
+                        "Account reconciliation verified after {} attempt(s): {}",
+                        result.attempts, result.reason
+                    );
+                    app.finish_account_reconciliation();
+                } else {
+                    debug!(
+                        "Ignoring reconciliation generation {} because generation {} is pending",
+                        result.generation,
+                        app.reconciliation_generation()
+                    );
+                }
+            }
+
+            Some(fault) = executor_fault_rx.recv(), if config.order.enabled => {
+                error!("Ambiguous order transport failure: {}", fault);
+                for manager in app.order_managers_mut().values_mut() {
+                    manager.trigger_safety_pause("ambiguous order transport failure");
+                }
+                app.begin_account_reconciliation(fault);
             }
 
             // Handle order events (if order management enabled)
@@ -1275,11 +1524,63 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    OrderEvent::OrderFilled { order_id, fill_qty, fill_price } => {
-                        // Volume is inferred from position changes in PositionPoller
-                        // Position poller remains source of truth for position
-                        // Log fills for debugging
-                        info!("Fill received: order_id={}, qty={}, price={}", order_id, fill_qty, fill_price);
+                    OrderEvent::OrderFilled {
+                        order_id,
+                        cl_ord_id,
+                        status,
+                        fill_qty,
+                        fill_price,
+                    } => {
+                        info!(
+                            "Fill received: order_id={}, cl_ord_id={:?}, status={:?}, qty={}, price={}",
+                            order_id, cl_ord_id, status, fill_qty, fill_price
+                        );
+                        let fill_quantity = fill_qty.parse::<f64>().unwrap_or(0.0);
+                        let normalized_status = status.as_deref().unwrap_or("");
+                        let fully_filled = normalized_status == "filled";
+                        let partial = matches!(
+                            normalized_status,
+                            "partial" | "partially_filled" | "partially-filled"
+                        );
+
+                        if !fully_filled && !partial {
+                            app.begin_account_reconciliation(
+                                "fill response lacked an unambiguous status",
+                            );
+                            continue;
+                        }
+
+                        let mut matched = false;
+                        if let Some(ref client_id) = cl_ord_id {
+                            if let Some(symbol) = QuoteOrderManager::extract_symbol_from_cl_ord_id(client_id) {
+                                if let Some(manager) = app.get_order_manager_mut(symbol) {
+                                    matched = manager.on_order_fill(
+                                        order_id,
+                                        Some(client_id),
+                                        fill_quantity,
+                                        fully_filled,
+                                    );
+                                }
+                            }
+                        }
+                        if !matched {
+                            for manager in app.order_managers_mut().values_mut() {
+                                if manager.on_order_fill(
+                                    order_id,
+                                    cl_ord_id.as_deref(),
+                                    fill_quantity,
+                                    fully_filled,
+                                ) {
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !matched {
+                            app.begin_account_reconciliation(
+                                "fill could not be matched to a tracked order",
+                            );
+                        }
                     }
                     OrderEvent::OrderCanceled { order_id, cl_ord_id } => {
                         // First try matching by cl_ord_id (works for orders that were never accepted)
@@ -1328,15 +1629,28 @@ async fn main() -> anyhow::Result<()> {
                         for (_, manager) in app.order_managers_mut() {
                             manager.on_cancel_failed(order_id, &reason);
                         }
+                        let requires_reconciliation = order_id == 0
+                            || app
+                                .order_managers_mut()
+                                .values()
+                                .any(|manager| {
+                                    manager.has_pause_reason(PauseReason::Reconciliation)
+                                });
+                        if requires_reconciliation {
+                            app.begin_account_reconciliation(
+                                "cancel rejection requires verified account reconciliation",
+                            );
+                        }
                     }
                     OrderEvent::Connected => {
                         info!("Order WebSocket connected");
                         app.order_ws_connected = true;
                     }
                     OrderEvent::Authenticated => {
-                        info!("Order WebSocket authenticated, resuming trading");
+                        info!("Order WebSocket authenticated");
                         app.order_ws_authenticated = true;
-                        // Resume all order managers
+                        // Clear only the order-transport reason. Warm-up, risk data,
+                        // and reconciliation independently keep trading paused.
                         for (_, manager) in app.order_managers_mut() {
                             manager.resume();
                         }
@@ -1346,30 +1660,12 @@ async fn main() -> anyhow::Result<()> {
                         app.order_ws_connected = false;
                         app.order_ws_authenticated = false;
 
-                        // 1. Pause all order managers IMMEDIATELY (atomic, no latency)
+                        // Pause immediately. Do not clear local state until REST verifies
+                        // that account-wide cleanup completed.
                         for (_, manager) in app.order_managers_mut() {
                             manager.pause();
                         }
-
-                        // 2. Clear internal order state IMMEDIATELY
-                        // This prevents stale orders from blocking new placements after reconnect
-                        for (_, manager) in app.order_managers_mut() {
-                            manager.clear_all_orders();
-                        }
-
-                        // 3. Cancel all orders via HTTP (reliable fallback to clean exchange side)
-                        if let Some(auth) = &shared_auth {
-                            let auth_clone = Arc::clone(auth);
-                            // Spawn to avoid blocking main loop
-                            tokio::spawn(async move {
-                                let mut auth_guard = auth_clone.lock().await;
-                                if let Err(e) = auth_guard.cancel_all_orders(None).await {
-                                    error!("Failed to cancel orders on disconnect: {}", e);
-                                } else {
-                                    info!("Canceled all orders due to WebSocket disconnect");
-                                }
-                            });
-                        }
+                        app.begin_account_reconciliation("order WebSocket disconnected");
                     }
                     OrderEvent::Reconnecting { attempt, delay_secs } => {
                         info!("Order WebSocket reconnecting in {}s (attempt {})", delay_secs, attempt);
@@ -1401,6 +1697,13 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             error!("Order WebSocket error: {}", msg);
                         }
+                    }
+                    OrderEvent::AmbiguousResponse { request_id, code, reason } => {
+                        error!(
+                            "Ambiguous order response: request_id={:?}, code={:?}, reason={}",
+                            request_id, code, reason
+                        );
+                        app.begin_account_reconciliation(reason);
                     }
                 }
             }
@@ -1517,30 +1820,15 @@ async fn main() -> anyhow::Result<()> {
                     manager.pause();
                 }
 
-                // 2. Clear internal order state
-                if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
-                    manager.clear_all_orders();
-                }
+                app.begin_account_reconciliation(format!(
+                    "tick/lot size changed for {}",
+                    signal.symbol
+                ));
 
-                // 3. Cancel all orders on exchange via HTTP
-                if let Some(auth) = &shared_auth {
-                    let mut auth_guard = auth.lock().await;
-                    match auth_guard.cancel_all_orders(Some(&signal.symbol)).await {
-                        Ok(count) => {
-                            info!("[{}] Canceled {} order(s) due to tick size change", signal.symbol, count);
-                        }
-                        Err(e) => {
-                            error!("[{}] Failed to cancel orders on tick size change: {}", signal.symbol, e);
-                        }
-                    }
-                }
-
-                // 4. Reset strategy (clears rolling stats, re-enters warmup)
+                // Reset strategy (clears rolling stats, re-enters warmup)
                 app.reset_strategy(&signal.symbol);
-
-                // 5. Resume order manager (will wait for strategy warmup before trading)
                 if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
-                    manager.resume();
+                    manager.set_pause_reason(PauseReason::MarketData);
                 }
 
                 info!(
@@ -1551,10 +1839,21 @@ async fn main() -> anyhow::Result<()> {
 
             // Periodic tasks: timeout checking and stats logging (runs every 1 second)
             _ = periodic_interval.tick() => {
+                if app.update_risk_pauses() {
+                    app.begin_account_reconciliation("position or equity data became stale");
+                }
+
                 // Check for clear order signals from OpenOrdersChecker (non-blocking)
                 // This is O(1) try_recv - zero latency impact on hot path
                 if let Some(ref mut rx) = clear_orders_rx {
                     while let Ok(signal) = rx.try_recv() {
+                        let manager_has_orders = app
+                            .get_order_manager_mut(&signal.symbol)
+                            .map(|manager| !manager.get_all_live_order_ids().is_empty())
+                            .unwrap_or(false);
+                        if signal.reason.starts_with("0 orders") && !manager_has_orders {
+                            continue;
+                        }
                         if signal.pause_trading {
                             // CRITICAL: >2 orders detected - this is a safety limit violation
                             error!(
@@ -1568,32 +1867,17 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
 
-                        // 1. Clear internal state and trigger safety pause if needed
+                        // Pause first. Clear local state only after REST verifies that
+                        // account-wide cleanup completed.
                         if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
-                            manager.clear_all_orders();
                             if signal.pause_trading {
                                 manager.trigger_safety_pause(&signal.reason);
                             }
                         }
-
-                        // 2. Cancel orders on exchange (spawn to avoid blocking)
-                        if let Some(auth) = &shared_auth {
-                            let auth_clone = Arc::clone(auth);
-                            let symbol = signal.symbol.clone();
-                            tokio::spawn(async move {
-                                let mut auth_guard = auth_clone.lock().await;
-                                match auth_guard.cancel_all_orders(Some(&symbol)).await {
-                                    Ok(count) => {
-                                        if count > 0 {
-                                            info!("[{}] Canceled {} stale order(s)", symbol, count);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("[{}] Failed to cancel stale orders: {}", symbol, e);
-                                    }
-                                }
-                            });
-                        }
+                        app.begin_account_reconciliation(format!(
+                            "open-order checker for {}: {}",
+                            signal.symbol, signal.reason
+                        ));
                     }
                 }
 
@@ -1619,8 +1903,8 @@ async fn main() -> anyhow::Result<()> {
                                     // Pause order managers while reconnecting
                                     for (_, manager) in app.order_managers_mut() {
                                         manager.pause();
-                                        manager.clear_all_orders();
                                     }
+                                    app.begin_account_reconciliation("JWT refresh reconnect");
                                     let oc_clone = Arc::clone(oc);
                                     tokio::spawn(async move {
                                         oc_clone.force_reconnect().await;

@@ -62,8 +62,14 @@ pub enum OrderEvent {
     OrderAccepted { cl_ord_id: String, order_id: i64 },
     /// Order rejected by exchange.
     OrderRejected { cl_ord_id: String, reason: String },
-    /// Order filled.
-    OrderFilled { order_id: i64, fill_qty: String, fill_price: String },
+    /// Order fill/update with correlation and status where supplied.
+    OrderFilled {
+        order_id: i64,
+        cl_ord_id: Option<String>,
+        status: Option<String>,
+        fill_qty: String,
+        fill_price: String,
+    },
     /// Order canceled.
     OrderCanceled { order_id: i64, cl_ord_id: Option<String> },
     /// Cancel request failed.
@@ -76,6 +82,12 @@ pub enum OrderEvent {
     MaxRetriesExceeded,
     /// General error.
     Error(String),
+    /// A response could not be correlated safely to a request.
+    AmbiguousResponse {
+        request_id: Option<String>,
+        code: Option<i32>,
+        reason: String,
+    },
 }
 
 /// WebSocket message for order API.
@@ -365,9 +377,23 @@ impl OrderWsClient {
                     last_message = Instant::now();
                     match msg {
                         Message::Text(text) => {
-                            debug!("WS Received: {}", text);
-                            if let Ok(response) = serde_json::from_str::<WsResponse>(&text) {
-                                Self::handle_response(response, tx, &self.pending_cancels).await;
+                            match serde_json::from_str::<WsResponse>(&text) {
+                                Ok(response) => {
+                                    debug!(
+                                        "Order WS response: method={:?}, code={:?}, request_id={:?}",
+                                        response.method, response.code, response.request_id
+                                    );
+                                    Self::handle_response(response, tx, &self.pending_cancels).await;
+                                }
+                                Err(error) => {
+                                    let _ = tx
+                                        .send(OrderEvent::AmbiguousResponse {
+                                            request_id: None,
+                                            code: None,
+                                            reason: format!("malformed order WS response: {error}"),
+                                        })
+                                        .await;
+                                }
                             }
                         }
                         Message::Ping(_) => {
@@ -450,11 +476,15 @@ impl OrderWsClient {
             let read_timeout = Duration::from_millis(500);
             match timeout(read_timeout, read.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
-                    debug!("Auth response: {}", text);
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                         // Check if this is an auth response (has code field and matches our request_id)
                         let resp_request_id = json.get("request_id").and_then(|r| r.as_str());
                         let has_code = json.get("code").is_some();
+                        debug!(
+                            "Order WS auth response: code={:?}, request_id={:?}",
+                            json.get("code").and_then(|code| code.as_i64()),
+                            resp_request_id
+                        );
 
                         // Match by request_id if present, or accept any response with code during auth
                         if has_code && (resp_request_id == request_id.as_deref() || resp_request_id.is_none()) {
@@ -512,12 +542,19 @@ impl OrderWsClient {
         let json = serde_json::to_string(msg)
             .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
-        debug!("Sending: {}", json);
+        debug!("{}", Self::safe_log_summary(msg));
 
         writer.send(Message::Text(json)).await
             .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn safe_log_summary(msg: &WsOrderMessage) -> String {
+        format!(
+            "Sending order WS message: method={}, request_id={:?}",
+            msg.method, msg.request_id
+        )
     }
 
     /// Place a new order via WebSocket.
@@ -577,7 +614,11 @@ impl OrderWsClient {
             let mut pending = self.pending_cancels.lock().await;
             pending.insert(cl_ord_id.to_string());
         }
-        self.send_cancel(json!({ "cl_ord_id": cl_ord_id })).await
+        let result = self.send_cancel(json!({ "cl_ord_id": cl_ord_id })).await;
+        if result.is_err() {
+            self.pending_cancels.lock().await.remove(cl_ord_id);
+        }
+        result
     }
 
     /// Get reference to pending cancels set (for response handling).
@@ -696,13 +737,13 @@ impl OrderWsClient {
             .to_string()
     }
 
-    /// Check if data has a client order ID field.
     #[inline]
-    fn has_cl_ord_id(data: &serde_json::Value) -> bool {
-        data.get("cl_ord_id").is_some()
-            || data.get("clOrdId").is_some()
-            || data.get("clientOrderId").is_some()
-            || data.get("client_order_id").is_some()
+    fn extract_status(data: &serde_json::Value) -> Option<String> {
+        data.get("status")
+            .or_else(|| data.get("order_status"))
+            .or_else(|| data.get("orderStatus"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
     }
 
     // ========== Response Handlers ==========
@@ -716,6 +757,7 @@ impl OrderWsClient {
     ) {
         let method = response.method.as_deref().unwrap_or("");
         let code = response.code.unwrap_or(0);
+        let request_id = response.request_id.clone();
 
         // Use result field if data is not present (StandX API uses "result")
         let data = response.data.or(response.result);
@@ -726,6 +768,15 @@ impl OrderWsClient {
                 debug!("Routing: order:new response (code={})", code);
                 if let Some(data) = data {
                     Self::handle_order_response(data, code, &response.message, event_tx).await;
+                } else {
+                    let _ = event_tx
+                        .send(OrderEvent::AmbiguousResponse {
+                            request_id,
+                            code: response.code,
+                            reason: "order:new response contained no correlatable order data"
+                                .to_string(),
+                        })
+                        .await;
                 }
                 return;
             }
@@ -738,6 +789,15 @@ impl OrderWsClient {
                         pending.remove(&cl_ord_id);
                     }
                     Self::handle_cancel_response(data, code, &response.message, event_tx).await;
+                } else {
+                    let _ = event_tx
+                        .send(OrderEvent::AmbiguousResponse {
+                            request_id,
+                            code: response.code,
+                            reason: "order:cancel response contained no correlatable order data"
+                                .to_string(),
+                        })
+                        .await;
                 }
                 return;
             }
@@ -745,9 +805,27 @@ impl OrderWsClient {
                 debug!("Routing: order:fill response");
                 if let Some(data) = data {
                     let order_id = Self::extract_order_id(&data).unwrap_or(0);
+                    let cl_ord_id = Self::extract_cl_ord_id(&data);
+                    let status = Self::extract_status(&data).or_else(|| {
+                        (method == "order:filled").then(|| "filled".to_string())
+                    });
                     let fill_qty = Self::extract_fill_qty(&data);
                     let fill_price = Self::extract_fill_price(&data);
-                    let _ = event_tx.send(OrderEvent::OrderFilled { order_id, fill_qty, fill_price }).await;
+                    let _ = event_tx.send(OrderEvent::OrderFilled {
+                        order_id,
+                        cl_ord_id,
+                        status,
+                        fill_qty,
+                        fill_price,
+                    }).await;
+                } else {
+                    let _ = event_tx
+                        .send(OrderEvent::AmbiguousResponse {
+                            request_id,
+                            code: response.code,
+                            reason: "fill response contained no correlatable order data".to_string(),
+                        })
+                        .await;
                 }
                 return;
             }
@@ -793,12 +871,16 @@ impl OrderWsClient {
             }
         }
 
-        // Handle errors
-        if code != 0 {
-            debug!("Routing: error response (code={})", code);
-            let msg = response.message.unwrap_or_else(|| "Unknown error".to_string());
-            let _ = event_tx.send(OrderEvent::Error(msg)).await;
-        }
+        let reason = response.message.unwrap_or_else(|| {
+            "response contained no method or correlatable order data".to_string()
+        });
+        let _ = event_tx
+            .send(OrderEvent::AmbiguousResponse {
+                request_id,
+                code: response.code,
+                reason,
+            })
+            .await;
     }
 
     /// Handle order new/accepted response.
@@ -813,10 +895,30 @@ impl OrderWsClient {
         let order_id = Self::extract_order_id(&data).unwrap_or(0);
 
         if code == 0 {
+            if cl_ord_id.is_empty() || order_id == 0 {
+                let _ = event_tx
+                    .send(OrderEvent::AmbiguousResponse {
+                        request_id: None,
+                        code: Some(code),
+                        reason: "order acceptance lacked client or exchange order ID".to_string(),
+                    })
+                    .await;
+                return;
+            }
             info!("Order accepted: cl_ord_id={}, order_id={}", cl_ord_id, order_id);
             let _ = event_tx.send(OrderEvent::OrderAccepted { cl_ord_id, order_id }).await;
         } else {
             let reason = message.clone().unwrap_or_default();
+            if cl_ord_id.is_empty() {
+                let _ = event_tx
+                    .send(OrderEvent::AmbiguousResponse {
+                        request_id: None,
+                        code: Some(code),
+                        reason,
+                    })
+                    .await;
+                return;
+            }
             warn!("Order rejected: cl_ord_id={}, reason={}", cl_ord_id, reason);
             let _ = event_tx.send(OrderEvent::OrderRejected { cl_ord_id, reason }).await;
         }
@@ -834,9 +936,30 @@ impl OrderWsClient {
         let cl_ord_id = Self::extract_cl_ord_id(&data);
 
         if code == 0 {
+            if order_id == 0 && cl_ord_id.is_none() {
+                let _ = event_tx
+                    .send(OrderEvent::AmbiguousResponse {
+                        request_id: None,
+                        code: Some(code),
+                        reason: "cancel confirmation lacked client and exchange order IDs"
+                            .to_string(),
+                    })
+                    .await;
+                return;
+            }
             let _ = event_tx.send(OrderEvent::OrderCanceled { order_id, cl_ord_id }).await;
         } else {
             let reason = message.clone().unwrap_or_else(|| "Cancel failed".to_string());
+            if order_id == 0 && cl_ord_id.is_none() {
+                let _ = event_tx
+                    .send(OrderEvent::AmbiguousResponse {
+                        request_id: None,
+                        code: Some(code),
+                        reason,
+                    })
+                    .await;
+                return;
+            }
             warn!("Cancel failed for order {}: {}", order_id, reason);
             let _ = event_tx.send(OrderEvent::CancelFailed { order_id, reason }).await;
         }
@@ -866,5 +989,68 @@ mod tests {
 
         // Default config should have max 10 retries
         assert_eq!(client.reconnect_config.max_retries, Some(10));
+    }
+
+    #[tokio::test]
+    async fn data_less_order_response_fails_closed() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "code": 0,
+            "message": "success",
+            "request_id": "constant-signing-id"
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        OrderWsClient::handle_response(response, &tx, &pending).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::AmbiguousResponse {
+                request_id: Some(_),
+                code: Some(0),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn data_rich_order_response_preserves_correlation() {
+        let response: WsResponse = serde_json::from_value(json!({
+            "method": "order:new",
+            "code": 0,
+            "data": {"cl_ord_id": "mm_TEST-USD_1_0_1", "order_id": 42}
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        OrderWsClient::handle_response(response, &tx, &pending).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OrderEvent::OrderAccepted { order_id: 42, .. })
+        ));
+    }
+
+    #[test]
+    fn outbound_log_summary_redacts_credentials_and_params() {
+        let message = WsOrderMessage {
+            session_id: Some("session".to_string()),
+            request_id: Some("request".to_string()),
+            method: "auth:login".to_string(),
+            header: Some(WsHeader {
+                request_id: "header-id".to_string(),
+                timestamp: "123".to_string(),
+                signature: "private-signature".to_string(),
+            }),
+            params: WsParams("{\"token\":\"secret-jwt\"}".to_string()),
+        };
+
+        let summary = OrderWsClient::safe_log_summary(&message);
+        assert!(summary.contains("auth:login"));
+        assert!(!summary.contains("secret-jwt"));
+        assert!(!summary.contains("private-signature"));
+        assert!(!summary.contains("header-id"));
     }
 }

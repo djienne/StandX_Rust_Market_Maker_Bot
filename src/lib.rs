@@ -102,7 +102,7 @@ pub use orderbook::{
 pub use strategy::{QuoteStrategy, ObiStrategy, Quote, QuoteFormatter, RollingStats, RollingWindow};
 pub use trading::{
     AuthManager, SharedPosition, PositionPoller, PositionPollerConfig, PositionPollerHandle,
-    QuoteOrderManager, OrderManagerConfig, OrderDecision, OrderDecisions, LiveOrder, OrderState, Side, OrderManagerStats,
+    QuoteOrderManager, OrderManagerConfig, OrderDecision, OrderDecisions, LiveOrder, OrderState, PauseReason, Side, OrderManagerStats,
     WalletTracker, WalletTrackerConfig, WalletTrackerHandle,
     OpenOrdersChecker, OpenOrdersCheckerConfig, OpenOrdersCheckerHandle, ClearOrdersSignal,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
