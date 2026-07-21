@@ -276,8 +276,9 @@ impl StrategyConfig {
     /// Calculate warm-up time in nanoseconds.
     pub fn warmup_ns(&self) -> u64 {
         // First update at: ceil((window_steps - 1) / update_interval_steps) * update_interval_steps
-        let first_step = ((self.window_steps - 1 + self.update_interval_steps - 1)
-            / self.update_interval_steps) * self.update_interval_steps;
+        let first_step = (self.window_steps - 1)
+            .div_ceil(self.update_interval_steps)
+            * self.update_interval_steps;
         first_step as u64 * self.step_ns
     }
 }
@@ -596,6 +597,7 @@ impl Config {
     }
 
     /// Load configuration from a JSON string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(json: &str) -> Result<Self, ConfigError> {
         let config: Config = serde_json::from_str(json)?;
         config.validate()?;
@@ -885,8 +887,10 @@ mod tests {
             vec!["BTC-ÜSD".to_string()],
             vec!["BTC-USD".to_string(), "BTC-USD".to_string()],
         ] {
-            let mut config = Config::default();
-            config.symbols = symbols;
+            let config = Config {
+                symbols,
+                ..Config::default()
+            };
             assert!(config.validate().is_err());
         }
     }

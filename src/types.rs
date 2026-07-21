@@ -52,7 +52,7 @@ impl PriceLevel {
 
 /// Fixed-size symbol string to avoid heap allocations.
 /// Supports symbols up to 15 characters (plus null terminator).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Symbol {
     data: [u8; 16],
     len: u8,
@@ -114,15 +114,6 @@ impl Symbol {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-}
-
-impl Default for Symbol {
-    fn default() -> Self {
-        Self {
-            data: [0u8; 16],
-            len: 0,
-        }
     }
 }
 

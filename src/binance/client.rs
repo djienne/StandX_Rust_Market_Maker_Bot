@@ -46,6 +46,8 @@ const MAX_CONNECTION_DURATION: Duration = Duration::from_secs(23 * 60 * 60); // 
 
 /// Events emitted by the Binance client.
 #[derive(Debug, Clone)]
+// Boxing snapshots would add an allocation to every market-data update.
+#[allow(clippy::large_enum_variant)]
 pub enum BinanceEvent {
     /// New orderbook snapshot available
     Snapshot(OrderbookSnapshot),

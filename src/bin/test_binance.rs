@@ -57,8 +57,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if last_print.elapsed() >= Duration::from_secs(1) {
                             let mid = snapshot.mid_price().unwrap_or(0.0);
                             let spread = snapshot.spread().unwrap_or(0.0);
-                            let spread_bps = snapshot.spread_bps().unwrap_or(0.0);
-
                             let (alpha, vol) = obi_result.unwrap_or((0.0, 0.0));
                             let vol_bps = vol * 10000.0; // Convert to basis points
 

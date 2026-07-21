@@ -137,7 +137,7 @@ impl BinanceOrderbook {
             } else {
                 // Spot: U <= lastUpdateId+1 AND u >= lastUpdateId+1
                 update.first_update_id <= self.snapshot_update_id + 1
-                    && update.final_update_id >= self.snapshot_update_id + 1
+                    && update.final_update_id > self.snapshot_update_id
             };
 
             if sync_ok {

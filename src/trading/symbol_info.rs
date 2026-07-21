@@ -333,7 +333,7 @@ impl SymbolInfoPoller {
                             "[{}] Symbol info poll failed (attempt {}): {}",
                             self.config.symbol, consecutive_errors, e
                         );
-                    } else if consecutive_errors % 10 == 0 {
+                    } else if consecutive_errors.is_multiple_of(10) {
                         error!(
                             "[{}] Symbol info poll failing repeatedly ({} errors): {}",
                             self.config.symbol, consecutive_errors, e

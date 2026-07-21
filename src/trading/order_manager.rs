@@ -1574,8 +1574,10 @@ mod tests {
     fn test_no_reprice_within_threshold() {
         let position = create_test_position();
         let equity = create_test_equity_high_limit();
-        let mut config = OrderManagerConfig::default();
-        config.reprice_threshold_bps = 10.0; // 10 bps threshold
+        let config = OrderManagerConfig {
+            reprice_threshold_bps: 10.0,
+            ..OrderManagerConfig::default()
+        };
         let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
@@ -1584,7 +1586,7 @@ mod tests {
         assert_eq!(decisions.len(), 2);
 
         // Simulate acceptance
-        if let Some(OrderDecision::Send { cl_ord_id, .. }) = decisions.get(0) {
+        if let Some(OrderDecision::Send { cl_ord_id, .. }) = decisions.first() {
             manager.on_order_accepted(cl_ord_id, 1001);
         }
         if let Some(OrderDecision::Send { cl_ord_id, .. }) = decisions.get(1) {
@@ -1603,8 +1605,10 @@ mod tests {
     fn test_reprice_beyond_threshold() {
         let position = create_test_position();
         let equity = create_test_equity_high_limit();
-        let mut config = OrderManagerConfig::default();
-        config.reprice_threshold_bps = 1.0; // 1 bps threshold
+        let config = OrderManagerConfig {
+            reprice_threshold_bps: 1.0,
+            ..OrderManagerConfig::default()
+        };
         let mut manager = OrderManager::new(config, position, equity);
 
         // Place initial orders
@@ -1791,8 +1795,10 @@ mod tests {
     fn test_two_level_order_placement() {
         let position = create_test_position();
         let equity = create_test_equity_high_limit();
-        let mut config = OrderManagerConfig::default();
-        config.num_levels = 2; // Enable 2 levels
+        let config = OrderManagerConfig {
+            num_levels: 2,
+            ..OrderManagerConfig::default()
+        };
         let mut manager = OrderManager::new(config, position, equity);
 
         // Create a 2-level quote
@@ -1828,8 +1834,10 @@ mod tests {
 
         // Set max_position to $500 via SharedEquity
         let equity = create_test_equity(500.0);
-        let mut config = OrderManagerConfig::default();
-        config.num_levels = 2;
+        let config = OrderManagerConfig {
+            num_levels: 2,
+            ..OrderManagerConfig::default()
+        };
         let mut manager = OrderManager::new(config, position, equity);
 
         // First place orders (simulating already having orders)

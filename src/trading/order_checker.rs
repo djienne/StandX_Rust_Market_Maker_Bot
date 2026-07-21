@@ -222,7 +222,7 @@ impl OpenOrdersChecker {
                             "[{}] Open orders check failed (attempt {}): {}",
                             self.config.symbol, consecutive_errors, e
                         );
-                    } else if consecutive_errors % 10 == 0 {
+                    } else if consecutive_errors.is_multiple_of(10) {
                         error!(
                             "[{}] Open orders check failing repeatedly ({} errors): {}",
                             self.config.symbol, consecutive_errors, e

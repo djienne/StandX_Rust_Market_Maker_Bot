@@ -111,6 +111,7 @@ impl StandXObiCalculator {
 }
 
 #[derive(Default, Clone)]
+#[allow(dead_code)]
 struct Metrics {
     mid_price: f64,
     spread: f64,

@@ -267,14 +267,10 @@ impl ObiStrategy {
     #[inline]
     pub fn history_duration_ns(&self) -> u64 {
         match self.first_timestamp_ns {
-            Some(first) => {
-                if self.latest_timestamp_ns > first {
-                    (self.latest_timestamp_ns - first) as u64
-                } else {
-                    0
-                }
+            Some(first) if self.latest_timestamp_ns > first => {
+                (self.latest_timestamp_ns - first) as u64
             }
-            None => 0,
+            _ => 0,
         }
     }
 
@@ -577,7 +573,7 @@ impl ObiStrategy {
         );
 
         Some(Quote {
-            symbol: snapshot.symbol.clone(),
+            symbol: snapshot.symbol,
             bid_prices,
             ask_prices,
             num_levels,
@@ -616,7 +612,7 @@ impl ObiStrategy {
     #[inline]
     pub fn is_using_binance_alpha(&self) -> bool {
         self.use_binance_alpha
-            && self.shared_binance_alpha.as_ref().map_or(false, |b| {
+            && self.shared_binance_alpha.as_ref().is_some_and(|b| {
                 b.is_warmed_up() && !b.is_stale(self.binance_stale_ms)
             })
     }

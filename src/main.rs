@@ -137,6 +137,7 @@ impl StatsTracker {
     }
 
     /// Log statistics if interval has elapsed.
+    #[allow(clippy::too_many_arguments)]
     fn log_if_needed(
         &mut self,
         config: &Config,
@@ -657,7 +658,7 @@ impl App {
             return;
         }
 
-        for (_, manager) in &mut self.order_managers {
+        for manager in self.order_managers.values_mut() {
             manager.check_circuit_breaker_recovery(self.config.order.circuit_breaker_recovery_secs);
         }
     }
@@ -669,7 +670,7 @@ impl App {
             return;
         }
 
-        for (_, manager) in &mut self.order_managers {
+        for manager in self.order_managers.values_mut() {
             manager.check_safety_pause_recovery(recovery_secs);
         }
     }
@@ -677,7 +678,7 @@ impl App {
     /// Shutdown all order managers and get orders to cancel.
     fn shutdown_order_managers(&mut self) -> Vec<String> {
         let mut all_orders = Vec::new();
-        for (_, manager) in &mut self.order_managers {
+        for manager in self.order_managers.values_mut() {
             manager.shutdown();
             all_orders.extend(manager.get_all_live_order_ids());
         }
@@ -753,7 +754,9 @@ impl App {
 
                             if let Some(quote) = strategy.update(&snapshot) {
                                 quote_result = Some(quote);
-                            } else if !strategy.is_warmed_up() && self.stats.message_count % 20 == 0 {
+                            } else if !strategy.is_warmed_up()
+                                && self.stats.message_count.is_multiple_of(20)
+                            {
                                 is_warming_up = true;
                             }
                         }
@@ -852,7 +855,7 @@ impl App {
                         }
 
                         // Log periodic orderbook updates if verbose
-                        if self.config.verbose && self.stats.message_count % 100 == 0 {
+                        if self.config.verbose && self.stats.message_count.is_multiple_of(100) {
                             if let Some(ob) = self.store.get(&data.symbol) {
                                 if let Some(latest) = ob.latest() {
                                     info!(
@@ -1626,7 +1629,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     OrderEvent::CancelFailed { order_id, reason } => {
                         // Cancel failed - order is still live, revert state
-                        for (_, manager) in app.order_managers_mut() {
+                        for manager in app.order_managers_mut().values_mut() {
                             manager.on_cancel_failed(order_id, &reason);
                         }
                         let requires_reconciliation = order_id == 0
@@ -1651,7 +1654,7 @@ async fn main() -> anyhow::Result<()> {
                         app.order_ws_authenticated = true;
                         // Clear only the order-transport reason. Warm-up, risk data,
                         // and reconciliation independently keep trading paused.
-                        for (_, manager) in app.order_managers_mut() {
+                        for manager in app.order_managers_mut().values_mut() {
                             manager.resume();
                         }
                     }
@@ -1662,7 +1665,7 @@ async fn main() -> anyhow::Result<()> {
 
                         // Pause immediately. Do not clear local state until REST verifies
                         // that account-wide cleanup completed.
-                        for (_, manager) in app.order_managers_mut() {
+                        for manager in app.order_managers_mut().values_mut() {
                             manager.pause();
                         }
                         app.begin_account_reconciliation("order WebSocket disconnected");
@@ -1725,7 +1728,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     // Pause all order managers immediately
-                    for (_, manager) in app.order_managers_mut() {
+                    for manager in app.order_managers_mut().values_mut() {
                         manager.pause();
                     }
                     // Cancel all orders via HTTP
@@ -1901,7 +1904,7 @@ async fn main() -> anyhow::Result<()> {
                                         remaining
                                     );
                                     // Pause order managers while reconnecting
-                                    for (_, manager) in app.order_managers_mut() {
+                                    for manager in app.order_managers_mut().values_mut() {
                                         manager.pause();
                                     }
                                     app.begin_account_reconciliation("JWT refresh reconnect");
