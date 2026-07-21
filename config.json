@@ -31,7 +31,7 @@
     "leverage": 1.0
   },
   "order": {
-    "enabled": true,
+    "enabled": false,
     "reprice_threshold_bps": 1.0,
     "pending_timeout_secs": 30
   },

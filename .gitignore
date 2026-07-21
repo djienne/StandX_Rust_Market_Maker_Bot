@@ -2,3 +2,15 @@ data/
 __pycache__/
 *.pyc
 .env
+
+# Rust build output
+target/
+
+# Runtime state and diagnostics
+*.log
+*.pid
+*.csv
+
+# Local tool metadata and packaged documentation
+.codex
+DOCS/*.zip
