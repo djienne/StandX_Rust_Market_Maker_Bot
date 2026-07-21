@@ -1,12 +1,4 @@
-# Environment variables and secrets
+data/
+__pycache__/
+*.pyc
 .env
-
-# Rust build artifacts
-target/
-
-# IDE
-.idea/
-.vscode/
-
-# Data files
-wallet_history.csv
