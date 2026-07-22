@@ -936,16 +936,14 @@ impl OrderManager {
                     "[{}] {} order accepted: {} -> {} (latency={}ms)",
                     self.config.symbol, side, cl_ord_id, order_id, latency_ms
                 );
-            } else if prev_state == OrderState::Canceling {
-                // Order was already being canceled when acceptance arrived
-                // Keep in Canceling state - cancel request is in flight
-                if existing_order_id.is_none() {
-                    warn!(
-                        "[{}] {} order {} accepted while Canceling (order_id={}) - keeping Canceling state",
-                        self.config.symbol, side, cl_ord_id, order_id
-                    );
-                    self.stats.orders_accepted += 1;
-                }
+            } else if prev_state == OrderState::Canceling && existing_order_id.is_none() {
+                // A REST snapshot can supply the numeric ID after the
+                // response-stream ACK was counted and a cancel was sent.
+                // Preserve Canceling and do not count the same acceptance twice.
+                debug!(
+                    "[{}] {} order {} enriched while Canceling (order_id={})",
+                    self.config.symbol, side, cl_ord_id, order_id
+                );
             }
         }
 
@@ -1828,6 +1826,38 @@ mod tests {
         );
         assert!(!manager.on_order_accepted(&cl_ord_id, 43));
         assert!(!manager.on_order_accepted("mm_TEST-USD_unknown", 44));
+    }
+
+    #[test]
+    fn rest_enrichment_while_canceling_does_not_double_count() {
+        let position = create_test_position();
+        let equity = create_test_equity_high_limit();
+        let mut manager = OrderManager::new(OrderManagerConfig::default(), position, equity);
+        let decisions = manager.on_quote(
+            &create_test_quote(99_000.0, 101_000.0, 0.001),
+            1_000_000_000,
+        );
+        let cl_ord_id = decisions
+            .iter()
+            .find_map(|decision| match decision {
+                OrderDecision::Send {
+                    side: Side::Buy,
+                    cl_ord_id,
+                    ..
+                } => Some(cl_ord_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(manager.on_order_accepted(&cl_ord_id, 0));
+        assert_eq!(manager.stats().orders_accepted, 1);
+        manager.set_order_canceling(Side::Buy, 0, 2_000_000_000);
+
+        assert!(manager.on_order_accepted(&cl_ord_id, 42));
+        let order = manager.find_order(&cl_ord_id).unwrap();
+        assert_eq!(order.state, OrderState::Canceling);
+        assert_eq!(order.order_id, Some(42));
+        assert_eq!(manager.stats().orders_accepted, 1);
     }
 
     #[test]
