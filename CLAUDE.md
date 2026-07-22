@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build and Run Commands
 
-```bash
-# Build (debug)
-cargo build
+**Mandatory release-profile rule:** Always use Cargo's `--release` profile for
+builds, runs, checks, lints, and tests in this repository. Do not create or use
+debug-profile artifacts; latency and behavior must be evaluated with optimized
+code.
 
-# Build (release, optimized)
+```bash
+# Build
 cargo build --release
 
 # Run with default config
@@ -18,22 +20,22 @@ cargo run --release
 cargo run --release -- /path/to/config.json
 
 # Run tests
-cargo test
+cargo test --release
 
 # Run a single test
-cargo test test_name
+cargo test --release test_name
 
 # Run tests in a specific module
-cargo test trading::order_manager::tests
+cargo test --release trading::order_manager::tests
 
 # Check compilation without building
-cargo check
+cargo check --release
 
 # Format code
 cargo fmt
 
 # Lint
-cargo clippy
+cargo clippy --release
 ```
 
 ## Architecture
@@ -117,7 +119,7 @@ Credentials: `.env` file (WALLET_AD, PRIVATE_KEY)
 
 Key config sections:
 - `strategy`: Quote parameters (tick_size, vol_to_half_spread, skew, max_position_dollar)
-- `order`: Order management (enabled, reprice_threshold_bps, pending_timeout_secs, max_live_age_secs, circuit_breaker_rejections)
+- `order`: Order management (enabled by default; set `enabled=false` only for explicit test/observe-only mode, plus reprice_threshold_bps, pending_timeout_secs, max_live_age_secs, circuit_breaker_rejections)
 - `position`: Position polling (enabled, poll_interval_secs)
 
 ## Order Manager Features
@@ -149,7 +151,7 @@ cp .env.example .env
 # 2. Test connection (no real orders)
 docker compose --profile test up bot-test
 
-# 3. Production (after setting order.enabled=true in config.json)
+# 3. Production (real order placement is enabled by default)
 docker compose up -d
 docker compose logs -f bot
 ```

@@ -334,8 +334,9 @@ impl StatsTracker {
                 }
             }
         } else {
-            info!(
-                "Stats: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), {} total history entries",
+            warn!(
+                "TEST/OBSERVE-ONLY MODE: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), \
+                 {} total history entries; order.enabled=false, so no orders will be placed",
                 self.message_count,
                 rate,
                 self.quote_count,
@@ -1212,7 +1213,9 @@ async fn main() -> anyhow::Result<()> {
             config.order.max_live_age_secs,
         );
     } else {
-        info!("Order management: DISABLED (set order.enabled=true in config to enable)");
+        warn!(
+            "TEST/OBSERVE-ONLY MODE: order.enabled=false; this process will never place orders"
+        );
     }
 
     // Fetch symbol info from API (tick_size/lot_size auto-detection).

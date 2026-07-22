@@ -366,7 +366,9 @@ pub struct OrderConfig {
     pub position_limit_from_start: bool,
 }
 
-fn default_order_enabled() -> bool { false } // Disabled by default for safety
+// This binary is a market maker: live order placement is the default. Setting
+// `order.enabled=false` is an explicit observe-only/test mode.
+fn default_order_enabled() -> bool { true }
 fn default_reprice_threshold_bps() -> f64 { 1.0 }
 fn default_pending_timeout_secs() -> u64 { 5 }
 fn default_max_live_age_secs() -> u64 { 60 }
@@ -412,7 +414,9 @@ pub struct WalletConfig {
     pub csv_path: String,
 }
 
-fn default_wallet_enabled() -> bool { false } // Disabled by default
+// Live ordering requires a fresh equity source, so wallet polling follows the
+// live-order default. Authentication failures still make startup fail closed.
+fn default_wallet_enabled() -> bool { true }
 fn default_wallet_interval() -> u64 { 60 }
 fn default_wallet_stale_threshold() -> u64 { 120 }
 fn default_wallet_csv_path() -> String { "wallet_history.csv".to_string() }
@@ -833,7 +837,30 @@ mod tests {
         assert_eq!(config.symbols, vec!["TEST-USD"]);
         assert_eq!(config.orderbook_levels, 20);
         assert_eq!(config.history_minutes, 10);
+        assert!(config.order.enabled);
+        assert!(config.pnl_tracking.enabled);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn order_placement_is_default_and_observe_only_is_explicit() {
+        let live = Config::from_str(r#"{"symbols":["BTC-USD"]}"#).unwrap();
+        assert!(live.order.enabled);
+
+        let observe_only = Config::from_str(
+            r#"{"symbols":["BTC-USD"],"order":{"enabled":false}}"#,
+        )
+        .unwrap();
+        assert!(!observe_only.order.enabled);
+    }
+
+    #[test]
+    fn checked_in_runtime_config_enables_real_orders() {
+        let config = Config::from_str(include_str!("../config.json")).unwrap();
+        assert!(
+            config.order.enabled,
+            "config.json must place real orders; use an explicit test config for observe-only mode"
+        );
     }
 
     #[test]
