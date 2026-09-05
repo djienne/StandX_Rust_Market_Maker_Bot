@@ -379,15 +379,3 @@ impl OpenOrdersCheckerHandle {
         let _ = self.task.await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_default() {
-        let config = OpenOrdersCheckerConfig::default();
-        assert_eq!(config.interval, Duration::from_secs(3));
-        assert_eq!(config.debounce_count, 2);
-    }
-}

@@ -156,6 +156,8 @@ pub struct OrderManagerConfig {
     pub tick_size: f64,
     /// Lot size for quantity.
     pub lot_size: f64,
+    pub min_order_qty: f64,
+    pub min_order_qty_dollar: f64,
     /// Enable debug logging for order state tracking.
     pub debug: bool,
     /// Maximum consecutive rejections before pausing trading (circuit breaker).
@@ -180,6 +182,8 @@ impl Default for OrderManagerConfig {
             max_live_age_ns: 60_000_000_000,   // 60 seconds max age for Live orders
             tick_size: 0.01,
             lot_size: 0.001,
+            min_order_qty: 0.001,
+            min_order_qty_dollar: 10.0,
             debug: false,
             circuit_breaker_rejections: 5,     // Pause after 5 consecutive rejections
             num_levels: 1,                     // Default to single level
@@ -194,6 +198,24 @@ impl Default for OrderManagerConfig {
 /// This limits how often we check for timed out orders to minimize hot path latency.
 const TIMEOUT_CHECK_INTERVAL_NS: i64 = 1_000_000_000;
 
+/// Shared pause state and the barrier between new-order writes and cleanup.
+#[derive(Default)]
+pub struct ExecutionState {
+    pause_reasons: AtomicU8,
+    shutdown: AtomicBool,
+    generation: AtomicU64,
+    pub submission: tokio::sync::Mutex<()>,
+}
+
+impl ExecutionState {
+    pub fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
+    pub fn permits(&self, generation: u64) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+            && self.pause_reasons.load(Ordering::Acquire) == 0
+            && generation == self.generation()
+    }
+}
+
 /// Low-latency order manager for market making.
 ///
 /// Provides synchronous order decision-making in the hot path with
@@ -203,10 +225,6 @@ const TIMEOUT_CHECK_INTERVAL_NS: i64 = 1_000_000_000;
 pub struct OrderManager {
     /// Configuration.
     config: OrderManagerConfig,
-
-    /// Precomputed once so the normal quote path needs only one predictable
-    /// branch before entering the optional hard-cap implementation.
-    guarded_limits: bool,
 
     /// Current bid orders per level (buy).
     bid_orders: [Option<LiveOrder>; MAX_ORDER_LEVELS],
@@ -225,28 +243,16 @@ pub struct OrderManager {
 
     /// Session prefix for client order IDs.
     session_prefix: String,
+    retired_generation: u64,
 
     /// Statistics.
     stats: OrderManagerStats,
 
     /// Shutdown flag.
-    shutdown: AtomicBool,
-
-    /// Pause reasons bitfield.
-    /// Trading is paused when any bit is set. Each subsystem only clears its own bit,
-    /// preventing one recovery from incorrectly resuming trading blocked by another reason.
-    pause_reasons: AtomicU8,
+    execution: Arc<ExecutionState>,
 
     /// Last time we checked for timeouts (throttles hot path).
     last_timeout_check_ns: i64,
-
-    /// Pending bid prices after cancel confirms per level (for CancelAndReplace).
-    /// Stores (price, qty) to place immediately when slot is cleared.
-    pending_bid_prices: [Option<(f64, f64)>; MAX_ORDER_LEVELS],
-
-    /// Pending ask prices after cancel confirms per level (for CancelAndReplace).
-    /// Stores (price, qty) to place immediately when slot is cleared.
-    pending_ask_prices: [Option<(f64, f64)>; MAX_ORDER_LEVELS],
 
     /// Consecutive rejection count for circuit breaker.
     consecutive_rejections: u32,
@@ -278,26 +284,20 @@ impl OrderManager {
     ) -> Self {
         // Generate session prefix including symbol for O(1) lookup by symbol in event handlers
         // Format: mm_<symbol>_<timestamp>
-        let session_prefix = format!("mm_{}_{}", config.symbol, chrono::Utc::now().timestamp_millis() % 1_000_000);
-        let guarded_limits = config.absolute_max_position_dollar.is_some()
-            || config.max_order_qty_dollar.is_some()
-            || config.position_limit_from_start;
+        let session_prefix = format!("mm_{}_{}", config.symbol, chrono::Utc::now().timestamp_millis());
 
         Self {
             config,
-            guarded_limits,
             bid_orders: [None, None],
             ask_orders: [None, None],
             position,
             shared_equity,
             cl_ord_id_counter: AtomicU64::new(1),
             session_prefix,
+            retired_generation: 0,
             stats: OrderManagerStats::default(),
-            shutdown: AtomicBool::new(false),
-            pause_reasons: AtomicU8::new(0),
+            execution: Arc::new(ExecutionState::default()),
             last_timeout_check_ns: 0,
-            pending_bid_prices: [None, None],
-            pending_ask_prices: [None, None],
             consecutive_rejections: 0,
             circuit_breaker_triggered_at_ms: 0,
             safety_pause_triggered_at_ms: 0,
@@ -324,19 +324,27 @@ impl OrderManager {
     }
 
     /// Generate a unique client order ID with level.
-    /// Format: mm_<symbol>_<timestamp>_<level>_<seq>
+    /// Format: mm_<symbol>_<timestamp>_<level>_<generation>_<seq>
     #[inline]
     pub fn generate_cl_ord_id(&self, level: usize) -> String {
         let seq = self.cl_ord_id_counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}_{}_{}", self.session_prefix, level, seq)
+        format!("{}_{}_{}_{}", self.session_prefix, level, self.execution.generation(), seq)
+    }
+
+    /// Responses for orders cleared by verified cleanup cannot recreate state.
+    pub fn is_retired_client_id(&self, id: &str) -> bool {
+        id.strip_prefix(&format!("{}_", self.session_prefix))
+            .and_then(|suffix| suffix.split('_').nth(1))
+            .and_then(|generation| generation.parse::<u64>().ok())
+            .is_some_and(|generation| generation < self.retired_generation)
     }
 
     /// Extract symbol from a client order ID.
-    /// Format: mm_<symbol>_<timestamp>_<level>_<seq>
+    /// Format: mm_<symbol>_<timestamp>_<level>_<generation>_<seq>
     /// Returns None if format doesn't match.
     #[inline]
     pub fn extract_symbol_from_cl_ord_id(cl_ord_id: &str) -> Option<&str> {
-        // Format: mm_<symbol>_<timestamp>_<level>_<seq>
+        // Format: mm_<symbol>_<timestamp>_<level>_<generation>_<seq>
         // Skip "mm_", find symbol between first and second "_" after "mm_"
         let rest = cl_ord_id.strip_prefix("mm_")?;
         // Find the first underscore (after symbol)
@@ -400,7 +408,7 @@ impl OrderManager {
         decisions.clear();
         // Early exit if shutting down or paused (atomic, no latency)
         // Use Acquire ordering to ensure we see the Release store from shutdown()/pause()
-        if self.shutdown.load(Ordering::Acquire) || self.pause_reasons.load(Ordering::Acquire) != 0 {
+        if self.execution.shutdown.load(Ordering::Acquire) || self.execution.pause_reasons.load(Ordering::Acquire) != 0 {
             return;
         }
 
@@ -411,224 +419,85 @@ impl OrderManager {
 
         // Validate mid_price to prevent NaN/Inf from bypassing position limits
         // (NaN comparisons always return false, which would skip all limit checks)
-        if !quote.mid_price.is_finite() || quote.mid_price <= 0.0 {
+        if !quote.mid_price.is_finite() || quote.mid_price <= 0.0
+            || !quote.quantity.is_finite() || quote.quantity <= 0.0 {
             return;
         }
 
-        if !self.guarded_limits {
-            self.on_quote_uncapped(quote, current_time_ns, decisions);
+        let position = self.position.get();
+        let limit = self.shared_equity.max_position_dollar();
+        if !position.is_finite() || !limit.is_finite() || limit <= 0.0 {
+            self.set_pause_reason(PauseReason::RiskData);
+            self.cancel_exposure(decisions, current_time_ns);
             return;
         }
-
-        self.on_quote_guarded(quote, current_time_ns, decisions);
-    }
-
-    /// Optional hard-cap path, kept out of the instruction cache for the
-    /// normal uncapped production configuration.
-    #[cold]
-    #[inline(never)]
-    fn on_quote_guarded(
-        &mut self,
-        quote: &Quote,
-        current_time_ns: i64,
-        decisions: &mut Vec<OrderDecision>,
-    ) {
-        // Calculate position in dollars (from poller - source of truth). Guarded
-        // canaries can measure exposure relative to the first fresh position.
-        let current_position = self.position.get();
-        let position_for_limit = if self.config.position_limit_from_start {
-            let Some(baseline) = self.position_baseline else {
-                return;
-            };
-            current_position - baseline
-        } else {
-            current_position
-        };
-        let position_dollar = position_for_limit * quote.mid_price;
-
-        // Get max_position from SharedEquity (lock-free read, ~1ns)
-        // If equity not initialized (max_position = 0), don't enforce limits
-        let dynamic_max_position = self.shared_equity.max_position_dollar();
-        if !dynamic_max_position.is_finite() || dynamic_max_position <= 0.0 {
-            return;
-        }
-        let hard_position_cap = self.config.absolute_max_position_dollar;
-        let max_position = hard_position_cap
-            .map(|cap| cap.min(dynamic_max_position))
-            .unwrap_or(dynamic_max_position);
-
-        // Pending/live exposure accounting is needed only for the optional hard
-        // canary cap. Preserve the original constant-time production path when
-        // that cap is unset.
-        let (worst_long, worst_short) = if hard_position_cap.is_some() {
-            (
-                position_dollar + self.outstanding_notional(Side::Buy),
-                position_dollar - self.outstanding_notional(Side::Sell),
-            )
-        } else {
-            (position_dollar, position_dollar)
-        };
-
-        // Use > and < (not >= and <=) so that at exactly the limit we can still
-        // place orders on the opposite side to rebalance position
-        let at_max_long = worst_long > max_position;
-        let at_max_short = worst_short < -max_position;
-
-        // Use the minimum of configured levels and quote levels
-        let num_levels = self.config.num_levels.min(quote.num_levels);
-
-        // Process each level
-        for level in 0..num_levels {
-            let bid_quantity = self.capped_quantity(quote.bid_prices[level], quote.quantity);
-            let ask_quantity = self.capped_quantity(quote.ask_prices[level], quote.quantity);
-            // Process BID side (buy) - skip if at max long position
-            if !at_max_long {
-                let would_exceed = hard_position_cap.is_some()
-                    && self.bid_orders[level].is_none()
-                    && self.outstanding_notional(Side::Buy)
-                        + position_dollar
-                        + quote.bid_prices[level] * bid_quantity
-                        > max_position;
-                if !would_exceed && bid_quantity > 0.0 {
-                    if let Some(decision) = self.process_side_level(
-                    Side::Buy,
-                    level,
-                    quote.bid_prices[level],
-                    bid_quantity,
-                    current_time_ns,
-                    ) {
-                        decisions.push(decision);
+        let baseline = if self.config.position_limit_from_start {
+            let Some(baseline) = self.position_baseline else { return; };
+            baseline
+        } else { 0.0 };
+        for side in [Side::Buy, Side::Sell] {
+            let sign = if side == Side::Buy { 1.0 } else { -1.0 };
+            let mut headroom = limit - sign * position * quote.mid_price;
+            if let Some(cap) = self.config.absolute_max_position_dollar {
+                headroom = headroom.min(cap - sign * (position - baseline) * quote.mid_price);
+            }
+            for level in 0..self.config.num_levels.min(quote.num_levels) {
+                let price = if side == Side::Buy { quote.bid_prices[level] } else { quote.ask_prices[level] };
+                if !price.is_finite() || price <= 0.0 { continue; }
+                // Reserve other pending/live/canceling slots. Mark conservatively
+                // at max(limit price, mid) so appreciation cannot hide exposure.
+                let orders = if side == Side::Buy { &self.bid_orders } else { &self.ask_orders };
+                let reserved: f64 = orders.iter().enumerate()
+                    .filter(|(index, _)| *index != level)
+                    .filter_map(|(_, order)| order.as_ref())
+                    .map(|order| order.quantity * order.price.max(quote.mid_price)).sum();
+                let budget = (headroom - reserved).max(0.0);
+                let mut qty = quote.quantity.min(budget / price.max(quote.mid_price));
+                if let Some(cap) = self.config.max_order_qty_dollar { qty = qty.min(cap / price); }
+                qty = (qty / self.config.lot_size).floor() * self.config.lot_size;
+                if !qty.is_finite() || qty < self.config.min_order_qty || qty * price < self.config.min_order_qty_dollar {
+                    qty = 0.0;
+                }
+                if let Some(order) = &orders[level] {
+                    let exceeds = order.quantity * order.price.max(quote.mid_price) > budget + 1e-9
+                        || self.config.max_order_qty_dollar.is_some_and(|cap| order.quantity * order.price > cap + 1e-9);
+                    if (exceeds || qty == 0.0) && order.state != OrderState::Canceling {
+                        let cl_ord_id = order.cl_ord_id.clone();
+                        self.set_order_canceling(side, level, current_time_ns);
+                        decisions.push(OrderDecision::Cancel { cl_ord_id });
+                        continue;
                     }
                 }
-            } else {
-                // At max long - cancel any existing bid at this level
-                if let Some(bid) = &self.bid_orders[level] {
-                    if bid.state != OrderState::Canceling {
-                        let cl_ord_id = bid.cl_ord_id.clone();
-                        debug!(
-                            "[{}] At max long position ({:.2} > {:.2}), canceling bid L{}",
-                            self.config.symbol, position_dollar, max_position, level
-                        );
-                        self.set_order_canceling(Side::Buy, level, current_time_ns);
-                        decisions.push(OrderDecision::Cancel { cl_ord_id });
+                if qty > 0.0 {
+                    if let Some(decision) = self.process_side_level(side, level, price, qty, current_time_ns) {
+                        decisions.push(decision);
                     }
                 }
             }
+        }
+    }
 
-            // Process ASK side (sell) - skip if at max short position
-            if !at_max_short {
-                let would_exceed = hard_position_cap.is_some()
-                    && self.ask_orders[level].is_none()
-                    && position_dollar
-                        - self.outstanding_notional(Side::Sell)
-                        - quote.ask_prices[level] * ask_quantity
-                        < -max_position;
-                if !would_exceed && ask_quantity > 0.0 {
-                    if let Some(decision) = self.process_side_level(
-                    Side::Sell,
-                    level,
-                    quote.ask_prices[level],
-                    ask_quantity,
-                    current_time_ns,
-                    ) {
-                        decisions.push(decision);
-                    }
-                }
-            } else {
-                // At max short - cancel any existing ask at this level
-                if let Some(ask) = &self.ask_orders[level] {
-                    if ask.state != OrderState::Canceling {
-                        let cl_ord_id = ask.cl_ord_id.clone();
-                        debug!(
-                            "[{}] At max short position ({:.2} < -{:.2}), canceling ask L{}",
-                            self.config.symbol, position_dollar, max_position, level
-                        );
-                        self.set_order_canceling(Side::Sell, level, current_time_ns);
+    fn cancel_exposure(&mut self, decisions: &mut Vec<OrderDecision>, now: i64) {
+        for side in [Side::Buy, Side::Sell] {
+            for level in 0..MAX_ORDER_LEVELS {
+                let orders = if side == Side::Buy { &self.bid_orders } else { &self.ask_orders };
+                if let Some(order) = &orders[level] {
+                    if order.state != OrderState::Canceling {
+                        let cl_ord_id = order.cl_ord_id.clone();
+                        self.set_order_canceling(side, level, now);
                         decisions.push(OrderDecision::Cancel { cl_ord_id });
                     }
                 }
             }
         }
-
     }
 
-    /// Original constant-time production path. Optional canary caps take the
-    /// guarded branch above; their additional exposure scans never run here.
-    #[inline(always)]
-    fn on_quote_uncapped(
-        &mut self,
-        quote: &Quote,
-        current_time_ns: i64,
-        decisions: &mut Vec<OrderDecision>,
-    ) {
-        let position_dollar = self.position.get() * quote.mid_price;
-        let max_position = self.shared_equity.max_position_dollar();
-        let at_max_long = max_position > 0.0 && position_dollar > max_position;
-        let at_max_short = max_position > 0.0 && position_dollar < -max_position;
-        let num_levels = self.config.num_levels.min(quote.num_levels);
-        for level in 0..num_levels {
-            if !at_max_long {
-                if let Some(decision) = self.process_side_level(
-                    Side::Buy,
-                    level,
-                    quote.bid_prices[level],
-                    quote.quantity,
-                    current_time_ns,
-                ) {
-                    decisions.push(decision);
-                }
-            } else if let Some(bid) = &self.bid_orders[level] {
-                if bid.state != OrderState::Canceling {
-                    let cl_ord_id = bid.cl_ord_id.clone();
-                    self.set_order_canceling(Side::Buy, level, current_time_ns);
-                    decisions.push(OrderDecision::Cancel { cl_ord_id });
-                }
-            }
+    pub fn execution_state(&self) -> Arc<ExecutionState> { Arc::clone(&self.execution) }
 
-            if !at_max_short {
-                if let Some(decision) = self.process_side_level(
-                    Side::Sell,
-                    level,
-                    quote.ask_prices[level],
-                    quote.quantity,
-                    current_time_ns,
-                ) {
-                    decisions.push(decision);
-                }
-            } else if let Some(ask) = &self.ask_orders[level] {
-                if ask.state != OrderState::Canceling {
-                    let cl_ord_id = ask.cl_ord_id.clone();
-                    self.set_order_canceling(Side::Sell, level, current_time_ns);
-                    decisions.push(OrderDecision::Cancel { cl_ord_id });
-                }
-            }
-        }
-
-    }
-
-    #[inline]
-    fn outstanding_notional(&self, side: Side) -> f64 {
-        let orders = match side {
-            Side::Buy => &self.bid_orders,
-            Side::Sell => &self.ask_orders,
-        };
-        orders
-            .iter()
-            .flatten()
-            .map(|order| order.price * order.quantity)
-            .sum()
-    }
-
-    #[inline]
-    fn capped_quantity(&self, price: f64, quantity: f64) -> f64 {
-        let Some(max_notional) = self.config.max_order_qty_dollar else {
-            return quantity;
-        };
-        if price * quantity <= max_notional {
-            return quantity;
-        }
-        let lots = (max_notional / price / self.config.lot_size).floor();
-        lots * self.config.lot_size
+    pub fn set_precision(&mut self, tick: f64, lot: f64, min_qty: f64) {
+        self.config.tick_size = tick;
+        self.config.lot_size = lot;
+        self.config.min_order_qty = min_qty;
     }
 
     /// Process one side at a specific level and return decision.
@@ -669,19 +538,16 @@ impl OrderManager {
             Some(o) if o.state == OrderState::Pending => {
                 // Still pending - wait for confirmation
                 let age_secs = (current_time_ns - o.sent_at_ns) / 1_000_000_000;
-                if self.config.debug {
-                    info!(
-                        "[{}] {} L{} order blocked: pending confirmation for {} ({}s ago)",
-                        self.config.symbol, side, level, o.cl_ord_id, age_secs
-                    );
-                }
+                debug!(
+                    "[{}] {} L{} order blocked: pending confirmation for {} ({}s ago)",
+                    self.config.symbol, side, level, o.cl_ord_id, age_secs
+                );
                 None
             }
             Some(o) if o.state == OrderState::Canceling => {
                 // Cancel in progress - wait for confirmation
                 let age_secs = (current_time_ns - o.sent_at_ns) / 1_000_000_000;
-                // Always log at info level for Canceling - this blocks new orders
-                info!(
+                debug!(
                     "[{}] {} L{} order blocked: cancel pending for {} ({}s ago, order_id={:?})",
                     self.config.symbol, side, level, o.cl_ord_id, age_secs, o.order_id
                 );
@@ -694,7 +560,8 @@ impl OrderManager {
                 let order_too_old = self.config.max_live_age_ns > 0
                     && age_ns > self.config.max_live_age_ns as i64;
 
-                if price_changed || order_too_old {
+                let qty_changed = (o.quantity - qty).abs() >= self.config.lot_size * 0.5;
+                if price_changed || order_too_old || qty_changed {
                     let change_bps = ((new_price - o.price) / o.price).abs() * 10_000.0;
                     let age_secs = age_ns / 1_000_000_000;
 
@@ -715,11 +582,6 @@ impl OrderManager {
                     self.set_order_canceling(side, level, current_time_ns);
                     self.stats.reprices += 1;
 
-                    // Store pending price for immediate placement after cancel confirms
-                    match side {
-                        Side::Buy => self.pending_bid_prices[level] = Some((new_price, qty)),
-                        Side::Sell => self.pending_ask_prices[level] = Some((new_price, qty)),
-                    }
 
                     Some(OrderDecision::CancelAndReplace {
                         cancel_id,
@@ -752,83 +614,20 @@ impl OrderManager {
     /// the slot so new orders can be placed.
     #[inline]
     fn check_timeouts(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
-        let mut cancels = Vec::with_capacity(MAX_ORDER_LEVELS * 2); // At most 4 orders
-        let timeout_ns = self.config.pending_timeout_ns as i64;
-        let timeout_secs = timeout_ns / 1_000_000_000;
-
-        // Check bid orders at all levels - only timeout Pending or Canceling orders
-        // Live orders should NOT timeout - they're valid on the exchange
-        for level in 0..MAX_ORDER_LEVELS {
-            if let Some(order) = &self.bid_orders[level] {
-                // Skip Live orders - they don't need timeout checking
-                if order.state == OrderState::Live {
-                    // Live order is fine, no timeout needed
-                } else {
-                    let age_ns = current_time_ns - order.sent_at_ns;
-                    let age_secs = age_ns / 1_000_000_000;
-
-                    // Debug: log every check when order exists and is getting old
-                    if age_secs >= 50 {
-                        info!(
-                            "[{}] Timeout check: {} L{} order {} state={:?} age={}s timeout={}s",
-                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
-                        );
-                    }
-
-                    if age_ns > timeout_ns {
-                        warn!(
-                            "[{}] {} L{} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
-                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
-                        );
-                        cancels.push(OrderDecision::Cancel {
-                            cl_ord_id: order.cl_ord_id.clone(),
-                        });
-                        self.stats.timeouts += 1;
-                        // Clear order and any stale pending price for this slot
-                        self.bid_orders[level] = None;
-                        self.pending_bid_prices[level] = None;
-                    }
+        let mut decisions = Vec::new();
+        for orders in [&self.bid_orders, &self.ask_orders] {
+            for order in orders.iter().flatten() {
+                if order.state != OrderState::Live
+                    && current_time_ns - order.sent_at_ns > self.config.pending_timeout_ns as i64 {
+                    decisions.push(OrderDecision::Cancel { cl_ord_id: order.cl_ord_id.clone() });
                 }
             }
         }
-
-        // Check ask orders at all levels - only timeout Pending or Canceling orders
-        // Live orders should NOT timeout - they're valid on the exchange
-        for level in 0..MAX_ORDER_LEVELS {
-            if let Some(order) = &self.ask_orders[level] {
-                // Skip Live orders - they don't need timeout checking
-                if order.state == OrderState::Live {
-                    // Live order is fine, no timeout needed
-                } else {
-                    let age_ns = current_time_ns - order.sent_at_ns;
-                    let age_secs = age_ns / 1_000_000_000;
-
-                    // Debug: log every check when order exists and is getting old
-                    if age_secs >= 50 {
-                        info!(
-                            "[{}] Timeout check: {} L{} order {} state={:?} age={}s timeout={}s",
-                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
-                        );
-                    }
-
-                    if age_ns > timeout_ns {
-                        warn!(
-                            "[{}] {} L{} order {} ({:?}) timed out after {}s (>{}s) - CLEARING SLOT",
-                            self.config.symbol, order.side, level, order.cl_ord_id, order.state, age_secs, timeout_secs
-                        );
-                        cancels.push(OrderDecision::Cancel {
-                            cl_ord_id: order.cl_ord_id.clone(),
-                        });
-                        self.stats.timeouts += 1;
-                        // Clear order and any stale pending price for this slot
-                        self.ask_orders[level] = None;
-                        self.pending_ask_prices[level] = None;
-                    }
-                }
-            }
+        if !decisions.is_empty() {
+            self.stats.timeouts += decisions.len() as u64;
+            self.begin_reconciliation();
         }
-
-        cancels
+        decisions
     }
 
     /// Set order state to pending.
@@ -893,6 +692,17 @@ impl OrderManager {
             error!(
                 "[{}] Order identity conflict for {}: local={:?}, exchange={}",
                 self.config.symbol, cl_ord_id, existing_order_id, order_id
+            );
+            return false;
+        }
+
+        if order_id != 0
+            && self.bid_orders.iter().chain(self.ask_orders.iter()).flatten()
+                .any(|order| order.order_id == Some(order_id) && order.cl_ord_id != cl_ord_id)
+        {
+            error!(
+                "[{}] Exchange order_id {} already bound to another slot; rejecting {}",
+                self.config.symbol, order_id, cl_ord_id
             );
             return false;
         }
@@ -962,10 +772,6 @@ impl OrderManager {
         self.clear_order_by_cl_ord_id(cl_ord_id);
         self.stats.rejections += 1;
 
-        // Also clear pending price for this side/level to avoid placing stale orders
-        if let Some((side, level)) = order_info {
-            self.clear_pending_price(side, level);
-        }
 
         // Circuit breaker: pause trading after too many consecutive rejections
         self.consecutive_rejections += 1;
@@ -990,7 +796,7 @@ impl OrderManager {
         self.consecutive_rejections = 0;
         self.circuit_breaker_triggered_at_ms = 0;
         self.clear_pause_reason(PauseReason::CircuitBreaker);
-        let remaining = self.pause_reasons.load(Ordering::Acquire);
+        let remaining = self.execution.pause_reasons.load(Ordering::Acquire);
         if remaining == 0 {
             info!("[{}] Circuit breaker reset, trading resumed", self.config.symbol);
         } else {
@@ -998,29 +804,26 @@ impl OrderManager {
         }
     }
 
-    /// Check if circuit breaker should auto-recover.
-    /// Returns true if recovery occurred.
+    /// True once per trip when the cooldown has elapsed. The caller then
+    /// requests account reconciliation; trading resumes only if it verifies.
     pub fn check_circuit_breaker_recovery(&mut self, recovery_secs: u64) -> bool {
-        // Only check if circuit breaker is active and auto-recovery is enabled
-        if recovery_secs == 0 || self.circuit_breaker_triggered_at_ms == 0 {
+        self.has_pause_reason(PauseReason::CircuitBreaker)
+            && Self::cooldown_elapsed(&mut self.circuit_breaker_triggered_at_ms, recovery_secs)
+    }
+
+    fn cooldown_elapsed(triggered_at_ms: &mut u64, recovery_secs: u64) -> bool {
+        if recovery_secs == 0 || *triggered_at_ms == 0 {
             return false;
         }
-
-        // Only recover if circuit breaker bit is actually set
-        if !self.has_pause_reason(PauseReason::CircuitBreaker) {
-            return false;
-        }
-
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-
-        let elapsed_secs = (now_ms - self.circuit_breaker_triggered_at_ms) / 1000;
-
-        let _ = elapsed_secs;
-
-        false
+        if now_ms.saturating_sub(*triggered_at_ms) < recovery_secs.saturating_mul(1000) {
+            return false;
+        }
+        *triggered_at_ms = 0;
+        true
     }
 
     /// Trigger a safety pause from external signal (e.g., >2 orders detected).
@@ -1040,33 +843,11 @@ impl OrderManager {
             .as_millis() as u64;
     }
 
-    /// Check if safety pause should auto-recover.
-    /// Returns true if recovery occurred.
-    ///
-    /// Unlike circuit breaker which is triggered by rejections, safety pause
-    /// is triggered by detecting >2 orders on the exchange. Both have their
-    /// own recovery timers to allow independent tuning.
+    /// Safety pauses (duplicate orders, transport faults) use the same
+    /// cooldown-then-reconcile recovery with their own timer.
     pub fn check_safety_pause_recovery(&mut self, recovery_secs: u64) -> bool {
-        // Only check if safety pause is active and auto-recovery is enabled
-        if recovery_secs == 0 || self.safety_pause_triggered_at_ms == 0 {
-            return false;
-        }
-
-        // Only recover if safety pause bit is actually set
-        if !self.has_pause_reason(PauseReason::Safety) {
-            return false;
-        }
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let elapsed_secs = (now_ms - self.safety_pause_triggered_at_ms) / 1000;
-
-        let _ = elapsed_secs;
-
-        false
+        self.has_pause_reason(PauseReason::Safety)
+            && Self::cooldown_elapsed(&mut self.safety_pause_triggered_at_ms, recovery_secs)
     }
 
     /// Get consecutive rejection count.
@@ -1147,8 +928,8 @@ impl OrderManager {
         }
     }
 
-    /// Apply a correlated fill. Full fills free the slot; partial fills reduce
-    /// the tracked remaining quantity.
+    /// Apply a correlated fill. Full fills free the slot. Partial fills keep the
+    /// slot with its full quantity reserved until reconciliation verifies the remainder.
     pub fn on_order_fill(
         &mut self,
         order_id: i64,
@@ -1201,150 +982,39 @@ impl OrderManager {
     const MAX_CANCEL_FAILURES: u32 = 3;
 
     pub fn on_cancel_failed(&mut self, order_id: i64, reason: &str) {
-        warn!(
-            "[{}] Cancel failed for order {}: {}",
-            self.config.symbol, order_id, reason
-        );
-
-        // Find the order and handle the failure - search all levels
-        for level in 0..MAX_ORDER_LEVELS {
-            if let Some(order) = &mut self.bid_orders[level] {
-                if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
-                    order.cancel_fail_count += 1;
-
-                    // Repeated failures are ambiguous. Keep the slot and fail closed;
-                    // reconciliation will clear it only after REST verification.
-                    if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
-                        error!(
-                            "[{}] Bid L{} order {} exceeded {} cancel failures - pausing for reconciliation (order_id={}, cl_ord_id={})",
-                            self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
-                            order_id, order.cl_ord_id
-                        );
-                        self.set_pause_reason(PauseReason::Safety);
-                        self.set_pause_reason(PauseReason::Reconciliation);
-                    } else {
-                        // Revert to Live for retry
-                        order.state = OrderState::Live;
-                        debug!(
-                            "[{}] Reverted bid L{} order {} to Live state (fail count: {})",
-                            self.config.symbol, level, order_id, order.cancel_fail_count
-                        );
-                    }
-                    return;
-                }
+        warn!("[{}] Cancel failed for order {}: {}", self.config.symbol, order_id, reason);
+        let symbol = &self.config.symbol;
+        let mut fail_closed = false;
+        for order in self.bid_orders.iter_mut().chain(self.ask_orders.iter_mut()).flatten() {
+            if order.order_id != Some(order_id) || order.state != OrderState::Canceling {
+                continue;
             }
+            order.cancel_fail_count += 1;
+            if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
+                // Repeated failures are ambiguous. Keep the slot and fail closed;
+                // reconciliation will clear it only after REST verification.
+                error!(
+                    "[{}] {} L{} order {} exceeded {} cancel failures - pausing for reconciliation",
+                    symbol, order.side, order.level, order.cl_ord_id, Self::MAX_CANCEL_FAILURES
+                );
+                fail_closed = true;
+            } else {
+                order.state = OrderState::Live;
+                debug!(
+                    "[{}] Reverted {} L{} order {} to Live state (fail count: {})",
+                    symbol, order.side, order.level, order_id, order.cancel_fail_count
+                );
+            }
+            break;
         }
-
-        for level in 0..MAX_ORDER_LEVELS {
-            if let Some(order) = &mut self.ask_orders[level] {
-                if order.order_id == Some(order_id) && order.state == OrderState::Canceling {
-                    order.cancel_fail_count += 1;
-
-                    // Repeated failures are ambiguous. Keep the slot and fail closed;
-                    // reconciliation will clear it only after REST verification.
-                    if order.cancel_fail_count >= Self::MAX_CANCEL_FAILURES {
-                        error!(
-                            "[{}] Ask L{} order {} exceeded {} cancel failures - pausing for reconciliation (order_id={}, cl_ord_id={})",
-                            self.config.symbol, level, order_id, Self::MAX_CANCEL_FAILURES,
-                            order_id, order.cl_ord_id
-                        );
-                        self.set_pause_reason(PauseReason::Safety);
-                        self.set_pause_reason(PauseReason::Reconciliation);
-                    } else {
-                        // Revert to Live for retry
-                        order.state = OrderState::Live;
-                        debug!(
-                            "[{}] Reverted ask L{} order {} to Live state (fail count: {})",
-                            self.config.symbol, level, order_id, order.cancel_fail_count
-                        );
-                    }
-                    return;
-                }
-            }
+        if fail_closed {
+            self.set_pause_reason(PauseReason::Safety);
+            self.set_pause_reason(PauseReason::Reconciliation);
         }
     }
 
     // ========== Pending Order Handling ==========
 
-    /// Check if we have pending prices to place after a slot was cleared.
-    ///
-    /// This implements immediate order placement after cancel confirms,
-    /// avoiding the race condition where price changes during cancel wait.
-    /// Returns decisions for immediate order placement.
-    pub fn check_pending_orders(&mut self, current_time_ns: i64) -> Vec<OrderDecision> {
-        let mut decisions = Vec::new();
-
-        // Check bid orders at all levels - only place if slot is empty
-        for level in 0..MAX_ORDER_LEVELS {
-            if self.bid_orders[level].is_none() {
-                if let Some((price, qty)) = self.pending_bid_prices[level].take() {
-                    let cl_ord_id = self.generate_cl_ord_id(level);
-                    debug!(
-                        "[{}] Placing pending BID L{}: {:.2} x {:.6}, id={}",
-                        self.config.symbol, level, price, qty, cl_ord_id
-                    );
-                    self.set_order_pending(Side::Buy, level, cl_ord_id.clone(), price, qty, current_time_ns);
-                    self.stats.orders_sent += 1;
-                    self.last_order_sent_at_ms = current_time_ns.max(0) as u64 / 1_000_000;
-                    decisions.push(OrderDecision::Send {
-                        side: Side::Buy,
-                        level,
-                        price,
-                        qty,
-                        cl_ord_id,
-                    });
-                }
-            }
-        }
-
-        // Check ask orders at all levels - only place if slot is empty
-        for level in 0..MAX_ORDER_LEVELS {
-            if self.ask_orders[level].is_none() {
-                if let Some((price, qty)) = self.pending_ask_prices[level].take() {
-                    let cl_ord_id = self.generate_cl_ord_id(level);
-                    debug!(
-                        "[{}] Placing pending ASK L{}: {:.2} x {:.6}, id={}",
-                        self.config.symbol, level, price, qty, cl_ord_id
-                    );
-                    self.set_order_pending(Side::Sell, level, cl_ord_id.clone(), price, qty, current_time_ns);
-                    self.stats.orders_sent += 1;
-                    self.last_order_sent_at_ms = current_time_ns.max(0) as u64 / 1_000_000;
-                    decisions.push(OrderDecision::Send {
-                        side: Side::Sell,
-                        level,
-                        price,
-                        qty,
-                        cl_ord_id,
-                    });
-                }
-            }
-        }
-
-        decisions
-    }
-
-    /// Clear pending price for a side at a specific level (e.g., on rejection or timeout).
-    pub fn clear_pending_price(&mut self, side: Side, level: usize) {
-        if level >= MAX_ORDER_LEVELS {
-            return;
-        }
-        match side {
-            Side::Buy => self.pending_bid_prices[level] = None,
-            Side::Sell => self.pending_ask_prices[level] = None,
-        }
-    }
-
-    /// Clear all pending prices (e.g., on disconnect).
-    pub fn clear_all_pending_prices(&mut self) {
-        for level in 0..MAX_ORDER_LEVELS {
-            self.pending_bid_prices[level] = None;
-            self.pending_ask_prices[level] = None;
-        }
-    }
-
-    // ========== Order Lookup Helpers ==========
-
-    #[inline]
     fn find_order(&self, cl_ord_id: &str) -> Option<&LiveOrder> {
         for level in 0..MAX_ORDER_LEVELS {
             if let Some(order) = &self.bid_orders[level] {
@@ -1486,9 +1156,6 @@ impl OrderManager {
                         order.state = OrderState::Live;
                     }
                 }
-                if matches!(decision, OrderDecision::CancelAndReplace { .. }) {
-                    self.clear_all_pending_prices();
-                }
             }
             OrderDecision::NoAction => {}
         }
@@ -1507,7 +1174,7 @@ impl OrderManager {
     /// circuit breaker or safety pause is also active.
     pub fn resume(&self) {
         self.clear_pause_reason(PauseReason::OrderWebSocket);
-        let remaining = self.pause_reasons.load(Ordering::Acquire);
+        let remaining = self.execution.pause_reasons.load(Ordering::Acquire);
         if remaining == 0 {
             info!("[{}] Order manager resumed (WebSocket reconnected)", self.config.symbol);
         } else {
@@ -1517,31 +1184,34 @@ impl OrderManager {
 
     /// Check if trading is paused (any reason).
     pub fn is_paused(&self) -> bool {
-        self.pause_reasons.load(Ordering::Acquire) != 0
+        self.execution.pause_reasons.load(Ordering::Acquire) != 0
     }
 
     /// Set one independent pause reason.
     #[inline]
     pub fn set_pause_reason(&self, reason: PauseReason) {
-        self.pause_reasons.fetch_or(reason as u8, Ordering::Release);
+        let old = self.execution.pause_reasons.fetch_or(reason as u8, Ordering::AcqRel);
+        if old & reason as u8 == 0 {
+            self.execution.generation.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Clear one independent pause reason.
     #[inline]
     pub fn clear_pause_reason(&self, reason: PauseReason) {
-        self.pause_reasons.fetch_and(!(reason as u8), Ordering::Release);
+        self.execution.pause_reasons.fetch_and(!(reason as u8), Ordering::Release);
     }
 
     /// Test one pause reason.
     #[inline]
     pub fn has_pause_reason(&self, reason: PauseReason) -> bool {
-        self.pause_reasons.load(Ordering::Acquire) & reason as u8 != 0
+        self.execution.pause_reasons.load(Ordering::Acquire) & reason as u8 != 0
     }
 
     /// Return the active pause bitfield for diagnostics and tests.
     #[inline]
     pub fn pause_reason_bits(&self) -> u8 {
-        self.pause_reasons.load(Ordering::Acquire)
+        self.execution.pause_reasons.load(Ordering::Acquire)
     }
 
     /// Capture the first fresh position as the incremental exposure baseline.
@@ -1582,6 +1252,7 @@ impl OrderManager {
 
     /// Apply a verified account-wide reconciliation result.
     pub fn finish_reconciliation(&mut self) {
+        self.retired_generation = self.execution.generation();
         self.clear_all_orders();
         self.safety_pause_triggered_at_ms = 0;
         self.circuit_breaker_triggered_at_ms = 0;
@@ -1595,13 +1266,14 @@ impl OrderManager {
 
     /// Initiate graceful shutdown - stop placing new orders.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.execution.shutdown.store(true, Ordering::Release);
+        self.execution.generation.fetch_add(1, Ordering::AcqRel);
         info!("[{}] Order manager shutdown initiated", self.config.symbol);
     }
 
     /// Check if shutdown is in progress.
     pub fn is_shutting_down(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        self.execution.shutdown.load(Ordering::Acquire)
     }
 
     /// Get all tracked order client IDs for batch cancel on shutdown.
@@ -1639,29 +1311,10 @@ impl OrderManager {
                 self.ask_orders[level] = None;
             }
         }
-        // Also clear pending prices to avoid placing stale orders after state reset
-        self.clear_all_pending_prices();
     }
 
-    /// Get current bid order info at level 0 (for logging/monitoring).
-    /// For backward compatibility, returns the level 0 bid order.
-    pub fn bid_order(&self) -> Option<&LiveOrder> {
-        self.bid_orders[0].as_ref()
-    }
-
-    /// Get current ask order info at level 0 (for logging/monitoring).
-    /// For backward compatibility, returns the level 0 ask order.
-    pub fn ask_order(&self) -> Option<&LiveOrder> {
-        self.ask_orders[0].as_ref()
-    }
-
-    /// Get bid order at a specific level.
     pub fn bid_order_at(&self, level: usize) -> Option<&LiveOrder> {
-        if level < MAX_ORDER_LEVELS {
-            self.bid_orders[level].as_ref()
-        } else {
-            None
-        }
+        self.bid_orders.get(level).and_then(Option::as_ref)
     }
 
     /// Get ask order at a specific level.
@@ -1683,11 +1336,11 @@ mod tests {
     }
 
     /// Create SharedEquity with a given max_position_dollar.
-    /// Uses reverse formula: equity = max_position / 0.9 (since max_pos = equity * 0.9)
+    /// Uses reverse formula: equity = max_position / (0.82 * 0.9), above the minimum-order floor
     fn create_test_equity(max_position_dollar: f64) -> Arc<SharedEquity> {
         let equity = Arc::new(SharedEquity::new(1, 10.0, 1.0));
-        // Reverse the formula: max_pos = equity * 0.9 => equity = max_pos / 0.9
-        let raw_equity = max_position_dollar / 0.9;
+        // Reserve 18% of equity for one side of orders, then apply the 10% buffer.
+        let raw_equity = max_position_dollar / (0.82 * 0.9);
         equity.set_equity(raw_equity);
         equity
     }
@@ -1735,18 +1388,6 @@ mod tests {
             bid_floored: [false, false],
             ask_floored: [false, false],
         }
-    }
-
-    #[test]
-    fn test_new_order_manager() {
-        let position = create_test_position();
-        let equity = create_test_equity_high_limit();
-        let config = OrderManagerConfig::default();
-        let manager = OrderManager::new(config, position, equity);
-
-        assert!(manager.bid_order().is_none());
-        assert!(manager.ask_order().is_none());
-        assert_eq!(manager.stats().orders_sent, 0);
     }
 
     #[test]
@@ -1906,18 +1547,24 @@ mod tests {
         let decisions = manager.on_quote(&quote, 1_000_000_000);
 
         // Simulate acceptance
-        for decision in &decisions {
+        for (index, decision) in decisions.iter().enumerate() {
             if let OrderDecision::Send { cl_ord_id, .. } = decision {
-                manager.on_order_accepted(cl_ord_id, 1001);
+                assert!(manager.on_order_accepted(cl_ord_id, 1001 + index as i64));
             }
         }
 
-        // Large price change (100 bps)
+        // Large price change (100 bps): both live orders are replaced at the new
+        // prices and wait for cancel confirmation.
         let quote2 = create_test_quote(101000.0, 101100.0, 0.001);
-        let decisions2 = manager.on_quote(&quote2, 2_000_000_000);
-
-        // Should reprice
-        assert!(!decisions2.is_empty(), "Should reprice beyond threshold");
+        let mut replaced: Vec<f64> = manager.on_quote(&quote2, 2_000_000_000).iter().map(|d| match d {
+            OrderDecision::CancelAndReplace { new_price, .. } => *new_price,
+            other => panic!("unexpected {other:?}"),
+        }).collect();
+        replaced.sort_by(f64::total_cmp);
+        assert_eq!(replaced, vec![101000.0, 101100.0]);
+        assert_eq!(manager.bid_order_at(0).unwrap().state, OrderState::Canceling);
+        assert_eq!(manager.ask_order_at(0).unwrap().state, OrderState::Canceling);
+        assert_eq!(manager.stats().reprices, 2);
     }
 
     #[test]
@@ -2042,6 +1689,7 @@ mod tests {
         let config = OrderManagerConfig {
             num_levels: 2,
             lot_size: 0.00001,
+            min_order_qty: 0.00001,
             absolute_max_position_dollar: Some(50.0),
             position_limit_from_start: true,
             max_order_qty_dollar: Some(25.0),
@@ -2133,60 +1781,187 @@ mod tests {
         let quote = create_test_quote_2_levels(99000.0, 101000.0, 0.001);
         let decisions = manager.on_quote(&quote, 1_000_000_000);
 
-        // Should place 4 orders total (2 bids + 2 asks)
-        assert_eq!(decisions.len(), 4, "Should place 4 orders for 2-level mode");
-
-        // Check we have orders at both levels
-        let mut bid_levels = vec![];
-        let mut ask_levels = vec![];
-
-        for decision in &decisions {
-            if let OrderDecision::Send { side, level, .. } = decision {
-                match side {
-                    Side::Buy => bid_levels.push(*level),
-                    Side::Sell => ask_levels.push(*level),
-                }
-            }
-        }
-
-        assert!(bid_levels.contains(&0), "Should have bid at level 0");
-        assert!(bid_levels.contains(&1), "Should have bid at level 1");
-        assert!(ask_levels.contains(&0), "Should have ask at level 0");
-        assert!(ask_levels.contains(&1), "Should have ask at level 1");
+        // Four orders at the quoted level prices and quantity.
+        let mut sent: Vec<(Side, usize, f64, f64)> = decisions.iter().map(|d| match d {
+            OrderDecision::Send { side, level, price, qty, .. } => (*side, *level, *price, *qty),
+            other => panic!("unexpected {other:?}"),
+        }).collect();
+        sent.sort_by_key(|(side, level, ..)| (*side == Side::Sell, *level));
+        assert_eq!(sent, vec![
+            (Side::Buy, 0, 99000.0, 0.001), (Side::Buy, 1, 98990.0, 0.001),
+            (Side::Sell, 0, 101000.0, 0.001), (Side::Sell, 1, 101010.0, 0.001),
+        ]);
     }
 
     #[test]
     fn test_two_level_position_limit_cancels_both() {
         let position = create_test_position();
-        position.set(0.006); // 0.006 BTC position = $600 at $100k
-
-        // Set max_position to $500 via SharedEquity
         let equity = create_test_equity(500.0);
-        let config = OrderManagerConfig {
-            num_levels: 2,
-            ..OrderManagerConfig::default()
-        };
-        let mut manager = OrderManager::new(config, position, equity);
+        let config = OrderManagerConfig { num_levels: 2, ..OrderManagerConfig::default() };
+        let mut manager = OrderManager::new(config, Arc::clone(&position), equity);
 
-        // First place orders (simulating already having orders)
+        // Flat: all four orders go live.
         let quote = create_test_quote_2_levels(100000.0, 100100.0, 0.001);
-        let initial_decisions = manager.on_quote(&quote, 1_000_000_000);
-
-        // Accept only the sell orders (we're over max long so no buys should be placed)
-        for decision in &initial_decisions {
-            if let OrderDecision::Send { side: Side::Sell, cl_ord_id, .. } = decision {
-                manager.on_order_accepted(cl_ord_id, 1001);
-            }
+        for (index, decision) in manager.on_quote(&quote, 1_000_000_000).iter().enumerate() {
+            let OrderDecision::Send { cl_ord_id, .. } = decision else { panic!("unexpected {decision:?}") };
+            assert!(manager.on_order_accepted(cl_ord_id, 1001 + index as i64));
         }
 
-        // At max long, should not place any buy orders at either level
-        assert!(!initial_decisions.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Buy, .. })),
-            "Should not place buy orders when at max long position");
+        // $600 long against a $500 limit: both bids are canceled, asks stay untouched.
+        position.set(0.006);
+        let decisions = manager.on_quote(&quote, 2_000_000_000);
+        assert_eq!(decisions.len(), 2, "{decisions:?}");
+        assert!(decisions.iter().all(|d| matches!(d, OrderDecision::Cancel { .. })));
+        for level in 0..2 {
+            assert_eq!(manager.bid_order_at(level).unwrap().state, OrderState::Canceling);
+            assert_eq!(manager.ask_order_at(level).unwrap().state, OrderState::Live);
+        }
+        assert!(manager.on_quote(&quote, 3_000_000_000).is_empty(), "cancel is not repeated");
+    }
 
-        // Should only have sell orders (at both levels)
-        let sell_count = initial_decisions.iter()
-            .filter(|d| matches!(d, OrderDecision::Send { side: Side::Sell, .. }))
-            .count();
-        assert_eq!(sell_count, 2, "Should have 2 sell orders (one per level) when at max long");
+    #[test]
+    fn duplicate_exchange_id_is_rejected_and_cancel_failures_fail_closed() {
+        let mut manager = OrderManager::new(OrderManagerConfig::default(), create_test_position(), create_test_equity_high_limit());
+        let quote = create_test_quote(100000.0, 100100.0, 0.001);
+        let ids: Vec<String> = manager.on_quote(&quote, 1_000_000_000).into_iter().map(|d| match d {
+            OrderDecision::Send { cl_ord_id, .. } => cl_ord_id,
+            other => panic!("unexpected {other:?}"),
+        }).collect();
+        assert!(manager.on_order_accepted(&ids[0], 7));
+        assert!(!manager.on_order_accepted(&ids[1], 7), "one exchange id cannot own two slots");
+        assert!(manager.on_order_accepted(&ids[1], 8));
+
+        // Reprice puts both orders into Canceling; two cancel failures revert the
+        // bid for retry, the third fails closed and pauses for reconciliation.
+        let quote2 = create_test_quote(101000.0, 101100.0, 0.001);
+        assert_eq!(manager.on_quote(&quote2, 2_000_000_000).len(), 2);
+        for expected_count in 1..3 {
+            manager.on_cancel_failed(7, "busy");
+            let bid = manager.bid_order_at(0).unwrap();
+            assert_eq!((bid.state, bid.cancel_fail_count), (OrderState::Live, expected_count));
+            assert_eq!(manager.on_quote(&quote2, 3_000_000_000).len(), 1, "cancel is re-issued");
+        }
+        manager.on_cancel_failed(7, "busy");
+        assert_eq!(manager.bid_order_at(0).unwrap().state, OrderState::Canceling);
+        assert!(manager.has_pause_reason(PauseReason::Safety));
+        assert!(manager.has_pause_reason(PauseReason::Reconciliation));
+        assert!(manager.on_quote(&quote2, 4_000_000_000).is_empty(), "paused");
+    }
+
+    #[test]
+    fn circuit_breaker_recovers_only_after_cooldown_and_verified_reconciliation() {
+        let mut manager = OrderManager::new(OrderManagerConfig::default(), create_test_position(), create_test_equity_high_limit());
+        let quote = create_test_quote(100000.0, 100100.0, 0.001);
+        for attempt in 0..3_i64 {
+            for decision in manager.on_quote(&quote, 1_000_000_000 + attempt) {
+                let OrderDecision::Send { cl_ord_id, .. } = decision else { panic!("unexpected {decision:?}") };
+                manager.on_order_rejected(&cl_ord_id, "post-only would cross");
+            }
+        }
+        assert!(manager.has_pause_reason(PauseReason::CircuitBreaker));
+        assert!(manager.on_quote(&quote, 2_000_000_000).is_empty());
+        assert!(!manager.check_circuit_breaker_recovery(0), "0 disables the cooldown");
+        assert!(!manager.check_circuit_breaker_recovery(300), "cooldown has not elapsed");
+        manager.circuit_breaker_triggered_at_ms -= 301_000;
+        assert!(manager.check_circuit_breaker_recovery(300));
+        assert!(!manager.check_circuit_breaker_recovery(300), "reported once per trip");
+        assert!(manager.has_pause_reason(PauseReason::CircuitBreaker), "paused until reconciliation verifies");
+        manager.finish_reconciliation();
+        assert!(!manager.is_paused());
+        assert_eq!(manager.on_quote(&quote, 3_000_000_000).len(), 2);
+    }
+
+    #[test]
+    fn dispatch_failure_rolls_back_local_state() {
+        let mut manager = OrderManager::new(OrderManagerConfig::default(), create_test_position(), create_test_equity_high_limit());
+        let quote = create_test_quote(100000.0, 100100.0, 0.001);
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+        manager.on_dispatch_failed(&decisions[0]);
+        assert!(manager.bid_order_at(0).is_none(), "a send that never left frees the slot");
+        let OrderDecision::Send { cl_ord_id, .. } = &decisions[1] else { panic!("unexpected {decisions:?}") };
+        assert!(manager.on_order_accepted(cl_ord_id, 9));
+
+        let quote2 = create_test_quote(101000.0, 101100.0, 0.001);
+        let decisions2 = manager.on_quote(&quote2, 2_000_000_000);
+        let cancel = decisions2.iter().find(|d| matches!(d, OrderDecision::CancelAndReplace { .. })).unwrap();
+        assert_eq!(manager.ask_order_at(0).unwrap().state, OrderState::Canceling);
+        manager.on_dispatch_failed(cancel);
+        assert_eq!(manager.ask_order_at(0).unwrap().state, OrderState::Live, "a cancel that never left reverts");
+    }
+
+    #[test]
+    fn default_limit_reserves_all_levels_and_cancels_when_equity_falls() {
+        let position = create_test_position();
+        position.set(7.30);
+        let equity = create_test_equity(738.0);
+        let mut manager = OrderManager::new(OrderManagerConfig {
+            num_levels: 2, lot_size: 0.01, min_order_qty: 0.01,
+            min_order_qty_dollar: 1.0, ..OrderManagerConfig::default()
+        }, position, Arc::clone(&equity));
+        let quote = create_test_quote_2_levels(99.0, 101.0, 0.9);
+        let decisions = manager.on_quote(&quote, 1_000_000_000);
+        let buys: f64 = decisions.iter().filter_map(|d| match d {
+            OrderDecision::Send { side: Side::Buy, qty, price, .. } => Some(qty * price.max(100.0)), _ => None,
+        }).sum();
+        assert!(buys > 0.0 && 730.0 + buys <= 738.0 + 1e-9);
+        equity.set_equity(500.0);
+        let decisions = manager.on_quote(&quote, 2_000_000_000);
+        assert!(decisions.iter().any(|d| matches!(d, OrderDecision::Cancel { .. })));
+        assert!(!decisions.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Buy, .. })));
+        assert!(manager.bid_order_at(0).is_some(), "canceling exposure remains reserved");
+    }
+
+    #[test]
+    fn invalid_limits_and_incremental_caps_never_disable_absolute_limit() {
+        let position = create_test_position();
+        position.set(10.0);
+        let equity = create_test_equity(500.0);
+        let mut manager = OrderManager::new(OrderManagerConfig {
+            position_limit_from_start: true, absolute_max_position_dollar: Some(50.0),
+            ..OrderManagerConfig::default()
+        }, position, Arc::clone(&equity));
+        manager.initialize_position_baseline();
+        let quote = create_test_quote(99.0, 101.0, 0.2);
+        let orders = manager.on_quote(&quote, 1_000_000_000);
+        assert!(!orders.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Buy, .. })));
+        assert!(orders.iter().any(|d| matches!(d, OrderDecision::Send { side: Side::Sell, .. })));
+        equity.set_equity(0.0);
+        let orders = manager.on_quote(&quote, 2_000_000_000);
+        assert!(orders.iter().all(|d| matches!(d, OrderDecision::Cancel { .. })));
+        assert!(manager.has_pause_reason(PauseReason::RiskData));
+    }
+
+    #[test]
+    fn precision_minimum_and_quantity_validation_apply_to_replacements() {
+        let mut manager = OrderManager::new(OrderManagerConfig {
+            min_order_qty_dollar: 1.0, lot_size: 0.01, min_order_qty: 0.01,
+            ..OrderManagerConfig::default()
+        }, create_test_position(), create_test_equity_high_limit());
+        let quote = create_test_quote(99.0, 101.0, 0.129);
+        let first = manager.on_quote(&quote, 1_000_000_000);
+        for (i, d) in first.iter().enumerate() {
+            if let OrderDecision::Send { cl_ord_id, qty, .. } = d {
+                assert!((*qty - 0.12).abs() < 1e-12);
+                manager.on_order_accepted(cl_ord_id, i as i64 + 1);
+            }
+        }
+        manager.set_precision(0.1, 0.1, 0.2);
+        let next = manager.on_quote(&quote, 2_000_000_000);
+        assert_eq!(next.len(), 2);
+        assert!(next.iter().all(|d| matches!(d, OrderDecision::Cancel { .. })));
+        manager.on_order_canceled(1); manager.on_order_canceled(2);
+        assert!(manager.on_quote(&quote, 3_000_000_000).is_empty());
+        let mut invalid = quote;
+        invalid.quantity = f64::NAN;
+        assert!(manager.on_quote(&invalid, 4_000_000_000).is_empty());
+    }
+
+    #[test]
+    fn timed_out_slots_are_retained_until_verified_reconciliation() {
+        let mut manager = OrderManager::new(OrderManagerConfig::default(), create_test_position(), create_test_equity_high_limit());
+        manager.on_quote(&create_test_quote(99.0, 101.0, 1.0), 1);
+        assert!(!manager.check_timeouts_now(10_000_000_000).is_empty());
+        assert_eq!(manager.get_all_live_order_ids().len(), 2);
+        assert!(manager.has_pause_reason(PauseReason::Reconciliation));
     }
 }

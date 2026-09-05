@@ -16,13 +16,10 @@ futures-util = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
-
-# Decimal precision for financial data
-rust_decimal = { version = "1.33", features = ["serde", "serde-with-str"] }
 
 # Logging
 tracing = "0.1"
@@ -32,12 +29,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 anyhow = "1.0"
 
-# Lock-free data structures
-crossbeam-utils = "0.8"
+# Shared diagnostic snapshots
 parking_lot = "0.12"
-
-# URL parsing
-url = "2.5"
 
 # HTTP client
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
@@ -73,7 +66,8 @@ harness = false
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Supervised task panics must reach the common cleanup path.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

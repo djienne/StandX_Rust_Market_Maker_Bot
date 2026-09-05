@@ -45,6 +45,10 @@ pub struct WebSocketConfig {
     /// Stale connection timeout in seconds (force reconnect if no message)
     #[serde(default = "default_stale_timeout")]
     pub stale_timeout_secs: u64,
+
+    /// Maximum age of valid depth, independent of transport heartbeat traffic.
+    #[serde(default = "default_depth_stale_timeout")]
+    pub depth_stale_timeout_secs: u64,
 }
 
 impl Default for WebSocketConfig {
@@ -56,6 +60,7 @@ impl Default for WebSocketConfig {
             max_reconnect_delay_secs: default_max_reconnect_delay(),
             connect_timeout_secs: default_connect_timeout(),
             stale_timeout_secs: default_stale_timeout(),
+            depth_stale_timeout_secs: default_depth_stale_timeout(),
         }
     }
 }
@@ -103,6 +108,8 @@ fn default_max_reconnect_delay() -> u64 {
 fn default_connect_timeout() -> u64 {
     30
 }
+
+fn default_depth_stale_timeout() -> u64 { 5 }
 
 fn default_stale_timeout() -> u64 {
     60
@@ -259,11 +266,11 @@ impl StrategyConfig {
     /// If `c1` is set (> 0), returns it directly.
     /// Otherwise falls back to `c1_ticks * tick_size` (deprecated).
     #[inline]
-    pub fn c1(&self) -> f64 {
+    pub fn c1(&self, tick_size: f64) -> f64 {
         if self.c1 > 0.0 {
             self.c1
         } else {
-            self.c1_ticks * self.tick_size
+            self.c1_ticks * tick_size
         }
     }
 
@@ -346,14 +353,14 @@ pub struct OrderConfig {
     #[serde(default = "default_circuit_breaker_rejections")]
     pub circuit_breaker_rejections: u32,
 
-    /// Circuit breaker auto-recovery: resume trading after N seconds (default: 300 = 5 minutes)
-    /// Set to 0 to disable auto-recovery (manual reset required)
+    /// Circuit breaker cooldown in seconds (default: 300). After it elapses an
+    /// account reconciliation runs; trading resumes only when that verifies.
+    /// Set to 0 to recover only through an unrelated reconciliation.
     #[serde(default = "default_circuit_breaker_recovery_secs")]
     pub circuit_breaker_recovery_secs: u64,
 
-    /// Safety pause recovery: resume trading after N seconds when >2 orders detected (default: 30)
-    /// This handles rare edge cases where duplicate/stuck orders accumulate.
-    /// Set to 0 to disable auto-recovery (manual intervention required)
+    /// Safety pause cooldown in seconds (default: 30), with the same
+    /// reconcile-then-resume recovery as the circuit breaker.
     #[serde(default = "default_safety_pause_recovery_secs")]
     pub safety_pause_recovery_secs: u64,
 
@@ -501,10 +508,6 @@ pub struct Config {
     #[serde(default = "default_history_minutes")]
     pub history_minutes: u64,
 
-    /// Size of the history ring buffer (number of snapshots)
-    #[serde(default = "default_history_buffer_size")]
-    pub history_buffer_size: usize,
-
     /// WebSocket configuration
     #[serde(default)]
     pub websocket: WebSocketConfig,
@@ -547,7 +550,7 @@ pub struct Config {
 }
 
 fn default_symbols() -> Vec<String> {
-    vec!["TEST-USD".to_string()]
+    vec!["BTC-USD".to_string()]
 }
 
 fn default_orderbook_levels() -> usize {
@@ -556,10 +559,6 @@ fn default_orderbook_levels() -> usize {
 
 fn default_history_minutes() -> u64 {
     10
-}
-
-fn default_history_buffer_size() -> usize {
-    100_000
 }
 
 fn default_stats_interval() -> u64 {
@@ -576,7 +575,6 @@ impl Default for Config {
             symbols: default_symbols(),
             orderbook_levels: default_orderbook_levels(),
             history_minutes: default_history_minutes(),
-            history_buffer_size: default_history_buffer_size(),
             websocket: WebSocketConfig::default(),
             verbose: false,
             stats_interval_secs: default_stats_interval(),
@@ -643,12 +641,6 @@ impl Config {
         if self.history_minutes == 0 {
             return Err(ConfigError::ValidationError(
                 "history_minutes must be greater than 0".to_string()
-            ));
-        }
-
-        if self.history_buffer_size < 1000 {
-            return Err(ConfigError::ValidationError(
-                "history_buffer_size must be at least 1000".to_string()
             ));
         }
 
@@ -754,7 +746,13 @@ impl Config {
             }
         }
 
+        if self.websocket.depth_stale_timeout_secs == 0 {
+            return Err(ConfigError::ValidationError("depth_stale_timeout_secs must be positive".into()));
+        }
         if self.order.enabled {
+            if self.symbols != ["BTC-USD"] {
+                return Err(ConfigError::ValidationError("live trading supports only a single BTC-USD symbol".into()));
+            }
             if !self.position.enabled {
                 return Err(ConfigError::ValidationError(
                     "position.enabled must be true when order.enabled is true".to_string(),
@@ -832,17 +830,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let config = Config::default();
-        assert_eq!(config.symbols, vec!["TEST-USD"]);
-        assert_eq!(config.orderbook_levels, 20);
-        assert_eq!(config.history_minutes, 10);
-        assert!(config.order.enabled);
-        assert!(config.pnl_tracking.enabled);
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
     fn order_placement_is_default_and_observe_only_is_explicit() {
         let live = Config::from_str(r#"{"symbols":["BTC-USD"]}"#).unwrap();
         assert!(live.order.enabled);
@@ -867,6 +854,7 @@ mod tests {
     fn test_parse_config() {
         let json = r#"{
             "symbols": ["TEST-USD", "ETH-USD"],
+            "order": {"enabled": false},
             "orderbook_levels": 10,
             "history_minutes": 5
         }"#;
@@ -936,6 +924,20 @@ mod tests {
         assert!(config.validate().is_err());
         config.pnl_tracking.enabled = true;
         config.pnl_tracking.stale_threshold_secs = config.pnl_tracking.poll_interval_secs;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn live_is_btc_only_and_depth_timeout_must_be_positive() {
+        for symbols in [vec!["ETH-USD".into()], vec!["BTC-USD".into(), "ETH-USD".into()]] {
+            let mut config = Config { symbols, ..Config::default() };
+            assert!(config.validate().is_err());
+            config.order.enabled = false;
+            assert!(config.validate().is_ok());
+        }
+        let mut config = Config::default();
+        assert_eq!(config.websocket.depth_stale_timeout_secs, 5);
+        config.websocket.depth_stale_timeout_secs = 0;
         assert!(config.validate().is_err());
     }
 }

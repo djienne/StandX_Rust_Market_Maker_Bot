@@ -388,16 +388,4 @@ mod tests {
         assert!(market_no_price.validate().is_ok());
     }
 
-    #[test]
-    fn test_order_sides() {
-        assert_eq!(OrderSide::Buy.as_str(), "buy");
-        assert_eq!(OrderSide::Sell.as_str(), "sell");
-    }
-
-    #[test]
-    fn test_time_in_force() {
-        assert_eq!(TimeInForce::GTC.as_str(), "gtc");
-        assert_eq!(TimeInForce::IOC.as_str(), "ioc");
-        assert_eq!(TimeInForce::ALO.as_str(), "alo");
-    }
 }

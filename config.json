@@ -2,7 +2,6 @@
   "symbols": ["BTC-USD"],
   "orderbook_levels": 20,
   "history_minutes": 10,
-  "history_buffer_size": 100000,
   "debug": true,
   "verbose": false,
   "stats_interval_secs": 30,
@@ -42,7 +41,7 @@
   },
   "orderbook_sanity_check": {
     "enabled": true,
-    "interval_secs": 2,
+    "interval_secs": 30,
     "drift_threshold_bps": 2.0
   }
 }

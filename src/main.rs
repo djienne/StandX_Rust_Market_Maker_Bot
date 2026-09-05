@@ -22,9 +22,10 @@ use standx_orderbook::{
     OpenOrdersSnapshot,
     SharedSymbolInfo, SymbolInfoPoller, SymbolInfoPollerConfig, SymbolInfoPollerHandle, TickSizeChangedSignal,
     SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
-    SharedBbo, BinanceBboPollerHandle, start_binance_bbo_poller,
 };
 use standx_orderbook::trading::SharedEquity;
+use standx_orderbook::trading::order_manager::ExecutionState;
+use standx_orderbook::websocket::monotonic_time_ns;
 use standx_orderbook::trading::TradingStats;
 use standx_orderbook::trading::{OrderWsClient, OrderEvent, NewOrderRequest, StandXClient};
 
@@ -43,6 +44,8 @@ struct ReconciliationRequest {
 
 async fn run_reconciliation_worker(
     auth: Arc<Mutex<AuthManager>>,
+    client: Arc<OrderWsClient>,
+    execution: Arc<ExecutionState>,
     mut requests: mpsc::UnboundedReceiver<ReconciliationRequest>,
     results: mpsc::Sender<ReconciliationResult>,
 ) {
@@ -58,16 +61,7 @@ async fn run_reconciliation_worker(
         let mut attempt = 0_u32;
         loop {
             attempt = attempt.saturating_add(1);
-            let outcome = {
-                let mut auth = auth.lock().await;
-                match auth.cancel_all_orders(None).await {
-                    Ok(_) => auth
-                        .query_open_orders(None)
-                        .await
-                        .map(|orders| orders.is_empty()),
-                    Err(error) => Err(error),
-                }
-            };
+            let outcome = cleanup_attempt(&auth, Some((&client, &execution))).await;
 
             match outcome {
                 Ok(true) => {
@@ -82,7 +76,7 @@ async fn run_reconciliation_worker(
                 }
                 Ok(false) => {
                     error!(
-                        "Reconciliation attempt {} left open orders; trading remains paused",
+                        "Reconciliation attempt {} has open orders or unresolved submissions; trading remains paused",
                         attempt
                     );
                 }
@@ -106,39 +100,17 @@ async fn cancel_all_and_verify(
     auth: &Arc<Mutex<AuthManager>>,
     context: &str,
     max_attempts: u32,
+    execution: Option<(&OrderWsClient, &ExecutionState)>,
 ) -> bool {
     for attempt in 1..=max_attempts {
-        let outcome = {
-            let mut auth = auth.lock().await;
-            match auth.cancel_all_orders(None).await {
-                Ok(canceled) => auth
-                    .query_open_orders(None)
-                    .await
-                    .map(|remaining| (canceled, remaining.len())),
-                Err(error) => Err(error),
-            }
-        };
-
+        let outcome = cleanup_attempt(auth, execution).await;
         match outcome {
-            Ok((canceled, 0)) => {
-                info!(
-                    "{} cleanup verified: canceled {} order(s), zero account orders remain",
-                    context, canceled
-                );
+            Ok(true) => {
+                info!("{} cleanup verified: submissions settled and zero account orders remain", context);
                 return true;
             }
-            Ok((canceled, remaining)) => {
-                error!(
-                    "{} cleanup attempt {}/{} canceled {} order(s), but {} remain",
-                    context, attempt, max_attempts, canceled, remaining
-                );
-            }
-            Err(error) => {
-                error!(
-                    "{} cleanup attempt {}/{} failed: {}",
-                    context, attempt, max_attempts, error
-                );
-            }
+            Ok(false) => error!("{} cleanup attempt {}/{}: open orders or unresolved submissions remain", context, attempt, max_attempts),
+            Err(error) => error!("{} cleanup attempt {}/{} failed: {}", context, attempt, max_attempts, error),
         }
 
         if attempt < max_attempts {
@@ -151,6 +123,21 @@ async fn cancel_all_and_verify(
         context
     );
     false
+}
+
+async fn cleanup_attempt(
+    auth: &Arc<Mutex<AuthManager>>,
+    execution: Option<(&OrderWsClient, &ExecutionState)>,
+) -> Result<bool, standx_orderbook::trading::AuthError> {
+    if let Some((client, state)) = execution {
+        let _submission = state.submission.lock().await;
+        let mut auth = auth.lock().await;
+        client.cancel_and_verify(&mut auth).await
+    } else {
+        let mut auth = auth.lock().await;
+        auth.cancel_all_orders(None).await?;
+        Ok(auth.query_open_orders(None).await?.is_empty())
+    }
 }
 
 async fn log_account_positions(auth: &Arc<Mutex<AuthManager>>, context: &str) {
@@ -244,11 +231,9 @@ impl StatsTracker {
                 .unwrap_or_default();
 
             info!(
-                "[{}] updates={} history={}/{} bid={:.2} ask={:.2} spread={:.4} {}",
+                "[{}] updates={} bid={:.2} ask={:.2} spread={:.4} {}",
                 stat.symbol,
                 stat.update_count,
-                stat.history_count,
-                config.history_buffer_size,
                 stat.best_bid.unwrap_or(0.0),
                 stat.best_ask.unwrap_or(0.0),
                 stat.spread.unwrap_or(0.0),
@@ -299,10 +284,10 @@ impl StatsTracker {
                 };
 
                 // Build live orders string
-                let bid_info = manager.bid_order()
+                let bid_info = manager.bid_order_at(0)
                     .map(|o| format!("bid@{:.2}", o.price))
                     .unwrap_or_else(|| "no bid".to_string());
-                let ask_info = manager.ask_order()
+                let ask_info = manager.ask_order_at(0)
                     .map(|o| format!("ask@{:.2}", o.price))
                     .unwrap_or_else(|| "no ask".to_string());
 
@@ -336,12 +321,11 @@ impl StatsTracker {
         } else {
             warn!(
                 "TEST/OBSERVE-ONLY MODE: {} messages ({:.1}/sec), {} quotes ({:.1}/sec), \
-                 {} total history entries; order.enabled=false, so no orders will be placed",
+                 order.enabled=false, so no orders will be placed",
                 self.message_count,
                 rate,
                 self.quote_count,
                 quote_rate,
-                stats.iter().map(|s| s.history_count).sum::<usize>(),
             );
         }
 
@@ -361,6 +345,44 @@ impl StatsTracker {
     }
 }
 
+#[derive(Default)]
+struct DepthState {
+    received_at: i64,
+    sequence: u64,
+    server_time: i64,
+    stale: bool,
+}
+
+impl DepthState {
+    fn accept(&mut self, book: &OrderbookSnapshot, now: i64, max_age: i64) -> bool {
+        if book.validate().is_err() || book.received_at_ns <= 0
+            || now - book.received_at_ns >= max_age
+            || book.received_at_ns < self.received_at
+            || (book.sequence == 0 && book.timestamp_ns == 0)
+            || (self.sequence > 0 && book.sequence > 0 && book.sequence <= self.sequence)
+            || (self.server_time > 0 && book.timestamp_ns > 0 && book.timestamp_ns < self.server_time)
+            || (book.sequence == 0 && book.timestamp_ns <= self.server_time) {
+            return false;
+        }
+        self.received_at = book.received_at_ns;
+        self.sequence = book.sequence;
+        self.server_time = book.timestamp_ns;
+        self.stale = false;
+        true
+    }
+}
+
+async fn shutdown_requested() {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! { _ = signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    { let _ = signal::ctrl_c().await; }
+}
+
 /// Application state.
 struct App {
     /// Configuration
@@ -375,17 +397,10 @@ struct App {
     symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
     /// Shared equity for automatic order sizing (lock-free reads)
     shared_equity: Arc<SharedEquity>,
-    /// Shared Binance BBO for lock-free reads (optional)
-    #[allow(dead_code)]
-    shared_binance_bbo: Option<Arc<SharedBbo>>,
     /// Order managers per symbol
     order_managers: HashMap<String, QuoteOrderManager>,
     /// Channel to send order decisions to executor (uses Arc<str> for cheap clones)
-    order_tx: Option<mpsc::Sender<(Arc<str>, OrderDecision)>>,
-    /// Non-blocking diagnostic history channel; consumed off the quote path.
-    history_tx: mpsc::Sender<OrderbookSnapshot>,
-    /// History samples dropped because the cold-path recorder was saturated.
-    history_channel_drops: u64,
+    order_tx: Option<mpsc::Sender<(Arc<str>, u64, OrderDecision)>>,
     /// Cold-path account-wide reconciliation trigger.
     reconciliation_tx: Option<mpsc::UnboundedSender<ReconciliationRequest>>,
     reconciliation_generation: u64,
@@ -397,17 +412,10 @@ struct App {
     quote_formatter: QuoteFormatter,
     /// Statistics tracker (extracted to reduce App struct size)
     stats: StatsTracker,
-    /// Latest received_at timestamp from orderbook messages (nanoseconds).
-    ///
-    /// # Clock Source Design
-    /// This uses StandX server time (`received_at` from orderbook messages) rather than
-    /// local system time (`chrono::Utc::now()`). This ensures consistent timeout checking
-    /// since orders are also timestamped with `received_at` when created.
-    ///
-    /// Note: Other components use different clock sources:
-    /// - `order_manager.rs:189`: session_prefix uses local `chrono::Utc::now()` (for uniqueness only)
-    /// - `position.rs:52-57`: staleness check uses local `SystemTime::now()` (acceptable for staleness)
-    last_received_at_ns: i64,
+    depth: HashMap<String, DepthState>,
+    depth_connected_at: i64,
+    reconciliation_pending: bool,
+    reconciled_at_ns: i64,
     /// Order WebSocket connection state (for stats logging)
     order_ws_connected: bool,
     /// Order WebSocket authenticated state (for stats logging)
@@ -420,22 +428,8 @@ impl App {
         config: Config,
         symbol_infos: HashMap<String, Arc<SharedSymbolInfo>>,
         shared_binance_alpha: Option<Arc<SharedAlpha>>,
-        shared_binance_bbo: Option<Arc<SharedBbo>>,
     ) -> Self {
-        let store = Arc::new(OrderbookStore::new(
-            &config.symbols,
-            config.history_buffer_size,
-            config.history_minutes,
-        ));
-        let (history_tx, mut history_rx) = mpsc::channel::<OrderbookSnapshot>(4096);
-        let history_store = Arc::clone(&store);
-        tokio::spawn(async move {
-            while let Some(snapshot) = history_rx.recv().await {
-                if let Some(orderbook) = history_store.get(snapshot.symbol.as_str()) {
-                    orderbook.record_history(snapshot);
-                }
-            }
-        });
+        let store = Arc::new(OrderbookStore::new(&config.symbols));
 
         // Create SharedEquity for automatic order sizing
         let shared_equity = Arc::new(SharedEquity::new(
@@ -452,34 +446,11 @@ impl App {
         let mut decision_buffers = HashMap::new();
 
         for symbol in &config.symbols {
-            // Create strategy with shared symbol info, shared equity, and optional Binance alpha
-            let strategy = if let Some(shared_info) = symbol_infos.get(symbol) {
-                if let Some(ref binance_alpha) = shared_binance_alpha {
-                    // Full constructor with Binance alpha
-                    ObiStrategy::with_binance_alpha(
-                        config.strategy.clone(),
-                        Arc::clone(shared_info),
-                        Arc::clone(&shared_equity),
-                        Arc::clone(binance_alpha),
-                        config.history_minutes,
-                    )
-                } else {
-                    // Without Binance alpha
-                    ObiStrategy::with_shared_info(
-                        config.strategy.clone(),
-                        Arc::clone(shared_info),
-                        Arc::clone(&shared_equity),
-                        config.history_minutes,
-                    )
-                }
-            } else {
-                // Fallback to config-based tick_size (still uses shared_equity)
-                ObiStrategy::with_required_history(
-                    config.strategy.clone(),
-                    Arc::clone(&shared_equity),
-                    config.history_minutes,
-                )
-            };
+            let strategy = ObiStrategy::new(
+                config.strategy.clone(), symbol_infos.get(symbol).cloned(),
+                Some(Arc::clone(&shared_equity)), shared_binance_alpha.clone(),
+                config.history_minutes, config.websocket.depth_stale_timeout_secs,
+            );
             strategies.insert(symbol.clone(), strategy);
 
             let position = Arc::new(SharedPosition::new(symbol.clone()));
@@ -500,6 +471,8 @@ impl App {
                 max_live_age_ns: config.order.max_live_age_secs * 1_000_000_000,
                 tick_size,
                 lot_size,
+                min_order_qty: symbol_infos.get(symbol).map(|info| info.min_order_qty()).unwrap_or(lot_size),
+                min_order_qty_dollar: config.strategy.min_order_qty_dollar,
                 debug: config.debug,
                 circuit_breaker_rejections: config.order.circuit_breaker_rejections,
                 num_levels: config.strategy.order_levels,
@@ -530,6 +503,7 @@ impl App {
             (-tick_size.log10().floor()) as usize
         };
 
+        let depth = config.symbols.iter().map(|s| (s.clone(), DepthState::default())).collect();
         Self {
             config,
             store,
@@ -537,18 +511,18 @@ impl App {
             positions,
             symbol_infos,
             shared_equity,
-            shared_binance_bbo,
             order_managers,
             order_tx: None,
-            history_tx,
-            history_channel_drops: 0,
             reconciliation_tx: None,
             reconciliation_generation: 0,
             symbol_arcs,
             decision_buffers,
             quote_formatter: QuoteFormatter::new(price_precision, 4),
             stats: StatsTracker::new(),
-            last_received_at_ns: 0,
+            depth,
+            depth_connected_at: 0,
+            reconciliation_pending: false,
+            reconciled_at_ns: 0,
             order_ws_connected: false,
             order_ws_authenticated: false,
         }
@@ -576,6 +550,8 @@ impl App {
         }
 
         let equity_fresh = self.shared_equity.is_initialized()
+            && self.shared_equity.max_position_dollar().is_finite()
+            && self.shared_equity.max_position_dollar() > 0.0
             && self.shared_equity.age_ms()
                 <= self.config.pnl_tracking.stale_threshold_secs.saturating_mul(1000);
         let mut became_stale = false;
@@ -618,7 +594,7 @@ impl App {
     }
 
     /// Set the order decision channel.
-    fn set_order_tx(&mut self, tx: mpsc::Sender<(Arc<str>, OrderDecision)>) {
+    fn set_order_tx(&mut self, tx: mpsc::Sender<(Arc<str>, u64, OrderDecision)>) {
         self.order_tx = Some(tx);
     }
 
@@ -628,6 +604,8 @@ impl App {
 
     /// Pause every manager before scheduling account-wide cleanup.
     fn begin_account_reconciliation(&mut self, reason: impl Into<String>) {
+        if self.reconciliation_pending || !self.config.order.enabled { return; }
+        self.reconciliation_pending = true;
         for manager in self.order_managers.values_mut() {
             // Any cleanup can race an execution. Require two successful
             // position polls after reconciliation begins before quotes resume.
@@ -655,7 +633,10 @@ impl App {
     }
 
     fn finish_account_reconciliation(&mut self) {
+        self.reconciliation_pending = false;
+        self.reconciled_at_ns = standx_orderbook::current_time_ns();
         for manager in self.order_managers.values_mut() {
+            manager.require_position_refresh_after_fill();
             manager.finish_reconciliation();
         }
     }
@@ -703,6 +684,8 @@ impl App {
         &mut self,
         snapshot: &OpenOrdersSnapshot,
     ) -> Result<usize, String> {
+        if snapshot.observed_at_ns <= self.reconciled_at_ns { return Ok(0); }
+
         let manager = self
             .order_managers
             .get_mut(&snapshot.symbol)
@@ -799,12 +782,7 @@ impl App {
     /// Called periodically from the main event loop to ensure timeouts are
     /// enforced even when market data updates are sparse.
     fn check_order_timeouts(&mut self) {
-        if !self.config.order.enabled {
-            return;
-        }
-
-        // Skip if we haven't received any orderbook messages yet
-        if self.last_received_at_ns == 0 {
+        if !self.config.order.enabled || self.reconciliation_pending {
             return;
         }
 
@@ -815,16 +793,6 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as i64;
-
-        // Log clock drift periodically (every ~30s based on stats interval)
-        let drift_ms = (current_time_ns - self.last_received_at_ns) / 1_000_000;
-        if drift_ms.abs() > 5000 {
-            // Only log if drift > 5 seconds (significant)
-            debug!(
-                "Clock drift: system_time - server_time = {}ms",
-                drift_ms
-            );
-        }
 
         let mut dispatch_failed = false;
         let mut timed_out = false;
@@ -839,8 +807,8 @@ impl App {
                         .unwrap_or_else(|| Arc::from(symbol.as_str()));
                     for decision in timeout_decisions {
                         self.stats.order_decision_count += 1;
-                        if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), decision)) {
-                            let (_, failed_decision) = error.into_inner();
+                        if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), manager.execution_state().generation(), decision)) {
+                            let (_, _, failed_decision) = error.into_inner();
                             manager.on_dispatch_failed(&failed_decision);
                             manager.trigger_safety_pause("timeout cancel could not reach executor");
                             dispatch_failed = true;
@@ -860,33 +828,25 @@ impl App {
         if dispatch_failed {
             self.begin_account_reconciliation("timeout cancel could not reach executor");
         } else if timed_out {
-            // A timeout means the exchange outcome is unknown. The manager may
-            // clear its local slot, so pause before another quote event can use
-            // that slot and prove account-wide cleanup through REST.
+            // Timed-out slots retain exposure until verified account cleanup.
             self.begin_account_reconciliation("order or cancel response timed out");
         }
     }
 
-    /// Check circuit breaker auto-recovery for all order managers.
-    fn check_circuit_breaker_recovery(&mut self) {
-        if !self.config.order.enabled || self.config.order.circuit_breaker_recovery_secs == 0 {
+    /// Circuit-breaker and safety pauses recover through a verified account
+    /// reconciliation once their configured cooldown has elapsed.
+    fn check_pause_recovery(&mut self) {
+        let order = &self.config.order;
+        if !order.enabled {
             return;
         }
-
+        let mut due = false;
         for manager in self.order_managers.values_mut() {
-            manager.check_circuit_breaker_recovery(self.config.order.circuit_breaker_recovery_secs);
+            due |= manager.check_circuit_breaker_recovery(order.circuit_breaker_recovery_secs)
+                | manager.check_safety_pause_recovery(order.safety_pause_recovery_secs);
         }
-    }
-
-    /// Check safety pause auto-recovery for all order managers.
-    /// This is separate from circuit breaker recovery and handles the >2 orders case.
-    fn check_safety_pause_recovery(&mut self, recovery_secs: u64) {
-        if !self.config.order.enabled || recovery_secs == 0 {
-            return;
-        }
-
-        for manager in self.order_managers.values_mut() {
-            manager.check_safety_pause_recovery(recovery_secs);
+        if due {
+            self.begin_account_reconciliation("pause cooldown elapsed");
         }
     }
 
@@ -900,16 +860,37 @@ impl App {
         all_orders
     }
 
+    /// Returns true once per depth outage, independently of transport traffic.
+    fn check_depth_stale(&mut self, now: i64) -> bool {
+        let threshold = self.config.websocket.depth_stale_timeout_secs as i64 * 1_000_000_000;
+        let mut stale = false;
+        for symbol in &self.config.symbols {
+            let Some(depth) = self.depth.get_mut(symbol) else { continue; };
+            let last = if depth.received_at > 0 { depth.received_at } else { self.depth_connected_at };
+            if last > 0 && now - last >= threshold && !depth.stale {
+                depth.stale = true;
+                if let Some(strategy) = self.strategies.get_mut(symbol) { strategy.reset(); }
+                if let Some(manager) = self.order_managers.get(symbol) { manager.set_pause_reason(PauseReason::MarketData); }
+                stale = true;
+            }
+        }
+        if stale { self.begin_account_reconciliation("valid depth became stale"); }
+        stale
+    }
+
     /// Process a WebSocket event.
     fn process_event(&mut self, event: WsEvent) -> bool {
         match event {
             WsEvent::Connected => {
                 info!("Connected to StandX WebSocket");
+                self.depth_connected_at = monotonic_time_ns();
+                self.depth.values_mut().for_each(|state| *state = DepthState::default());
                 false
             }
             WsEvent::Disconnected(reason) => {
                 warn!("Disconnected: {}", reason);
-                self.last_received_at_ns = 0;
+                self.depth.values_mut().for_each(|state| *state = DepthState::default());
+                self.depth_connected_at = 0;
                 for strategy in self.strategies.values_mut() {
                     strategy.reset();
                 }
@@ -924,7 +905,7 @@ impl App {
                 false
             }
             WsEvent::ParseError(err) => {
-                debug!("Parse error: {}", err);
+                warn!("Parse error: {}", err);
                 false
             }
             WsEvent::Error(err) => {
@@ -935,177 +916,152 @@ impl App {
     }
 
     /// Process a parsed StandX message.
-    fn process_message(&mut self, msg: StandXMessage, received_at: i64) {
+    fn process_message(&mut self, msg: StandXMessage, _received_at: i64) {
         match msg {
-            StandXMessage::DepthBook(data) => {
+            StandXMessage::DepthBook(snapshot) => {
                 self.stats.message_count += 1;
-                // Update latest timestamp for timeout checking (same clock as order creation)
-                self.last_received_at_ns = received_at;
+                let symbol = snapshot.symbol;
+                let max_age = self.config.websocket.depth_stale_timeout_secs as i64 * 1_000_000_000;
+                let Some(depth) = self.depth.get_mut(symbol.as_str()) else { return; };
+                if !depth.accept(&snapshot, monotonic_time_ns(), max_age) {
+                    return;
+                }
 
-                // Convert to snapshot
-                match data.to_snapshot(self.config.orderbook_levels, received_at) {
-                    Ok(snapshot) => {
+                // Feed snapshot to OBI strategy FIRST (uses reference only)
+                // This allows us to move the snapshot to the store afterward without cloning
+                let mut quote_result = None;
+                let mut is_warming_up = false;
 
-                        // Validate orderbook integrity in debug builds only (no production latency)
-                        #[cfg(debug_assertions)]
-                        if self.stats.message_count % 100 == 1 {
-                            if let Err(e) = snapshot.validate() {
-                                error!("[{}] Orderbook validation failed: {}", data.symbol, e);
-                                debug!("[{}] {}", data.symbol, snapshot.debug_levels(5));
-                            }
-                        }
+                if let Some(strategy) = self.strategies.get_mut(symbol.as_str()) {
+                    // Update strategy position from shared atomic (lock-free read)
+                    if let Some(shared_pos) = self.positions.get(symbol.as_str()) {
+                        let pos = shared_pos.get();
+                        strategy.set_position(pos);
+                    }
 
-                        // Feed snapshot to OBI strategy FIRST (uses reference only)
-                        // This allows us to move the snapshot to the store afterward without cloning
-                        let mut quote_result = None;
-                        let mut is_warming_up = false;
+                    if let Some(quote) = strategy.update(&snapshot) {
+                        quote_result = Some(quote);
+                    } else if !strategy.is_warmed_up()
+                        && self.stats.message_count.is_multiple_of(20)
+                    {
+                        is_warming_up = true;
+                    }
+                }
 
-                        if let Some(strategy) = self.strategies.get_mut(&data.symbol) {
-                            // Update strategy position from shared atomic (lock-free read)
-                            if let Some(shared_pos) = self.positions.get(&data.symbol) {
-                                let pos = shared_pos.get();
-                                strategy.set_position(pos);
-                            }
+                // Log warmup message if needed (before moving snapshot)
+                if is_warming_up {
+                    info!(
+                        "[{}] Warming up... {} msgs, mid={:.2}",
+                        symbol,
+                        self.stats.message_count,
+                        snapshot.mid_price().unwrap_or(0.0)
+                    );
+                }
 
-                            if let Some(quote) = strategy.update(&snapshot) {
-                                quote_result = Some(quote);
-                            } else if !strategy.is_warmed_up()
-                                && self.stats.message_count.is_multiple_of(20)
-                            {
-                                is_warming_up = true;
-                            }
-                        }
+                // Update trading stats mid_price (single atomic store ~1ns)
+                if let Some(mid) = snapshot.mid_price() {
+                    self.stats.trading_stats.set_mid_price(mid);
+                }
 
-                        // Log warmup message if needed (before moving snapshot)
-                        if is_warming_up {
-                            info!(
-                                "[{}] Warming up... {} msgs, mid={:.2}",
-                                data.symbol,
-                                self.stats.message_count,
-                                snapshot.mid_price().unwrap_or(0.0)
+                // Note: Timeout checking is now consolidated in the periodic 1-second timer
+                // (check_order_timeouts). Both order creation and timeout checks use system
+                // time to avoid false timeouts when orderbook messages are sparse.
+
+                // Process quote if we got one
+                if let Some(quote) = quote_result {
+                    self.stats.quote_count += 1;
+                    let mut dispatch_failed = false;
+
+                    // Process quote through order manager if enabled
+                    if self.config.order.enabled
+                        && quote.valid_for_trading
+                        && quote.mid_price.is_finite()
+                        && quote.mid_price > 0.0
+                    {
+                        let symbol_arc = self.get_symbol_arc(symbol.as_str());
+                        if let Some(order_manager) = self.order_managers.get_mut(symbol.as_str()) {
+                            // `valid_for_trading` includes the full configured history
+                            // duration (10 minutes in the live/canary configurations).
+                            order_manager.clear_pause_reason(PauseReason::MarketData);
+                            // Use system time for order creation to match timeout checks
+                            use std::time::{SystemTime, UNIX_EPOCH};
+                            let system_time_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as i64;
+                            let decisions = self
+                                .decision_buffers
+                                .get_mut(symbol.as_str())
+                                .expect("decision buffer created for every configured symbol");
+                            order_manager.on_quote_into(
+                                &quote,
+                                system_time_ns,
+                                decisions,
                             );
-                        }
 
-                        // Update trading stats mid_price (single atomic store ~1ns)
-                        if let Some(mid) = snapshot.mid_price() {
-                            self.stats.trading_stats.set_mid_price(mid);
-                        }
-
-                        // Note: Timeout checking is now consolidated in the periodic 1-second timer
-                        // (check_order_timeouts). Both order creation and timeout checks use system
-                        // time to avoid false timeouts when orderbook messages are sparse.
-
-                        // Process quote if we got one
-                        if let Some(quote) = quote_result {
-                            self.stats.quote_count += 1;
-                            let mut dispatch_failed = false;
-
-                            // Process quote through order manager if enabled
-                            if self.config.order.enabled
-                                && quote.valid_for_trading
-                                && quote.mid_price.is_finite()
-                                && quote.mid_price > 0.0
-                            {
-                                let symbol_arc = self.get_symbol_arc(&data.symbol);
-                                if let Some(order_manager) = self.order_managers.get_mut(&data.symbol) {
-                                    // `valid_for_trading` includes the full configured history
-                                    // duration (10 minutes in the live/canary configurations).
-                                    order_manager.clear_pause_reason(PauseReason::MarketData);
-                                    // Use system time for order creation to match timeout checks
-                                    use std::time::{SystemTime, UNIX_EPOCH};
-                                    let system_time_ns = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_nanos() as i64;
-                                    let decisions = self
-                                        .decision_buffers
-                                        .get_mut(&data.symbol)
-                                        .expect("decision buffer created for every configured symbol");
-                                    order_manager.on_quote_into(
-                                        &quote,
-                                        system_time_ns,
-                                        decisions,
-                                    );
-
-                                    // Send decisions to executor via channel
-                                    if let Some(tx) = &self.order_tx {
-                                        for decision in decisions.drain(..) {
-                                            self.stats.order_decision_count += 1;
-                                            // Non-blocking send (Arc::clone is just a refcount increment)
-                                            if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), decision)) {
-                                                let (_, failed_decision) = error.into_inner();
-                                                order_manager.on_dispatch_failed(&failed_decision);
-                                                self.stats.consecutive_channel_drops += 1;
-                                                dispatch_failed = true;
-                                                error!("[{}] Order executor channel unavailable", data.symbol);
-                                            } else {
-                                                self.stats.consecutive_channel_drops = 0;
-                                            }
-                                        }
-                                    } else if !decisions.is_empty() {
-                                        for decision in decisions.drain(..) {
-                                            order_manager.on_dispatch_failed(&decision);
-                                        }
-                                        order_manager.trigger_safety_pause(
-                                            "order decision has no executor",
-                                        );
+                            // Send decisions to executor via channel
+                            if let Some(tx) = &self.order_tx {
+                                for decision in decisions.drain(..) {
+                                    self.stats.order_decision_count += 1;
+                                    // Non-blocking send (Arc::clone is just a refcount increment)
+                                    if let Err(error) = tx.try_send((Arc::clone(&symbol_arc), order_manager.execution_state().generation(), decision)) {
+                                        let (_, _, failed_decision) = error.into_inner();
+                                        order_manager.on_dispatch_failed(&failed_decision);
+                                        self.stats.consecutive_channel_drops += 1;
                                         dispatch_failed = true;
-                                        error!("[{}] Order decision has no executor", data.symbol);
+                                        error!("[{}] Order executor channel unavailable", symbol);
+                                    } else {
+                                        self.stats.consecutive_channel_drops = 0;
                                     }
-                                    decisions.clear();
                                 }
-                            }
-
-                            if dispatch_failed {
-                                for manager in self.order_managers.values_mut() {
-                                    manager.trigger_safety_pause("executor channel unavailable");
+                            } else if !decisions.is_empty() {
+                                for decision in decisions.drain(..) {
+                                    order_manager.on_dispatch_failed(&decision);
                                 }
-                                self.begin_account_reconciliation(
-                                    "order decision could not reach executor",
+                                order_manager.trigger_safety_pause(
+                                    "order decision has no executor",
                                 );
+                                dispatch_failed = true;
+                                error!("[{}] Order decision has no executor", symbol);
                             }
-
-                            // Log quote after trading decisions are dispatched so formatting
-                            // never sits in front of the order hot path.
-                            self.quote_formatter.log_quote(&quote);
-                        }
-
-                        // Storage and diagnostic history are cold-path work. Publish only
-                        // after order decisions have been sent to the executor.
-                        if let Some(ob) = self.store.get(&data.symbol) {
-                            ob.update_current(snapshot.clone());
-                        }
-                        if let Err(error) = self.history_tx.try_send(snapshot) {
-                            self.history_channel_drops = self.history_channel_drops.saturating_add(1);
-                            if self.history_channel_drops <= 3
-                                || self.history_channel_drops.is_power_of_two()
-                            {
-                                warn!(
-                                    "[{}] History recorder unavailable (drops={}): {}",
-                                    data.symbol, self.history_channel_drops, error
-                                );
-                            }
-                        }
-
-                        // Log periodic orderbook updates if verbose
-                        if self.config.verbose && self.stats.message_count.is_multiple_of(100) {
-                            if let Some(ob) = self.store.get(&data.symbol) {
-                                if let Some(latest) = ob.latest() {
-                                    info!(
-                                        "[{}] bid={:.2} ask={:.2} spread={:.2} levels={}/{}",
-                                        data.symbol,
-                                        latest.best_bid_price().unwrap_or(0.0),
-                                        latest.best_ask_price().unwrap_or(0.0),
-                                        latest.spread().unwrap_or(0.0),
-                                        latest.bid_count,
-                                        latest.ask_count,
-                                    );
-                                }
-                            }
+                            decisions.clear();
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to create snapshot: {}", e);
+
+                    if dispatch_failed {
+                        for manager in self.order_managers.values_mut() {
+                            manager.trigger_safety_pause("executor channel unavailable");
+                        }
+                        self.begin_account_reconciliation(
+                            "order decision could not reach executor",
+                        );
+                    }
+
+                    // Log quote after trading decisions are dispatched so formatting
+                    // never sits in front of the order hot path.
+                    self.quote_formatter.log_quote(&quote);
+                }
+
+                // Storage is cold-path work. Publish only after order decisions
+                // have been sent to the executor.
+                if let Some(ob) = self.store.get(symbol.as_str()) {
+                    ob.update_current(snapshot);
+                }
+
+                // Log periodic orderbook updates if verbose
+                if self.config.verbose && self.stats.message_count.is_multiple_of(100) {
+                    if let Some(ob) = self.store.get(symbol.as_str()) {
+                        if let Some(latest) = ob.latest() {
+                            info!(
+                                "[{}] bid={:.2} ask={:.2} spread={:.2} levels={}/{}",
+                                symbol,
+                                latest.best_bid_price().unwrap_or(0.0),
+                                latest.best_ask_price().unwrap_or(0.0),
+                                latest.spread().unwrap_or(0.0),
+                                latest.bid_count,
+                                latest.ask_count,
+                            );
+                        }
                     }
                 }
             }
@@ -1180,11 +1136,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(
-        "Config: symbols={:?}, levels={}, history={}min, buffer={}",
+        "Config: symbols={:?}, levels={}, history={}min",
         config.symbols,
         config.orderbook_levels,
         config.history_minutes,
-        config.history_buffer_size,
     );
 
     info!(
@@ -1236,7 +1191,8 @@ async fn main() -> anyhow::Result<()> {
 
         // Validate fetched values - reject if invalid
         let tick_valid = tick_size.is_finite() && tick_size > 1e-12 && tick_size < 1e12;
-        let lot_valid = lot_size.is_finite() && lot_size > 1e-12 && lot_size < 1e12;
+        let min_qty = info.min_order_qty.parse::<f64>().unwrap_or(f64::NAN);
+        let lot_valid = min_qty.is_finite() && min_qty > 0.0 && lot_size.is_finite() && lot_size > 1e-12 && lot_size < 1e12;
 
         if !tick_valid || !lot_valid {
             anyhow::bail!(
@@ -1288,26 +1244,7 @@ async fn main() -> anyhow::Result<()> {
         info!("Alpha source: StandX (Binance alpha disabled)");
     }
 
-    // Create SharedBbo for Binance BBO integration (lock-free reads from hot path)
-    let shared_binance_bbo: Option<Arc<SharedBbo>> = if config.strategy.alpha_source == "binance" {
-        Some(Arc::new(SharedBbo::new()))
-    } else {
-        None
-    };
-
-    // Start Binance BBO poller if configured
-    let mut binance_bbo_handle: Option<BinanceBboPollerHandle> = None;
-    if let Some(ref shared_bbo) = shared_binance_bbo {
-        let binance_symbol = "btcusdt";
-        info!("Starting Binance BBO poller (symbol={})", binance_symbol);
-        binance_bbo_handle = Some(start_binance_bbo_poller(
-            binance_symbol,
-            Arc::clone(shared_bbo),
-        ));
-    }
-
-    // Create application with symbol info and Binance alpha/BBO
-    let mut app = App::new(config.clone(), symbol_infos, shared_binance_alpha, shared_binance_bbo);
+    let mut app = App::new(config.clone(), symbol_infos, shared_binance_alpha);
 
     // Create shared auth manager if any feature needs it
     // IMPORTANT: Use a SINGLE AuthManager for all features to ensure consistent ed25519 keypair
@@ -1360,19 +1297,6 @@ async fn main() -> anyhow::Result<()> {
         mpsc::unbounded_channel::<ReconciliationRequest>();
     let (reconciliation_result_tx, mut reconciliation_result_rx) =
         mpsc::channel::<ReconciliationResult>(8);
-    if config.order.enabled {
-        let auth = Arc::clone(shared_auth.as_ref().expect("validated above"));
-        tokio::spawn(run_reconciliation_worker(
-            auth,
-            reconciliation_rx,
-            reconciliation_result_tx,
-        ));
-        app.set_reconciliation_tx(reconciliation_tx);
-    } else {
-        drop(reconciliation_rx);
-        drop(reconciliation_result_tx);
-    }
-
     // Ensure exchange leverage matches config for all symbols before trading
     // CRITICAL: If leverage cannot be verified/set, refuse to trade to prevent wrong-leverage risk
     let target_leverage = config.strategy.leverage as i32;
@@ -1458,7 +1382,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 // Cancel all existing account orders before starting and prove
                 // that cleanup completed before the order socket is created.
-                if !cancel_all_and_verify(auth, "startup", 3).await {
+                if !cancel_all_and_verify(auth, "startup", 3, None).await {
                     anyhow::bail!(
                         "startup reconciliation could not verify zero open account orders"
                     );
@@ -1483,10 +1407,11 @@ async fn main() -> anyhow::Result<()> {
                 order_event_rx = Some(rx);
 
                 // Create order decision channel (uses Arc<str> for cheap symbol clones)
-                let (order_tx, order_rx) = mpsc::channel::<(Arc<str>, OrderDecision)>(1000);
+                let (order_tx, order_rx) = mpsc::channel::<(Arc<str>, u64, OrderDecision)>(1000);
                 app.set_order_tx(order_tx);
 
                 let executor_client = Arc::clone(&ws_client);
+                let execution = app.order_managers["BTC-USD"].execution_state();
                 let executor_fault_tx = executor_fault_tx.clone();
 
                 // Clone symbol_infos for executor to read dynamic tick_size/lot_size
@@ -1499,7 +1424,7 @@ async fn main() -> anyhow::Result<()> {
                 let executor_handle = tokio::spawn(async move {
                     let mut order_rx = order_rx;
                     info!("Order executor task started");
-                    while let Some((symbol, decision)) = order_rx.recv().await {
+                    while let Some((symbol, generation, decision)) = order_rx.recv().await {
                         match decision {
                             OrderDecision::Send { side, level, price, qty, cl_ord_id } => {
                                 // Get current tick_size/lot_size from SharedSymbolInfo (dynamic)
@@ -1516,7 +1441,7 @@ async fn main() -> anyhow::Result<()> {
                                         .with_client_id(&cl_ord_id),
                                 };
                                 debug!("[{}] Sending {} L{} order: {} @ {:.2}", symbol, side, level, cl_ord_id, price);
-                                if let Err(e) = executor_client.place_order(req).await {
+                                if let Err(e) = executor_client.place_order(req, &execution, generation).await {
                                     warn!("[{}] Failed to place order: {}", symbol, e);
                                     let _ = executor_fault_tx
                                         .send(format!("place {} {} failed: {}", symbol, cl_ord_id, e))
@@ -1557,6 +1482,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         (None, None)
     };
+    let mut reconciliation_handle = None;
+    if config.order.enabled {
+        let auth = Arc::clone(shared_auth.as_ref().expect("validated above"));
+        reconciliation_handle = Some(tokio::spawn(run_reconciliation_worker(
+            auth,
+            Arc::clone(order_client.as_ref().expect("live client")),
+            app.order_managers["BTC-USD"].execution_state(),
+            reconciliation_rx,
+            reconciliation_result_tx,
+        )));
+        app.set_reconciliation_tx(reconciliation_tx);
+    } else {
+        drop(reconciliation_rx);
+        drop(reconciliation_result_tx);
+    }
+
     let mut executor_handle: Option<tokio::task::JoinHandle<()>> = executor_handle_opt;
 
     // Start PnL tracking if enabled (uses shared auth)
@@ -1676,6 +1617,7 @@ async fn main() -> anyhow::Result<()> {
     let client = WsClientBuilder::new()
         .config(config.websocket.clone())
         .symbols(config.symbols.clone())
+        .orderbook_levels(config.orderbook_levels)
         .build();
 
     let stats = client.stats();
@@ -1691,10 +1633,19 @@ async fn main() -> anyhow::Result<()> {
     // (Using sleep inside select! would recreate it every iteration, never completing)
     let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
 
+    let mut fatal_exit = false;
+    let shutdown_signal = shutdown_requested();
+    tokio::pin!(shutdown_signal);
     loop {
         tokio::select! {
             // Handle market data WebSocket events
-            Some(event) = rx.recv() => {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    error!("Market-data task exited");
+                    fatal_exit = true;
+                    break;
+                };
+                if app.check_depth_stale(monotonic_time_ns()) { client.force_reconnect(); }
                 if app.process_event(event) {
                     app.begin_account_reconciliation("market data disconnected; warm-up reset");
                 }
@@ -1729,9 +1680,23 @@ async fn main() -> anyhow::Result<()> {
 
             // Handle order events (if order management enabled)
             // Uses guard to skip this arm entirely when order_event_rx is None
-            Some(event) = async {
+            event = async {
                 order_event_rx.as_mut().unwrap().recv().await
             }, if order_event_rx.is_some() => {
+                let Some(event) = event else {
+                    error!("Order transport task exited");
+                    fatal_exit = true;
+                    break;
+                };
+                let retired = match &event {
+                    OrderEvent::OrderAccepted { cl_ord_id, .. } | OrderEvent::OrderRejected { cl_ord_id, .. } => {
+                        QuoteOrderManager::extract_symbol_from_cl_ord_id(cl_ord_id)
+                            .and_then(|symbol| app.order_managers.get(symbol))
+                            .is_some_and(|manager| manager.is_retired_client_id(cl_ord_id))
+                    }
+                    _ => false,
+                };
+                if retired { continue; }
                 match event {
                     OrderEvent::OrderAccepted { cl_ord_id, order_id } => {
                         // O(1) lookup: extract symbol from cl_ord_id format: mm_<symbol>_<ts>_<seq>
@@ -1863,56 +1828,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                         // Fallback: scan all managers by order_id
                         if matched_symbol.is_none() {
-                            for (sym, manager) in app.order_managers_mut() {
+                            for manager in app.order_managers_mut().values_mut() {
                                 if manager.on_order_canceled(order_id) {
-                                    matched_symbol = Some(sym.clone());
                                     break;
                                 }
                             }
                         }
 
-                        // Check for pending replacement orders and execute immediately
-                        let mut pending_dispatch_failed = false;
-                        if let Some(symbol) = matched_symbol {
-                            let order_tx = app.order_tx.clone();
-                            if let Some(manager) = app.get_order_manager_mut(&symbol) {
-                                use std::time::{SystemTime, UNIX_EPOCH};
-                                let now_ns = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos() as i64;
-                                let pending_decisions = manager.check_pending_orders(now_ns);
-                                for decision in pending_decisions {
-                                    let symbol_arc: Arc<str> = Arc::from(symbol.as_str());
-                                    if let Some(ref order_tx) = order_tx {
-                                        if let Err(error) = order_tx.send((symbol_arc, decision)).await {
-                                            let (_, failed_decision) = error.0;
-                                            manager.on_dispatch_failed(&failed_decision);
-                                            manager.trigger_safety_pause(
-                                                "replacement order could not reach executor",
-                                            );
-                                            pending_dispatch_failed = true;
-                                            error!(
-                                                "[{}] Replacement order could not reach executor",
-                                                symbol
-                                            );
-                                        }
-                                    } else {
-                                        manager.on_dispatch_failed(&decision);
-                                        manager.trigger_safety_pause(
-                                            "replacement order has no executor",
-                                        );
-                                        pending_dispatch_failed = true;
-                                        error!("[{}] Replacement order has no executor", symbol);
-                                    }
-                                }
-                            }
-                        }
-                        if pending_dispatch_failed {
-                            app.begin_account_reconciliation(
-                                "replacement order could not reach executor",
-                            );
-                        }
+                        // Replacements are generated by the next fresh quote,
+                        // through the same exposure checks as initial orders.
                     }
                     OrderEvent::CancelSubmissionAcknowledged => {
                         // Without request or order identity, a successful response
@@ -1969,14 +1893,8 @@ async fn main() -> anyhow::Result<()> {
                         info!("Order WebSocket reconnecting in {}s (attempt {})", delay_secs, attempt);
                     }
                     OrderEvent::MaxRetriesExceeded => {
-                        error!("Order WebSocket max retries exceeded, initiating shutdown");
-                        app.shutdown_order_managers();
-                        if let Some(auth) = &shared_auth {
-                            cancel_all_and_verify(auth, "order WebSocket failure", 5).await;
-                            log_account_positions(auth, "order WebSocket failure").await;
-                        }
-                        // Stop the market data WebSocket and exit
-                        client.stop();
+                        error!("Order WebSocket retry limit exceeded");
+                        fatal_exit = true;
                         break;
                     }
                     OrderEvent::Error(msg) => {
@@ -1997,6 +1915,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            result = async {
+                match reconciliation_handle.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                error!("Reconciliation worker exited: {:?}", result);
+                reconciliation_handle.take();
+                fatal_exit = true;
+                break;
+            }
+
             // Detect order executor crash (if it exits unexpectedly, trigger shutdown)
             result = async {
                 match executor_handle.as_mut() {
@@ -2013,48 +1943,14 @@ async fn main() -> anyhow::Result<()> {
                             error!("FATAL: Order executor task panicked: {} - initiating shutdown", e);
                         }
                     }
-                    app.shutdown_order_managers();
-                    if let Some(auth) = &shared_auth {
-                        cancel_all_and_verify(auth, "order executor failure", 5).await;
-                        log_account_positions(auth, "order executor failure").await;
-                    }
+                    fatal_exit = true;
                     break;
                 }
             }
 
-            // Handle shutdown signal
-            _ = signal::ctrl_c() => {
+            // Both Unix service termination and interactive Ctrl+C use cleanup below.
+            _ = &mut shutdown_signal => {
                 info!("Received shutdown signal");
-
-                // Stop local order creation first, then perform account-wide
-                // cancellation even if local tracking currently has no orders.
-                let orders_to_cancel = app.shutdown_order_managers();
-                info!("Local state tracks {} order(s) at shutdown", orders_to_cancel.len());
-                if config.order.enabled {
-                    if let Some(auth) = &shared_auth {
-                        cancel_all_and_verify(auth, "shutdown", 5).await;
-                        log_account_positions(auth, "final").await;
-                    }
-                }
-
-                // Disconnect order WebSocket
-                if let Some(ref oc) = order_client {
-                    oc.disconnect().await;
-                }
-
-                // Stop sanity checker
-                if let Some(handle) = sanity_handle.take() {
-                    info!("Stopping sanity checker...");
-                    handle.stop();
-                }
-
-                // Stop wallet tracker
-                if let Some(handle) = wallet_handle.take() {
-                    info!("Stopping wallet tracker...");
-                    handle.stop();
-                }
-
-                client.stop();
                 break;
             }
 
@@ -2074,6 +1970,13 @@ async fn main() -> anyhow::Result<()> {
                     signal.symbol
                 ));
 
+                if let Some(info) = app.symbol_infos.get(&signal.symbol) {
+                    info.try_update(&signal.info).expect("poller validated symbol info");
+                }
+                if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
+                    manager.set_precision(signal.new_tick_size, signal.new_lot_size,
+                        signal.info.min_order_qty.parse().expect("validated minimum"));
+                }
                 // Reset strategy (clears rolling stats, re-enters warmup)
                 app.reset_strategy(&signal.symbol);
                 if let Some(manager) = app.get_order_manager_mut(&signal.symbol) {
@@ -2088,6 +1991,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Periodic tasks: timeout checking and stats logging (runs every 1 second)
             _ = periodic_interval.tick() => {
+                if app.check_depth_stale(monotonic_time_ns()) { client.force_reconnect(); }
                 if app.update_risk_pauses() {
                     app.begin_account_reconciliation("position or equity data became stale");
                 }
@@ -2198,16 +2102,31 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Check circuit breaker auto-recovery
-                app.check_circuit_breaker_recovery();
-
-                // Check safety pause auto-recovery (separate from circuit breaker)
-                app.check_safety_pause_recovery(config.order.safety_pause_recovery_secs);
+                app.check_pause_recovery();
 
                 app.log_stats();
             }
         }
     }
+
+    // Close the decision source first, then join/abort background cleanup before
+    // the final barrier. New submissions remain permanently disabled.
+    app.shutdown_order_managers();
+    app.order_tx.take();
+    if let Some(handle) = reconciliation_handle.take() { handle.abort(); let _ = handle.await; }
+    let mut cleanup_verified = !config.order.enabled;
+    if let (Some(auth), Some(order_client)) = (&shared_auth, &order_client) {
+        let execution = app.order_managers["BTC-USD"].execution_state();
+        cleanup_verified = tokio::time::timeout(Duration::from_secs(90),
+            cancel_all_and_verify(auth, "shutdown", 5, Some((order_client, &execution)))
+        ).await.unwrap_or(false);
+        let _ = tokio::time::timeout(Duration::from_secs(5), order_client.disconnect()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), log_account_positions(auth, "final")).await;
+    }
+    if let Some(handle) = executor_handle.take() { handle.abort(); }
+    if let Some(handle) = sanity_handle.take() { handle.stop(); }
+    if let Some(handle) = wallet_handle.take() { handle.stop(); }
+    client.stop();
 
     // Stop position pollers
     if !position_handles.is_empty() {
@@ -2239,11 +2158,6 @@ async fn main() -> anyhow::Result<()> {
         handle.stop();
     }
 
-    // Stop Binance BBO poller
-    if let Some(handle) = binance_bbo_handle {
-        info!("Stopping Binance BBO poller...");
-        handle.stop();
-    }
 
     // Final stats
     let ws_stats = stats.snapshot();
@@ -2257,10 +2171,9 @@ async fn main() -> anyhow::Result<()> {
     // Log orderbook stats
     for stat in app.store.stats() {
         info!(
-            "[{}] Final: {} updates, {} history snapshots",
+            "[{}] Final: {} updates",
             stat.symbol,
             stat.update_count,
-            stat.history_total_writes,
         );
     }
 
@@ -2272,6 +2185,118 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if !cleanup_verified { anyhow::bail!("shutdown could not verify settled submissions and zero open orders"); }
+    if fatal_exit { anyhow::bail!("fatal trading task failure; cleanup verified"); }
     info!("Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depth(sequence: u64, received_at: i64) -> WsEvent {
+        let message = StandXMessage::parse_str(&format!(r#"{{"channel":"depth_book","data":{{"symbol":"BTC-USD","bids":[["99","1"]],"asks":[["101","1"]],"sequence":{sequence}}}}}"#), 20, received_at).unwrap();
+        WsEvent::Message(message, received_at)
+    }
+
+    #[test]
+    fn depth_outage_ignores_other_traffic_and_recovery_requires_warmup() {
+        let mut app = App::new(Config::default(), HashMap::new(), None);
+        let (tx, mut requests) = mpsc::unbounded_channel();
+        app.set_reconciliation_tx(tx);
+        let start = monotonic_time_ns();
+        app.process_event(WsEvent::Connected);
+        app.process_event(depth(1, start));
+        // Other messages and duplicates do not refresh valid depth age.
+        app.process_event(WsEvent::Message(StandXMessage::Unknown(serde_json::json!({"pong":true})), start + 4_000_000_000));
+        app.process_event(depth(1, start + 4_000_000_000));
+        assert_eq!(app.depth["BTC-USD"].received_at, start);
+        assert!(app.check_depth_stale(start + 5_000_000_000));
+        assert!(!app.check_depth_stale(start + 6_000_000_000));
+        assert!(requests.try_recv().is_ok());
+        assert!(requests.try_recv().is_err(), "one reconciliation per outage");
+        let manager = &app.order_managers["BTC-USD"];
+        assert!(manager.has_pause_reason(PauseReason::MarketData));
+        assert!(manager.has_pause_reason(PauseReason::Reconciliation));
+        app.process_event(depth(2, start + 6_000_000_000));
+        app.finish_account_reconciliation();
+        assert!(app.order_managers["BTC-USD"].is_paused());
+        assert!(!app.strategies["BTC-USD"].is_valid_for_trading());
+        assert!(app.order_managers["BTC-USD"].has_pause_reason(PauseReason::RiskData));
+    }
+
+    #[test]
+    fn depth_rejects_regression_crossing_and_nonfinite_values() {
+        let mut book = OrderbookSnapshot::new("BTC-USD".into());
+        book.set_bids(&[(99.0, 1.0)], 1); book.set_asks(&[(101.0, 1.0)], 1);
+        book.received_at_ns = 1; book.sequence = 2; book.timestamp_ns = 2;
+        let mut state = DepthState::default();
+        assert!(state.accept(&book, 1, 5_000_000_000));
+        book.sequence = 1; assert!(!state.accept(&book, 2, 5_000_000_000));
+        book.sequence = 3; book.timestamp_ns = 1; assert!(!state.accept(&book, 2, 5_000_000_000));
+        book.timestamp_ns = 3; book.bids[0].price = 102.0;
+        assert!(!state.accept(&book, 2, 5_000_000_000));
+        book.bids[0].price = 99.0; book.asks[0].quantity = f64::INFINITY;
+        assert!(!state.accept(&book, 2, 5_000_000_000));
+        assert_eq!(state.sequence, 2);
+    }
+
+    #[test]
+    fn disconnect_invalidates_queued_generation_and_shutdown_cannot_resume() {
+        let mut app = App::new(Config::default(), HashMap::new(), None);
+        let execution = app.order_managers["BTC-USD"].execution_state();
+        let generation = execution.generation();
+        assert!(app.process_event(WsEvent::Disconnected("test".into())));
+        assert_ne!(execution.generation(), generation);
+        assert!(!execution.permits(generation));
+        app.shutdown_order_managers();
+        app.finish_account_reconciliation();
+        app.order_managers["BTC-USD"].resume();
+        assert!(!execution.permits(execution.generation()));
+    }
+
+    #[test]
+    fn actual_quote_dispatch_tags_generation_and_cleanup_discards_old_snapshots() {
+        let config = Config { history_minutes: 1, ..Config::default() };
+        let mut app = App::new(config, HashMap::new(), None);
+        app.shared_equity.set_equity(1000.0);
+        app.positions["BTC-USD"].set(0.0);
+        app.order_managers["BTC-USD"].resume();
+        app.update_risk_pauses();
+        let (tx, mut decisions) = mpsc::channel(16);
+        app.set_order_tx(tx);
+        let start = monotonic_time_ns();
+        for i in 0..=610 {
+            app.process_event(depth(i + 1, start + i as i64 * 100_000_000));
+        }
+        let (symbol, generation, decision) = decisions.try_recv().expect("warm strategy dispatches actual orders");
+        assert_eq!(symbol.as_ref(), "BTC-USD");
+        assert!(matches!(decision, OrderDecision::Send { .. }));
+        let state = app.order_managers["BTC-USD"].execution_state();
+        assert!(state.permits(generation));
+        let (tx, _requests) = mpsc::unbounded_channel();
+        app.set_reconciliation_tx(tx);
+        app.begin_account_reconciliation("test");
+        app.finish_account_reconciliation();
+        app.positions["BTC-USD"].set(0.0);
+        app.positions["BTC-USD"].set(0.0);
+        app.update_risk_pauses();
+        assert!(!state.permits(generation));
+        assert!(state.permits(state.generation()));
+        let old = OpenOrdersSnapshot { symbol: "BTC-USD".into(), orders: vec![], observed_at_ns: 1 };
+        assert_eq!(app.apply_open_orders_snapshot(&old).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_reaches_the_common_shutdown_signal() {
+        let mut shutdown = Box::pin(shutdown_requested());
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        // Signal this test process only; the Tokio handler is already installed.
+        let status = std::process::Command::new("sh").arg("-c")
+            .arg(format!("kill -TERM {}", std::process::id())).status().unwrap();
+        assert!(status.success());
+        tokio::time::timeout(Duration::from_secs(2), shutdown).await.unwrap();
+    }
 }

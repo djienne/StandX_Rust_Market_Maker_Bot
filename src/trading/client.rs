@@ -85,6 +85,7 @@ pub struct SymbolInfo {
     pub price_tick_decimals: u8,
     /// Number of decimal places for quantity (e.g., 3 means lot_size = 0.001)
     pub qty_tick_decimals: u8,
+    pub min_order_qty: String,
 }
 
 /// Position config from query_position_config endpoint.
@@ -319,9 +320,9 @@ pub struct CancelOrdersRequest {
 /// Paginated response wrapper from API.
 #[derive(Debug, Clone, Deserialize)]
 struct PaginatedResponse<T> {
-    #[allow(dead_code)]
-    code: i32,
-    #[allow(dead_code)]
+    #[serde(default)]
+    code: Option<i32>,
+    #[serde(default)]
     message: String,
     #[allow(dead_code)]
     page_size: Option<i32>,
@@ -493,6 +494,18 @@ impl StandXClient {
         })
     }
 
+    /// Look up an individual submission, including filled or canceled orders.
+    pub async fn query_order(&self, token: &str, cl_ord_id: &str) -> Result<OpenOrder, ClientError> {
+        let response = self.http.get(format!("{}/api/query_order", self.perps_base_url))
+            .query(&[("cl_ord_id", cl_ord_id)])
+            .bearer_auth(token).send().await?.error_for_status()?;
+        let order: OpenOrder = response.json().await?;
+        if order.cl_ord_id.as_deref() != Some(cl_ord_id) || order.id <= 0 {
+            return Err(ClientError::InvalidResponse("order lookup identity mismatch".into()));
+        }
+        Ok(order)
+    }
+
     /// Query open orders.
     pub async fn query_open_orders(
         &self,
@@ -522,6 +535,7 @@ impl StandXClient {
         let wrapper: PaginatedResponse<OpenOrder> = serde_json::from_str(&text).map_err(|e| {
             ClientError::InvalidResponse(format!("{}\nRaw response: {}", e, &text[..text.len().min(500)]))
         })?;
+        if wrapper.code.is_some_and(|code| code != 0) { return Err(ClientError::ApiError(wrapper.message)); }
         Ok(wrapper.result)
     }
 

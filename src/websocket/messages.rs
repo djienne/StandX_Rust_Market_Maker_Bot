@@ -3,8 +3,11 @@
 //! This module handles deserialization of StandX market data messages
 //! including orderbook depth, trades, and prices.
 
-use serde::Deserialize;
+use std::borrow::Cow;
+
 use chrono::DateTime;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::types::{OrderbookSnapshot, Symbol};
@@ -31,38 +34,31 @@ pub enum MessageError {
     MissingField(String),
 }
 
-/// Raw WebSocket message from StandX.
-#[derive(Debug, Deserialize)]
-pub struct RawMessage {
-    /// Sequence number
-    #[allow(dead_code)]
-    pub seq: Option<u64>,
-    /// Channel name
-    pub channel: Option<String>,
-    /// Message data (varies by channel)
-    pub data: Option<serde_json::Value>,
-    /// Error code (if error message)
-    pub code: Option<i32>,
-    /// Error message
-    pub message: Option<String>,
+/// Envelope with the channel payload left unparsed until the channel is known.
+#[derive(Deserialize)]
+struct RawMessage<'a> {
+    #[serde(borrow)]
+    channel: Option<&'a str>,
+    #[serde(borrow)]
+    data: Option<&'a RawValue>,
+    code: Option<i32>,
+    message: Option<String>,
 }
 
-/// Depth book (orderbook) data from the depth_book channel.
-#[derive(Debug, Deserialize)]
-pub struct DepthBookData {
-    pub symbol: String,
-    pub asks: Vec<(String, String)>,
-    pub bids: Vec<(String, String)>,
-    pub sequence: Option<u64>,
-    /// Timestamp - can be integer (ms) or string (ISO 8601)
-    #[serde(default)]
-    pub time: Option<serde_json::Value>,
-    /// Last traded price (sometimes included)
-    #[serde(default)]
-    pub last_price: Option<String>,
-    /// Mark price (sometimes included)
-    #[serde(default)]
-    pub mark_price: Option<String>,
+/// Depth payload borrowed from the message text. Numbers are parsed once,
+/// straight into the fixed-size snapshot.
+#[derive(Deserialize)]
+struct DepthBookData<'a> {
+    #[serde(borrow)]
+    symbol: Cow<'a, str>,
+    #[serde(borrow)]
+    asks: Vec<(&'a str, &'a str)>,
+    #[serde(borrow)]
+    bids: Vec<(&'a str, &'a str)>,
+    sequence: Option<u64>,
+    /// Integer milliseconds or an RFC 3339 string.
+    #[serde(borrow, default)]
+    time: Option<&'a RawValue>,
 }
 
 /// Price data from the price channel.
@@ -88,11 +84,12 @@ pub struct TradeData {
     pub time: Option<String>,
 }
 
-/// Parsed StandX message.
+/// Parsed StandX message. The depth variant is inline by design (see `WsEvent`).
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum StandXMessage {
-    /// Orderbook depth update
-    DepthBook(DepthBookData),
+    /// Validated orderbook snapshot with the receive timestamp stamped
+    DepthBook(OrderbookSnapshot),
     /// Price update
     Price(PriceData),
     /// Public trade
@@ -106,127 +103,56 @@ pub enum StandXMessage {
 }
 
 impl StandXMessage {
-    /// Parse a raw JSON message from the WebSocket.
-    pub fn parse(data: &[u8]) -> Result<Self, MessageError> {
+    /// Parse a raw message. Depth payloads become a validated snapshot holding
+    /// at most `max_levels` per side with `received_at_ns` stamped.
+    pub fn parse(data: &[u8], max_levels: usize, received_at_ns: i64) -> Result<Self, MessageError> {
         let raw: RawMessage = serde_json::from_slice(data)?;
-
-        // Parse based on channel first
-        match raw.channel.as_deref() {
-            Some("depth_book") => {
-                let data = raw.data.ok_or(MessageError::MissingField("data".into()))?;
-                let depth: DepthBookData = serde_json::from_value(data)?;
-                Ok(StandXMessage::DepthBook(depth))
-            }
-            Some("price") => {
-                let data = raw.data.ok_or(MessageError::MissingField("data".into()))?;
-                let price: PriceData = serde_json::from_value(data)?;
-                Ok(StandXMessage::Price(price))
-            }
-            Some("public_trade") => {
-                let data = raw.data.ok_or(MessageError::MissingField("data".into()))?;
-                let trade: TradeData = serde_json::from_value(data)?;
-                Ok(StandXMessage::Trade(trade))
-            }
+        let payload = || raw.data.ok_or_else(|| MessageError::MissingField("data".into()));
+        match raw.channel {
+            Some("depth_book") => depth_to_snapshot(payload()?, max_levels, received_at_ns).map(StandXMessage::DepthBook),
+            Some("price") => Ok(StandXMessage::Price(serde_json::from_str(payload()?.get())?)),
+            Some("public_trade") => Ok(StandXMessage::Trade(serde_json::from_str(payload()?.get())?)),
             Some("auth") => {
-                let data = raw.data.ok_or(MessageError::MissingField("data".into()))?;
-                let code = data.get("code")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
-                let message = data.get("msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(StandXMessage::Auth { code, message })
+                let data: serde_json::Value = serde_json::from_str(payload()?.get())?;
+                Ok(StandXMessage::Auth {
+                    code: data.get("code").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    message: data.get("msg").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                })
             }
-            Some(channel) => {
-                // Handle other channels or return as unknown
-                if let Some(data) = raw.data {
-                    Ok(StandXMessage::Unknown(data))
-                } else {
-                    Err(MessageError::UnknownChannel(channel.to_string()))
-                }
-            }
-            None => {
-                // No channel specified, might be an error or response
-                if let Some(code) = raw.code {
-                    let message = raw.message.unwrap_or_default();
-                    if code != 0 {
-                        Ok(StandXMessage::Error { code, message })
-                    } else {
-                        // Success response without channel
-                        if let Some(data) = raw.data {
-                            Ok(StandXMessage::Unknown(data))
-                        } else {
-                            let value = serde_json::from_slice(data)?;
-                            Ok(StandXMessage::Unknown(value))
-                        }
-                    }
-                } else if let Some(data) = raw.data {
-                    Ok(StandXMessage::Unknown(data))
-                } else {
-                    // Try to return the whole raw message
-                    let value = serde_json::from_slice(data)?;
-                    Ok(StandXMessage::Unknown(value))
-                }
-            }
+            _ => match (raw.channel, raw.code, raw.data) {
+                (_, Some(code), _) if code != 0 => Ok(StandXMessage::Error { code, message: raw.message.unwrap_or_default() }),
+                (Some(channel), _, None) => Err(MessageError::UnknownChannel(channel.to_string())),
+                (_, _, Some(data)) => Ok(StandXMessage::Unknown(serde_json::from_str(data.get())?)),
+                (_, _, None) => Ok(StandXMessage::Unknown(serde_json::from_slice(data)?)),
+            },
         }
     }
 
     /// Parse from a string.
-    pub fn parse_str(s: &str) -> Result<Self, MessageError> {
-        Self::parse(s.as_bytes())
+    pub fn parse_str(s: &str, max_levels: usize, received_at_ns: i64) -> Result<Self, MessageError> {
+        Self::parse(s.as_bytes(), max_levels, received_at_ns)
     }
 }
 
-/// Convert depth book data to an OrderbookSnapshot.
-impl DepthBookData {
-    /// Convert to an OrderbookSnapshot.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_levels` - Maximum number of levels to include
-    /// * `received_at_ns` - Local receive timestamp in nanoseconds
-    ///
-    /// # Performance
-    ///
-    /// This method is optimized for low latency:
-    /// - Parses strings directly into fixed arrays (no intermediate Vec allocation)
-    /// - Uses fast_float for ~3x faster float parsing
-    /// - Assumes exchange data is pre-sorted (skips sorting)
-    #[inline]
-    pub fn to_snapshot(&self, max_levels: usize, received_at_ns: i64) -> Result<OrderbookSnapshot, MessageError> {
-        let mut snapshot = OrderbookSnapshot::new(Symbol::new(&self.symbol));
-
-        // Parse directly into fixed arrays (no intermediate Vec allocation)
-        snapshot.set_bids_from_strings(&self.bids, max_levels);
-        snapshot.set_asks_from_strings(&self.asks, max_levels);
-
-        // Set sequence
-        snapshot.sequence = self.sequence.unwrap_or(0);
-
-        // Parse timestamp (can be integer ms or string ISO 8601)
-        if let Some(ref time_val) = self.time {
-            snapshot.timestamp_ns = parse_timestamp_value(time_val)?;
-        }
-
-        snapshot.received_at_ns = received_at_ns;
-
-        Ok(snapshot)
+fn depth_to_snapshot(raw: &RawValue, max_levels: usize, received_at_ns: i64) -> Result<OrderbookSnapshot, MessageError> {
+    let depth: DepthBookData = serde_json::from_str(raw.get())?;
+    let mut snapshot = OrderbookSnapshot::new(Symbol::new(&depth.symbol));
+    snapshot.set_levels_from_strings(true, &depth.bids, max_levels).map_err(MessageError::InvalidPrice)?;
+    snapshot.set_levels_from_strings(false, &depth.asks, max_levels).map_err(MessageError::InvalidPrice)?;
+    snapshot.sequence = depth.sequence.unwrap_or(0);
+    if let Some(time) = depth.time {
+        snapshot.timestamp_ns = parse_timestamp_raw(time.get())?;
     }
+    snapshot.received_at_ns = received_at_ns;
+    snapshot.validate().map_err(MessageError::InvalidPrice)?;
+    Ok(snapshot)
 }
 
-/// Parse timestamp from JSON value (integer ms or string ISO 8601).
-pub fn parse_timestamp_value(val: &serde_json::Value) -> Result<i64, MessageError> {
-    match val {
-        serde_json::Value::Number(n) => {
-            // Integer timestamp in milliseconds - use saturating_mul to prevent overflow
-            let ms = n.as_i64().unwrap_or(0);
-            Ok(ms.saturating_mul(1_000_000)) // Convert to nanoseconds
-        }
-        serde_json::Value::String(s) => {
-            parse_timestamp(s)
-        }
-        _ => Ok(0),
+/// Raw JSON timestamp: integer milliseconds or a quoted RFC 3339 string.
+fn parse_timestamp_raw(raw: &str) -> Result<i64, MessageError> {
+    match raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(text) => parse_timestamp(text),
+        None => Ok(raw.parse::<i64>().map_or(0, |ms| ms.saturating_mul(1_000_000))),
     }
 }
 
@@ -292,32 +218,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_depth_book() {
-        let json = r#"{
-            "seq": 1,
-            "channel": "depth_book",
-            "data": {
-                "symbol": "TEST-USD",
-                "asks": [["101.00", "1.0"], ["102.00", "2.0"]],
-                "bids": [["100.00", "1.0"], ["99.00", "2.0"]],
-                "sequence": 12345,
-                "time": "2025-08-11T03:44:40.922233Z"
-            }
-        }"#;
-
-        let msg = StandXMessage::parse_str(json).unwrap();
-        match msg {
-            StandXMessage::DepthBook(data) => {
-                assert_eq!(data.symbol, "TEST-USD");
-                assert_eq!(data.asks.len(), 2);
-                assert_eq!(data.bids.len(), 2);
-                assert_eq!(data.sequence, Some(12345));
-
-                let snapshot = data.to_snapshot(20, 0).unwrap();
-                assert_eq!(snapshot.best_bid_price(), Some(100.0));
-                assert_eq!(snapshot.best_ask_price(), Some(101.0));
-            }
-            _ => panic!("Expected DepthBook message"),
+    fn depth_message_becomes_validated_snapshot_with_best_levels_first() {
+        // Feed order matches DOCS/websocket.md: bids ascend, asks ascend.
+        let json = r#"{"seq":1,"channel":"depth_book","data":{"symbol":"TEST-USD",
+            "asks":[["101.00","1.0"],["102.00","2.0"],["103.00","3.0"]],
+            "bids":[["98.00","2.0"],["99.00","2.0"],["100.00","1.0"]],
+            "sequence":12345,"time":"2025-08-11T03:44:40.922233Z"}}"#;
+        let StandXMessage::DepthBook(book) = StandXMessage::parse_str(json, 2, 77).unwrap() else { panic!("depth") };
+        assert_eq!(book.symbol.as_str(), "TEST-USD");
+        assert_eq!((book.bid_count, book.ask_count, book.sequence, book.received_at_ns), (2, 2, 12345, 77));
+        assert_eq!((book.bids[0].price, book.bids[1].price), (100.0, 99.0));
+        assert_eq!((book.asks[0].price, book.asks[1].quantity), (101.0, 2.0));
+        assert_eq!(book.timestamp_ns, 1_754_883_880_922_233_000);
+        let ms = json.replace(r#""2025-08-11T03:44:40.922233Z""#, "1754883880922");
+        let StandXMessage::DepthBook(book) = StandXMessage::parse_str(&ms, 2, 0).unwrap() else { panic!("depth") };
+        assert_eq!(book.timestamp_ns, 1_754_883_880_922_000_000);
+        // Crossed, empty, and malformed books are rejected before they reach the strategy.
+        for bad in [
+            json.replace(r#"["100.00","1.0"]"#, r#"["101.50","1.0"]"#),
+            json.replace(r#""bids":[["98.00","2.0"],["99.00","2.0"],["100.00","1.0"]]"#, r#""bids":[]"#),
+            json.replace(r#"["102.00","2.0"]"#, r#"["102.00","-2.0"]"#),
+            json.replace(r#"["102.00","2.0"]"#, r#"["1e999","2.0"]"#),
+        ] {
+            assert!(StandXMessage::parse_str(&bad, 2, 0).is_err(), "{bad}");
         }
     }
 
@@ -336,7 +259,7 @@ mod tests {
             }
         }"#;
 
-        let msg = StandXMessage::parse_str(json).unwrap();
+        let msg = StandXMessage::parse_str(json, 20, 0).unwrap();
         match msg {
             StandXMessage::Trade(data) => {
                 assert_eq!(data.symbol, "TEST-USD");
@@ -354,7 +277,7 @@ mod tests {
             "message": "Bad request"
         }"#;
 
-        let msg = StandXMessage::parse_str(json).unwrap();
+        let msg = StandXMessage::parse_str(json, 20, 0).unwrap();
         match msg {
             StandXMessage::Error { code, message } => {
                 assert_eq!(code, 400);
@@ -366,8 +289,7 @@ mod tests {
 
     #[test]
     fn test_subscribe_message() {
-        let msg = subscribe_message("depth_book", "TEST-USD");
-        assert!(msg.contains("depth_book"));
-        assert!(msg.contains("TEST-USD"));
+        let msg: serde_json::Value = serde_json::from_str(&subscribe_message("depth_book", "TEST-USD")).unwrap();
+        assert_eq!(msg["subscribe"], serde_json::json!({"channel": "depth_book", "symbol": "TEST-USD"}));
     }
 }

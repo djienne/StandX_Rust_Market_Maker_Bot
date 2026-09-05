@@ -41,7 +41,7 @@ pub struct ObiStrategy {
     step_count: u64,
     /// Last update step
     last_update_step: u64,
-    /// Cached volatility (per-second scale)
+    /// Cached volatility (price per square-root second)
     volatility: f64,
     /// Cached alpha (z-score of imbalance)
     alpha: f64,
@@ -59,66 +59,30 @@ pub struct ObiStrategy {
     logged_valid_for_trading: bool,
     /// Has logged the "using Binance alpha" milestone (log only once)
     logged_binance_alpha_active: bool,
+    held_observation: Option<(f64, f64)>,
+    next_sample_ns: i64,
+    last_observation_ns: i64,
+    max_gap_ns: i64,
 }
 
-/// Default required history for trading: 10 minutes in nanoseconds
-const DEFAULT_REQUIRED_HISTORY_NS: u64 = 10 * 60 * 1_000_000_000;
-
-/// Minimum samples needed before generating quotes.
-/// This is a safety minimum - at ~4-5 msgs/sec, 100 samples ≈ 20-30 seconds.
+/// Minimum grid samples needed before generating quotes.
 /// The actual trading wait time is controlled by `history_minutes` in config.
 const MIN_SAMPLES_FOR_QUOTE: usize = 100;
 
 impl ObiStrategy {
-    /// Create a new OBI strategy.
-    pub fn new(config: StrategyConfig) -> Self {
-        let window_steps = config.window_steps;
-        let use_binance_alpha = config.alpha_source == "binance";
-        let binance_stale_ms = config.binance_stale_ms;
-
-        Self {
-            config,
-            shared_info: None,
-            shared_equity: None,
-            shared_binance_alpha: None,
-            use_binance_alpha,
-            binance_stale_ms,
-            mid_price_chg_stats: RollingStats::new(window_steps),
-            imbalance_stats: RollingStats::new(window_steps),
-            prev_mid_price: None,
-            position: 0.0,
-            step_count: 0,
-            last_update_step: 0,
-            volatility: 0.0,
-            alpha: 0.0,
-            warmed_up: false,
-            first_timestamp_ns: None,
-            latest_timestamp_ns: 0,
-            required_history_ns: DEFAULT_REQUIRED_HISTORY_NS,
-            total_samples: 0,
-            logged_valid_for_trading: false,
-            logged_binance_alpha_active: false,
-        }
-    }
-
-    /// Create a new OBI strategy with shared symbol info for dynamic tick_size/lot_size.
-    pub fn with_shared_info(
+    pub fn new(
         config: StrategyConfig,
-        shared_info: Arc<SharedSymbolInfo>,
-        shared_equity: Arc<SharedEquity>,
+        shared_info: Option<Arc<SharedSymbolInfo>>,
+        shared_equity: Option<Arc<SharedEquity>>,
+        shared_binance_alpha: Option<Arc<SharedAlpha>>,
         required_history_minutes: u64,
+        depth_stale_secs: u64,
     ) -> Self {
         let window_steps = config.window_steps;
-        let use_binance_alpha = config.alpha_source == "binance";
-        let binance_stale_ms = config.binance_stale_ms;
-
         Self {
-            config,
-            shared_info: Some(shared_info),
-            shared_equity: Some(shared_equity),
-            shared_binance_alpha: None,
-            use_binance_alpha,
-            binance_stale_ms,
+            use_binance_alpha: config.alpha_source == "binance",
+            binance_stale_ms: config.binance_stale_ms,
+            config, shared_info, shared_equity, shared_binance_alpha,
             mid_price_chg_stats: RollingStats::new(window_steps),
             imbalance_stats: RollingStats::new(window_steps),
             prev_mid_price: None,
@@ -134,64 +98,11 @@ impl ObiStrategy {
             total_samples: 0,
             logged_valid_for_trading: false,
             logged_binance_alpha_active: false,
+            held_observation: None,
+            next_sample_ns: 0,
+            last_observation_ns: 0,
+            max_gap_ns: depth_stale_secs as i64 * 1_000_000_000,
         }
-    }
-
-    /// Create a new OBI strategy with Binance alpha integration.
-    ///
-    /// This is the preferred constructor when using Binance as the alpha source.
-    /// The shared_binance_alpha provides lock-free reads (~1ns) for the hot path.
-    pub fn with_binance_alpha(
-        config: StrategyConfig,
-        shared_info: Arc<SharedSymbolInfo>,
-        shared_equity: Arc<SharedEquity>,
-        shared_binance_alpha: Arc<SharedAlpha>,
-        required_history_minutes: u64,
-    ) -> Self {
-        let window_steps = config.window_steps;
-        let use_binance_alpha = config.alpha_source == "binance";
-        let binance_stale_ms = config.binance_stale_ms;
-
-        Self {
-            config,
-            shared_info: Some(shared_info),
-            shared_equity: Some(shared_equity),
-            shared_binance_alpha: Some(shared_binance_alpha),
-            use_binance_alpha,
-            binance_stale_ms,
-            mid_price_chg_stats: RollingStats::new(window_steps),
-            imbalance_stats: RollingStats::new(window_steps),
-            prev_mid_price: None,
-            position: 0.0,
-            step_count: 0,
-            last_update_step: 0,
-            volatility: 0.0,
-            alpha: 0.0,
-            warmed_up: false,
-            first_timestamp_ns: None,
-            latest_timestamp_ns: 0,
-            required_history_ns: required_history_minutes * 60 * 1_000_000_000,
-            total_samples: 0,
-            logged_valid_for_trading: false,
-            logged_binance_alpha_active: false,
-        }
-    }
-
-    /// Create a new OBI strategy with custom required history duration.
-    pub fn with_required_history(
-        config: StrategyConfig,
-        shared_equity: Arc<SharedEquity>,
-        required_history_minutes: u64,
-    ) -> Self {
-        let mut strategy = Self::new(config);
-        strategy.shared_equity = Some(shared_equity);
-        strategy.required_history_ns = required_history_minutes * 60 * 1_000_000_000;
-        strategy
-    }
-
-    /// Set the shared Binance alpha (for late binding after construction).
-    pub fn set_binance_alpha(&mut self, shared_alpha: Arc<SharedAlpha>) {
-        self.shared_binance_alpha = Some(shared_alpha);
     }
 
     /// Get the current tick size (from SharedSymbolInfo if available, else from config).
@@ -293,40 +204,31 @@ impl ObiStrategy {
     /// `is_valid_for_trading()` returns true. Use `is_valid_for_trading()`
     /// to check if the quote should be used for order placement.
     pub fn update(&mut self, snapshot: &OrderbookSnapshot) -> Option<Quote> {
-        // Track timestamps for history duration
-        let timestamp = snapshot.timestamp_ns;
-        if timestamp > 0 {
-            if self.first_timestamp_ns.is_none() {
-                self.first_timestamp_ns = Some(timestamp);
-            }
-            self.latest_timestamp_ns = timestamp;
-        }
-
-        // Get mid-price
+        if snapshot.validate().is_err() { return None; }
+        let timestamp = snapshot.received_at_ns;
+        if timestamp < self.last_observation_ns { return None; }
         let mid_price = snapshot.mid_price()?;
-
-        // Calculate mid-price change in dollars (consistent with Python)
-        if let Some(prev_mid) = self.prev_mid_price {
-            let mid_chg = mid_price - prev_mid;
-            self.mid_price_chg_stats.push(mid_chg);
-            self.total_samples += 1;
-
-            // Log warmup milestones
-            if self.total_samples == MIN_SAMPLES_FOR_QUOTE || self.total_samples == 500 {
-                debug!(
-                    "[{}] Warmup milestone: {} samples collected",
-                    snapshot.symbol, self.total_samples
-                );
-            }
-        }
-        self.prev_mid_price = Some(mid_price);
-
-        // Calculate imbalance
         let imbalance = self.calculate_imbalance(snapshot, mid_price);
-        self.imbalance_stats.push(imbalance);
-
-        // Increment step
-        self.step_count += 1;
+        if self.held_observation.is_some() && timestamp - self.last_observation_ns >= self.max_gap_ns {
+            self.reset_state();
+        }
+        if let Some((mid, obi)) = self.held_observation {
+            // Sample held observations strictly before arrival. A new message
+            // may be used at its exact boundary, never at an earlier boundary.
+            while self.next_sample_ns < timestamp {
+                self.sample(self.next_sample_ns, mid, obi);
+                self.next_sample_ns += self.config.step_ns as i64;
+            }
+            if self.next_sample_ns == timestamp {
+                self.sample(timestamp, mid_price, imbalance);
+                self.next_sample_ns += self.config.step_ns as i64;
+            }
+        } else {
+            self.sample(timestamp, mid_price, imbalance);
+            self.next_sample_ns = timestamp + self.config.step_ns as i64;
+        }
+        self.held_observation = Some((mid_price, imbalance));
+        self.last_observation_ns = timestamp;
 
         // Check if we should update (based on update_interval_steps)
         let steps_since_update = self.step_count - self.last_update_step;
@@ -352,7 +254,7 @@ impl ObiStrategy {
         }
         self.warmed_up = true;
 
-        // Calculate volatility (scaled to per-second)
+        // Scale grid-increment volatility to price per square-root second.
         let vol_raw = self.mid_price_chg_stats.std();
         self.volatility = vol_raw * self.config.vol_scale();
 
@@ -393,6 +295,18 @@ impl ObiStrategy {
         self.calculate_quote(snapshot, mid_price)
     }
 
+    fn sample(&mut self, time_ns: i64, mid: f64, imbalance: f64) {
+        self.first_timestamp_ns.get_or_insert(time_ns);
+        self.latest_timestamp_ns = time_ns;
+        if let Some(previous) = self.prev_mid_price {
+            self.mid_price_chg_stats.push(mid - previous);
+            self.total_samples += 1;
+        }
+        self.prev_mid_price = Some(mid);
+        self.imbalance_stats.push(imbalance);
+        self.step_count += 1;
+    }
+
     /// Calculate order book imbalance within looking_depth of mid-price.
     /// Uses simple loops instead of iterator chains for better hot path performance.
     #[inline]
@@ -431,7 +345,7 @@ impl ObiStrategy {
         let best_ask = snapshot.best_ask_price()?;
 
         // Calculate base half-spread in ticks (priority: volatility > bps > fixed)
-        // Note: volatility > 0.0 implies is_finite() (NaN/Inf comparisons return false)
+        // Quote validation rejects nonfinite prices before submission.
         let tick_size = self.tick_size();
         let base_half_spread_tick = if self.config.vol_to_half_spread > 0.0 && self.volatility > 0.0 {
             // Mode 1: Volatility-based (half_spread_price = volatility * vol_to_half_spread)
@@ -448,7 +362,7 @@ impl ObiStrategy {
         };
 
         // Calculate fair price (mid + alpha adjustment)
-        let fair_price = mid_price + self.config.c1() * self.alpha;
+        let fair_price = mid_price + self.config.c1(tick_size) * self.alpha;
 
         // Get max_position_dollar from SharedEquity (lock-free read, ~1ns)
         // If not initialized, use f64::MAX (no normalization effect)
@@ -547,7 +461,7 @@ impl ObiStrategy {
         // Note: order_qty_dollar is already per-order (formula includes /order_levels)
         let order_qty_per_level = order_qty_dollar / mid_price;
         let lot_size = self.lot_size();
-        let quantity = ((order_qty_per_level / lot_size).round() * lot_size).max(lot_size);
+        let quantity = (order_qty_per_level / lot_size).floor() * lot_size;
 
         // Log "valid for trading" milestone once (uses info! for visibility)
         let valid_for_trading = self.is_valid_for_trading();
@@ -596,6 +510,9 @@ impl ObiStrategy {
         self.mid_price_chg_stats.clear();
         self.imbalance_stats.clear();
         self.prev_mid_price = None;
+        self.held_observation = None;
+        self.next_sample_ns = 0;
+        self.last_observation_ns = 0;
         self.step_count = 0;
         self.last_update_step = 0;
         self.volatility = 0.0;
@@ -738,19 +655,10 @@ mod tests {
     }
 
     #[test]
-    fn test_strategy_creation() {
-        let config = default_config();
-        let strategy = ObiStrategy::new(config);
-
-        assert!(!strategy.is_warmed_up());
-        assert_eq!(strategy.position(), 0.0);
-    }
-
-    #[test]
     fn test_strategy_warmup() {
         let config = default_config();
         let shared_equity = test_shared_equity();
-        let mut strategy = ObiStrategy::with_required_history(config, shared_equity, 0);
+        let mut strategy = ObiStrategy::new(config, None, Some(shared_equity), None, 0, 5);
 
         // Feed snapshots until warmed up (need MIN_SAMPLES_FOR_QUOTE = 100)
         // First call has no prev_mid_tick so doesn't add to mid_price_chg_stats
@@ -761,7 +669,8 @@ mod tests {
             // Vary prices to create non-zero volatility
             let noise = if i % 3 == 0 { 0.05 } else if i % 3 == 1 { -0.03 } else { 0.02 };
             let mid = 100.0 + noise;
-            let snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            let mut snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            snapshot.received_at_ns = i * 100_000_000;
             let result = strategy.update(&snapshot);
             if result.is_some() {
                 quote_received = true;
@@ -776,14 +685,15 @@ mod tests {
     fn test_position_skew() {
         let config = default_config();
         let shared_equity = test_shared_equity();
-        let mut strategy = ObiStrategy::with_required_history(config, shared_equity, 0);
+        let mut strategy = ObiStrategy::new(config, None, Some(shared_equity), None, 0, 5);
 
         // Warm up (need MIN_SAMPLES_FOR_QUOTE = 100)
         // Add varying prices to create non-zero volatility
         for i in 0..200 {
             let noise = if i % 3 == 0 { 0.05 } else if i % 3 == 1 { -0.03 } else { 0.02 };
             let mid = 100.0 + noise;
-            let snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            let mut snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            snapshot.received_at_ns = i * 100_000_000;
             strategy.update(&snapshot);
         }
 
@@ -792,28 +702,30 @@ mod tests {
         // Get quote with zero position
         let snapshot = create_snapshot(99.99, 100.01);
         strategy.set_position(0.0);
-        let quote_neutral = strategy.update(&snapshot);
+        let quote_neutral = strategy.calculate_quote(&snapshot, 100.0);
 
         // Get quote with long position
         strategy.set_position(5.0);  // 5 BTC long
-        let quote_long = strategy.update(&snapshot);
+        let quote_long = strategy.calculate_quote(&snapshot, 100.0);
 
-        // With long position, bid should be lower (more aggressive on selling)
-        // This test validates the skew logic is working
-        assert!(quote_neutral.is_some(), "Expected neutral quote");
-        assert!(quote_long.is_some(), "Expected long position quote");
+        // Long inventory pushes the bid away from mid and the ask toward it.
+        let (neutral, long) = (quote_neutral.unwrap(), quote_long.unwrap());
+        assert!(long.bid_prices[0] < neutral.bid_prices[0], "{long:?} vs {neutral:?}");
+        assert!(long.ask_prices[0] < neutral.ask_prices[0], "{long:?} vs {neutral:?}");
+        assert!(long.ask_prices[0] > long.bid_prices[0]);
     }
 
     #[test]
     fn test_imbalance_calculation() {
         let config = default_config();
-        let strategy = ObiStrategy::new(config);
+        let strategy = ObiStrategy::new(config, None, None, None, 0, 5);
 
         // Create snapshot with more bids than asks
         let mut snapshot = OrderbookSnapshot::new(Symbol::new("TEST-USD"));
         let bids = vec![
             (99.99, 10.0),  // Large bid
             (99.98, 5.0),
+            (90.0, 1000.0), // Outside looking_depth (2.5%): ignored
         ];
         let asks = vec![
             (100.01, 1.0),  // Small ask
@@ -825,21 +737,22 @@ mod tests {
         let mid = snapshot.mid_price().unwrap();
         let imbalance = strategy.calculate_imbalance(&snapshot, mid);
 
-        // With more bids, imbalance should be positive
-        assert!(imbalance > 0.0);
+        // 15 within-depth bids minus 2 asks; the deep 1000 is excluded.
+        assert_eq!(imbalance, 13.0);
     }
 
     #[test]
     fn test_no_quote_without_equity() {
         let config = default_config();
         // Create strategy WITHOUT shared_equity
-        let mut strategy = ObiStrategy::new(config);
+        let mut strategy = ObiStrategy::new(config, None, None, None, 0, 5);
 
         // Warm up
         for i in 0..200 {
             let noise = if i % 3 == 0 { 0.05 } else if i % 3 == 1 { -0.03 } else { 0.02 };
             let mid = 100.0 + noise;
-            let snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            let mut snapshot = create_snapshot(mid - 0.01, mid + 0.01);
+            snapshot.received_at_ns = i * 100_000_000;
             let _ = strategy.update(&snapshot);
         }
 
@@ -855,24 +768,24 @@ mod tests {
     fn trading_requires_ten_continuous_minutes_and_reset_restarts_clock() {
         let config = default_config();
         let shared_equity = test_shared_equity();
-        let mut strategy = ObiStrategy::with_required_history(config, shared_equity, 10);
+        let mut strategy = ObiStrategy::new(config, None, Some(shared_equity), None, 10, 5);
         let base = 1_800_000_000_000_000_000_i64;
 
-        for index in 0..=100_i64 {
+        for index in 0..=598_i64 {
             let mut snapshot = create_snapshot(99.99, 100.01);
-            snapshot.timestamp_ns = base + index * 5_000_000_000;
+            snapshot.received_at_ns = base + index * 1_000_000_000;
             let _ = strategy.update(&snapshot);
         }
         assert!(strategy.is_warmed_up());
         assert!(!strategy.is_valid_for_trading());
 
         let mut before_ten_minutes = create_snapshot(99.99, 100.01);
-        before_ten_minutes.timestamp_ns = base + 599_000_000_000;
+        before_ten_minutes.received_at_ns = base + 599_000_000_000;
         let quote = strategy.update(&before_ten_minutes).unwrap();
         assert!(!quote.valid_for_trading);
 
         let mut at_ten_minutes = create_snapshot(99.99, 100.01);
-        at_ten_minutes.timestamp_ns = base + 600_000_000_000;
+        at_ten_minutes.received_at_ns = base + 600_000_000_000;
         let quote = strategy.update(&at_ten_minutes).unwrap();
         assert!(quote.valid_for_trading);
 
@@ -880,5 +793,70 @@ mod tests {
         assert!(!strategy.is_warmed_up());
         assert!(!strategy.is_valid_for_trading());
         assert_eq!(strategy.history_duration_ns(), 0);
+    }
+
+    #[test]
+    fn grid_is_invariant_to_redundant_message_frequency_and_never_looks_ahead() {
+        let mut config = default_config();
+        config.window_steps = 100;
+        let mut sparse = ObiStrategy::new(config.clone(), None, None, None, 0, 5);
+        let mut dense = ObiStrategy::new(config, None, None, None, 0, 5);
+        for i in 0..=200 {
+            let mid = 100.0 + (i % 3) as f64;
+            let mut book = create_snapshot(mid - 0.01, mid + 0.01);
+            book.received_at_ns = 1 + i * 100_000_000;
+            sparse.update(&book);
+            dense.update(&book);
+            if i < 200 {
+                for extra in [20_000_000, 70_000_000] {
+                    book.received_at_ns = 1 + i * 100_000_000 + extra;
+                    dense.update(&book);
+                }
+            }
+        }
+        assert_eq!(sparse.total_samples, dense.total_samples);
+        assert!((sparse.volatility - dense.volatility).abs() < 1e-12);
+        // The grid increments are 1, 1, -2, with variance near 2 price^2.
+        assert!(sparse.volatility > 4.3 && sparse.volatility < 4.6);
+        let mut delayed = create_snapshot(199.99, 200.01);
+        delayed.received_at_ns = 1 + 20_250_000_000;
+        let samples_before = sparse.total_samples;
+        sparse.update(&delayed);
+        assert_eq!(sparse.total_samples, samples_before + 2);
+        // At 20.1 and 20.2 seconds only the old observation was available.
+        assert_eq!(sparse.prev_mid_price, Some(102.0));
+        delayed.received_at_ns = 1 + 20_300_000_000;
+        sparse.update(&delayed);
+        assert_eq!(sparse.prev_mid_price, Some(200.0));
+    }
+
+    #[test]
+    fn flat_prices_have_zero_volatility_and_stale_gaps_reset_warmup() {
+        let mut strategy = ObiStrategy::new(default_config(), None, None, None, 0, 5);
+        let mut book = create_snapshot(99.99, 100.01);
+        for i in 0..200 { book.received_at_ns = 1 + i * 100_000_000; strategy.update(&book); }
+        assert!(strategy.is_warmed_up());
+        assert_eq!(strategy.volatility(), 0.0);
+        book.received_at_ns += 5_000_000_000;
+        strategy.update(&book);
+        assert!(!strategy.is_warmed_up());
+        assert_eq!(strategy.total_samples, 0);
+        assert_eq!(strategy.history_duration_ns(), 0);
+    }
+
+    #[test]
+    fn legacy_alpha_coefficient_uses_exchange_tick_in_actual_quotes() {
+        let config = StrategyConfig { c1_ticks: 2.0, half_spread: 10.0, vol_to_half_spread: 0.0, ..default_config() };
+        // API tick differs from fallback config.tick_size by a factor of 100.
+        let info = Arc::new(SharedSymbolInfo::new("TEST-USD", 1.0, 0.001));
+        let mut strategy = ObiStrategy::new(config.clone(), Some(Arc::clone(&info)), Some(test_shared_equity()), None, 0, 5);
+        strategy.alpha = 1.0;
+        let book = create_snapshot(99.0, 101.0);
+        let quote = strategy.calculate_quote(&book, 100.0).unwrap();
+        assert_eq!(quote.bid_prices[0], 92.0);
+        assert_eq!(quote.ask_prices[0], 112.0);
+        let mut explicit = ObiStrategy::new(StrategyConfig { c1: 3.0, ..config }, Some(info), Some(test_shared_equity()), None, 0, 5);
+        explicit.alpha = 1.0;
+        assert_eq!(explicit.calculate_quote(&book, 100.0).unwrap().bid_prices[0], 93.0);
     }
 }

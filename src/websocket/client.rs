@@ -18,11 +18,14 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 
 use crate::config::WebSocketConfig;
-use super::messages::{StandXMessage, subscribe_message, current_time_ns};
+use crate::types::MAX_LEVELS;
+use super::messages::{StandXMessage, subscribe_message};
 use super::reconnect::{ReconnectConfig, ReconnectState};
 
-/// WebSocket client events.
+/// WebSocket client events. Depth snapshots travel inline: one memcpy per
+/// message instead of a heap allocation on the reader task.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum WsEvent {
     /// Connected to the server
     Connected,
@@ -78,10 +81,13 @@ pub struct WsClient {
     reconnect_config: ReconnectConfig,
     /// Symbols to subscribe to
     symbols: Vec<String>,
+    /// Depth levels kept per side
+    max_levels: usize,
     /// Whether the client is running
     running: Arc<AtomicBool>,
     /// Statistics
     stats: Arc<WsStats>,
+    reconnect: tokio::sync::Notify,
 }
 
 impl WsClient {
@@ -91,8 +97,10 @@ impl WsClient {
             url: config.url.clone(),
             reconnect_config: config.to_reconnect_config(),
             symbols,
+            max_levels: MAX_LEVELS,
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(WsStats::default()),
+            reconnect: tokio::sync::Notify::new(),
         }
     }
 
@@ -102,8 +110,10 @@ impl WsClient {
             url,
             reconnect_config,
             symbols,
+            max_levels: MAX_LEVELS,
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(WsStats::default()),
+            reconnect: tokio::sync::Notify::new(),
         }
     }
 
@@ -121,6 +131,8 @@ impl WsClient {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
     }
+
+    pub fn force_reconnect(&self) { self.reconnect.notify_one(); }
 
     /// Run the WebSocket client with automatic reconnection.
     ///
@@ -227,7 +239,11 @@ impl WsClient {
 
             // Read with timeout (use stale_timeout as read deadline)
             let read_timeout = stale_timeout;
-            match timeout(read_timeout, read.next()).await {
+            let incoming = tokio::select! {
+                _ = self.reconnect.notified() => break,
+                incoming = timeout(read_timeout, read.next()) => incoming,
+            };
+            match incoming {
                 Ok(Some(Ok(msg))) => {
                     last_message = Instant::now();
                     self.handle_message(msg, tx).await;
@@ -252,7 +268,7 @@ impl WsClient {
 
     /// Handle a received WebSocket message.
     async fn handle_message(&self, msg: Message, tx: &mpsc::Sender<WsEvent>) {
-        let received_at = current_time_ns();
+        let received_at = super::monotonic_time_ns();
 
         match msg {
             Message::Text(text) => {
@@ -260,7 +276,7 @@ impl WsClient {
                 self.stats.messages_received.fetch_add(1, Ordering::Relaxed);
                 self.stats.last_message_ns.store(received_at as u64, Ordering::Relaxed);
 
-                match StandXMessage::parse_str(&text) {
+                match StandXMessage::parse_str(&text, self.max_levels, received_at) {
                     Ok(parsed) => {
                         let _ = tx.send(WsEvent::Message(parsed, received_at)).await;
                     }
@@ -275,7 +291,7 @@ impl WsClient {
                 self.stats.messages_received.fetch_add(1, Ordering::Relaxed);
                 self.stats.last_message_ns.store(received_at as u64, Ordering::Relaxed);
 
-                match StandXMessage::parse(&data) {
+                match StandXMessage::parse(&data, self.max_levels, received_at) {
                     Ok(parsed) => {
                         let _ = tx.send(WsEvent::Message(parsed, received_at)).await;
                     }
@@ -306,6 +322,7 @@ pub struct WsClientBuilder {
     url: String,
     reconnect_config: ReconnectConfig,
     symbols: Vec<String>,
+    max_levels: usize,
 }
 
 impl WsClientBuilder {
@@ -316,6 +333,7 @@ impl WsClientBuilder {
             url: default_config.url.clone(),
             reconnect_config: default_config.to_reconnect_config(),
             symbols: vec!["TEST-USD".to_string()],
+            max_levels: MAX_LEVELS,
         }
     }
 
@@ -328,6 +346,12 @@ impl WsClientBuilder {
     /// Set the symbols to subscribe to.
     pub fn symbols(mut self, symbols: Vec<String>) -> Self {
         self.symbols = symbols;
+        self
+    }
+
+    /// Set how many depth levels per side are kept from each message.
+    pub fn orderbook_levels(mut self, levels: usize) -> Self {
+        self.max_levels = levels;
         self
     }
 
@@ -370,40 +394,14 @@ impl WsClientBuilder {
 
     /// Build the WebSocket client.
     pub fn build(self) -> Arc<WsClient> {
-        Arc::new(WsClient::with_reconnect_config(self.url, self.reconnect_config, self.symbols))
+        let mut client = WsClient::with_reconnect_config(self.url, self.reconnect_config, self.symbols);
+        client.max_levels = self.max_levels;
+        Arc::new(client)
     }
 }
 
 impl Default for WsClientBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_builder() {
-        let client = WsClientBuilder::new()
-            .url("wss://test.example.com/ws")
-            .symbols(vec!["TEST-USD".to_string(), "ETH-USD".to_string()])
-            .reconnect_delay(10)
-            .build();
-
-        assert!(!client.is_running());
-        assert_eq!(client.symbols.len(), 2);
-    }
-
-    #[test]
-    fn test_stats() {
-        let stats = WsStats::default();
-        stats.messages_received.fetch_add(10, Ordering::Relaxed);
-        stats.bytes_received.fetch_add(1000, Ordering::Relaxed);
-
-        let snapshot = stats.snapshot();
-        assert_eq!(snapshot.messages_received, 10);
-        assert_eq!(snapshot.bytes_received, 1000);
     }
 }

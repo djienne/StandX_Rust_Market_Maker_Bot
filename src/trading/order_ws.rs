@@ -23,13 +23,16 @@ use tracing::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::auth::AuthManager;
+use super::auth::{AuthManager, RequestSigner};
+use super::order_manager::ExecutionState;
 use super::client::NewOrderRequest;
 use crate::websocket::reconnect::{ReconnectConfig, ReconnectState};
 
 /// Order WebSocket errors.
 #[derive(Debug, thiserror::Error)]
 pub enum OrderWsError {
+    #[error("Order submission suspended or obsolete")]
+    Suspended,
     #[error("Not connected")]
     NotConnected,
 
@@ -171,6 +174,8 @@ pub struct OrderWsClient {
     auth: Arc<Mutex<AuthManager>>,
     /// WebSocket write half (protected by mutex for Arc<Self> access)
     writer: Arc<Mutex<Option<WsWriter>>>,
+    /// Signing material copied out of the auth mutex on first use.
+    signer: std::sync::OnceLock<RequestSigner>,
     /// Whether connected
     connected: Arc<AtomicBool>,
     /// Whether authenticated on WebSocket
@@ -196,6 +201,7 @@ impl OrderWsClient {
             url: "wss://perps.standx.com/ws-api/v1".to_string(),
             auth,
             writer: Arc::new(Mutex::new(None)),
+            signer: std::sync::OnceLock::new(),
             connected: Arc::new(AtomicBool::new(false)),
             ws_authenticated: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
@@ -217,6 +223,7 @@ impl OrderWsClient {
             url: url.into(),
             auth,
             writer: Arc::new(Mutex::new(None)),
+            signer: std::sync::OnceLock::new(),
             connected: Arc::new(AtomicBool::new(false)),
             ws_authenticated: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
@@ -261,6 +268,16 @@ impl OrderWsClient {
         self.running.store(false, Ordering::Release);
         self.connected.store(false, Ordering::Release);
         self.ws_authenticated.store(false, Ordering::Release);
+    }
+
+    /// The keypair is stable for the process lifetime, so only the first order
+    /// write waits for the auth mutex; REST polls hold it across round trips.
+    async fn signer(&self) -> Result<&RequestSigner, OrderWsError> {
+        if let Some(signer) = self.signer.get() {
+            return Ok(signer);
+        }
+        let signer = self.auth.lock().await.signer()?;
+        Ok(self.signer.get_or_init(|| signer))
     }
 
     /// Generate a unique request ID.
@@ -308,7 +325,7 @@ impl OrderWsClient {
             self.connected.store(false, Ordering::Release);
             self.ws_authenticated.store(false, Ordering::Release);
             self.pending_cancels.lock().await.clear();
-            self.pending_requests.lock().await.clear();
+            // Unresolved submissions survive reconnect; absence is not a rejection.
 
             if !self.running.load(Ordering::Acquire) {
                 break;
@@ -585,7 +602,9 @@ impl OrderWsClient {
     /// Place a new order via WebSocket.
     ///
     /// Returns the client order ID.
-    pub async fn place_order(&self, mut request: NewOrderRequest) -> Result<String, OrderWsError> {
+    pub async fn place_order(&self, mut request: NewOrderRequest, execution: &ExecutionState, generation: u64) -> Result<String, OrderWsError> {
+        let _submission = execution.submission.lock().await;
+        if !execution.permits(generation) { return Err(OrderWsError::Suspended); }
         if !self.is_connected() {
             return Err(OrderWsError::NotConnected);
         }
@@ -604,10 +623,7 @@ impl OrderWsClient {
         let params_json = serde_json::to_string(&request)
             .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
-        let (signing_request_id, timestamp_ms, signature) = {
-            let auth = self.auth.lock().await;
-            auth.sign_request(&params_json)?
-        };
+        let (signing_request_id, timestamp_ms, signature) = self.signer().await?.sign(&params_json);
         let response_request_id = self.next_request_id();
 
         // Build WebSocket message
@@ -623,19 +639,16 @@ impl OrderWsClient {
             params: WsParams(params_json),
         };
 
-        self.pending_requests.lock().await.insert(
-            response_request_id.clone(),
-            PendingRequest::New {
-                cl_ord_id: cl_ord_id.clone(),
-            },
-        );
-        if let Err(error) = self.send_message_internal(&msg).await {
-            self.pending_requests
-                .lock()
-                .await
-                .remove(&response_request_id);
-            return Err(error);
-        }
+        let mut writer_guard = self.writer.lock().await;
+        let writer = writer_guard.as_mut().ok_or(OrderWsError::NotConnected)?;
+        let json = serde_json::to_string(&msg).map_err(|e| OrderWsError::SendError(e.to_string()))?;
+        if !execution.permits(generation) { return Err(OrderWsError::Suspended); }
+        self.pending_requests.lock().await.insert(response_request_id, PendingRequest::New { cl_ord_id: cl_ord_id.clone() });
+        // A failed/timed-out write may have reached the exchange. Retain it
+        // until a correlated response or authenticated REST identifies it.
+        timeout(Duration::from_secs(5), writer.send(Message::Text(json))).await
+            .map_err(|_| OrderWsError::SendError("order write timed out; outcome unknown".into()))?
+            .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
         Ok(cl_ord_id)
     }
@@ -696,6 +709,40 @@ impl OrderWsClient {
         });
     }
 
+    /// Called with the execution barrier held and submissions paused.
+    /// REST visibility can identify an unacknowledged new order, but an empty
+    /// snapshot cannot establish that an unresolved submission was rejected.
+    pub async fn cancel_and_verify(&self, auth: &mut AuthManager) -> Result<bool, super::auth::AuthError> {
+        let before = auth.query_open_orders(None).await?;
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.retain(|_, request| match request {
+                PendingRequest::New { cl_ord_id } => !before.iter().any(|order| order.cl_ord_id.as_ref() == Some(cl_ord_id)),
+                _ => true,
+            });
+        }
+        let unresolved: Vec<String> = self.pending_requests.lock().await.values().filter_map(|request| {
+            if let PendingRequest::New { cl_ord_id } = request { Some(cl_ord_id.clone()) } else { None }
+        }).collect();
+        for id in unresolved {
+            if let Ok(order) = auth.query_order(&id).await {
+                if matches!(order.status.as_str(), "open" | "filled" | "canceled" | "cancelled" | "rejected") {
+                    self.try_clear_rest_confirmed_requests(&[&id]);
+                }
+            }
+        }
+        // Settlement must precede cancellation: an ACK arriving during REST
+        // cleanup requires another pass, not a retroactive success verdict.
+        let settled_before_cancel = self.submissions_settled().await;
+        auth.cancel_all_orders(None).await?;
+        let remaining = auth.query_open_orders(None).await?;
+        Ok(remaining.is_empty() && settled_before_cancel)
+    }
+
+    pub async fn submissions_settled(&self) -> bool {
+        !self.pending_requests.lock().await.values().any(|request| matches!(request, PendingRequest::New { .. }))
+    }
+
     /// Internal helper to send a cancel request.
     async fn send_cancel(
         &self,
@@ -712,10 +759,7 @@ impl OrderWsClient {
         let params_json = serde_json::to_string(&params)
             .map_err(|e| OrderWsError::SendError(e.to_string()))?;
 
-        let (signing_request_id, timestamp_ms, signature) = {
-            let auth = self.auth.lock().await;
-            auth.sign_request(&params_json)?
-        };
+        let (signing_request_id, timestamp_ms, signature) = self.signer().await?.sign(&params_json);
         let response_request_id = self.next_request_id();
 
         let msg = WsOrderMessage {
@@ -848,7 +892,9 @@ impl OrderWsClient {
         let request_id = response.request_id.clone();
 
         if let Some(id) = request_id.as_deref() {
-            let pending_request = pending_requests.lock().await.remove(id);
+            let pending_request = if response.code.is_some() {
+                pending_requests.lock().await.remove(id)
+            } else { None };
             if let Some(pending_request) = pending_request {
                 Self::handle_correlated_response(
                     id,
@@ -863,8 +909,24 @@ impl OrderWsClient {
             }
         }
 
+        if response.code.is_some() && request_id.as_deref().is_some_and(|id| id.starts_with("req_session_")) && response.method.is_none()
+            && response.data.is_none() && response.result.is_none() {
+            // Already settled request: a duplicate or response from an old generation.
+            return;
+        }
+
         // Use result field if data is not present (StandX API uses "result")
         let data = response.data.or(response.result);
+
+        if response.code.is_some() && method != "order:cancel" {
+            if let Some(cl_ord_id) = data.as_ref().and_then(Self::extract_cl_ord_id) {
+                if !pending_cancels.lock().await.contains(&cl_ord_id) {
+                    pending_requests.lock().await.retain(|_, request| {
+                        !matches!(request, PendingRequest::New { cl_ord_id: id } if *id == cl_ord_id)
+                    });
+                }
+            }
+        }
 
         // Handle responses with explicit method field
         match method {
@@ -1214,15 +1276,6 @@ mod tests {
         assert!(id1.starts_with("req_session_"));
     }
 
-    #[test]
-    fn test_reconnect_config() {
-        let auth = Arc::new(Mutex::new(AuthManager::new()));
-        let client = OrderWsClient::new(auth);
-
-        // Default config should have max 10 retries
-        assert_eq!(client.reconnect_config.max_retries, Some(10));
-    }
-
     #[tokio::test]
     async fn data_less_order_response_fails_closed() {
         let response: WsResponse = serde_json::from_value(json!({
@@ -1431,5 +1484,124 @@ mod tests {
         assert!(!summary.contains("secret-jwt"));
         assert!(!summary.contains("private-signature"));
         assert!(!summary.contains("header-id"));
+    }
+
+    async fn mock_account(body: &'static str) -> (AuthManager, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    if count == 0 { break; }
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (AuthManager::for_test(super::super::client::StandXClient::with_urls(&url, &url)), handle)
+    }
+
+    async fn order_socket(auth: Arc<Mutex<AuthManager>>) -> (Arc<OrderWsClient>, WebSocketStream<TcpStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (outgoing, incoming) = tokio::join!(connect_async(&url), async {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let (writer, _reader) = outgoing.unwrap().0.split();
+        let client = Arc::new(OrderWsClient::new(auth));
+        *client.writer.lock().await = Some(writer);
+        client.connected.store(true, Ordering::Release);
+        client.ws_authenticated.store(true, Ordering::Release);
+        (client, incoming)
+    }
+
+    fn execution_manager() -> super::super::order_manager::OrderManager {
+        super::super::order_manager::OrderManager::new(
+            super::super::order_manager::OrderManagerConfig::default(),
+            Arc::new(super::super::position::SharedPosition::new("BTC-USD")),
+            Arc::new(super::super::equity::SharedEquity::new(1, 10.0, 1.0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn pause_at_write_boundary_invalidates_queued_send() {
+        let (auth, server) = mock_account(r#"{"code":0,"message":"success","result":[]}"#).await;
+        let (client, mut peer) = order_socket(Arc::new(Mutex::new(auth))).await;
+        let manager = execution_manager();
+        let execution = manager.execution_state();
+        let generation = execution.generation();
+        let writer = client.writer.lock().await;
+        let send_client = Arc::clone(&client);
+        let send_state = Arc::clone(&execution);
+        let send = tokio::spawn(async move {
+            send_client.place_order(NewOrderRequest::post_only_buy("BTC-USD", 100.0, 1.0), &send_state, generation).await
+        });
+        timeout(Duration::from_secs(2), async {
+            while execution.submission.try_lock().is_ok() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        manager.pause();
+        assert!(execution.submission.try_lock().is_err(), "cleanup waits for admitted writer");
+        drop(writer);
+        assert!(matches!(send.await.unwrap(), Err(OrderWsError::Suspended)));
+        // Cancels remain permitted even while new submissions are suspended.
+        client.cancel_order_by_client_id("test-cancel").await.unwrap();
+        let cancel: serde_json::Value = serde_json::from_str(&peer.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(cancel["method"], "order:cancel");
+        manager.resume();
+        assert!(!execution.permits(generation), "old queued generation stays invalid after resume");
+        assert!(client.submissions_settled().await);
+        assert!(timeout(Duration::from_millis(20), peer.next()).await.is_err());
+        manager.shutdown();
+        assert!(!execution.permits(execution.generation()));
+        assert!(matches!(client.place_order(NewOrderRequest::post_only_buy("BTC-USD", 100.0, 1.0),
+            &execution, execution.generation()).await, Err(OrderWsError::Suspended)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_ack_and_disconnect_cannot_turn_empty_rest_into_success() {
+        let (auth, server) = mock_account(r#"{"code":0,"message":"success","result":[]}"#).await;
+        let auth = Arc::new(Mutex::new(auth));
+        let (client, mut peer) = order_socket(Arc::clone(&auth)).await;
+        let manager = execution_manager();
+        let execution = manager.execution_state();
+        client.place_order(NewOrderRequest::post_only_buy("BTC-USD", 100.0, 1.0).with_client_id("test-order"),
+            &execution, execution.generation()).await.unwrap();
+        let wire = peer.next().await.unwrap().unwrap().into_text().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        manager.begin_reconciliation();
+        client.force_reconnect().await;
+        assert!(!client.submissions_settled().await);
+        {
+            let _barrier = execution.submission.lock().await;
+            let mut auth = auth.lock().await;
+            assert!(!client.cancel_and_verify(&mut auth).await.unwrap());
+        }
+        let response: WsResponse = serde_json::from_value(json!({"request_id": request["request_id"], "code": 0})).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        OrderWsClient::handle_response(serde_json::from_value(json!({"request_id": request["request_id"], "code": 0})).unwrap(), &tx, &client.pending_cancels, &client.pending_requests).await;
+        assert!(matches!(rx.recv().await, Some(OrderEvent::OrderAccepted { .. })));
+        let _barrier = execution.submission.lock().await;
+        let mut auth = auth.lock().await;
+        assert!(client.cancel_and_verify(&mut auth).await.unwrap());
+        // Duplicate response from the settled generation must not resurrect state.
+        OrderWsClient::handle_response(response, &tx, &client.pending_cancels, &client.pending_requests).await;
+        assert!(rx.try_recv().is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_success_with_api_error_cannot_verify_cleanup() {
+        let (mut auth, server) = mock_account(r#"{"code":500,"message":"temporarily unavailable","result":[]}"#).await;
+        let client = OrderWsClient::new(Arc::new(Mutex::new(AuthManager::new())));
+        assert!(client.cancel_and_verify(&mut auth).await.is_err());
+        server.abort();
     }
 }

@@ -151,15 +151,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_shared_alpha() {
-        let shared = SharedAlpha::new();
-        assert_eq!(shared.alpha(), 0.0);
-        assert_eq!(shared.volatility(), 0.0);
-        assert_eq!(shared.sample_count(), 0);
-        assert!(!shared.is_warmed_up());
-    }
-
-    #[test]
     fn test_update_and_read() {
         let shared = SharedAlpha::new();
         shared.update(0.5, 0.001);

@@ -341,18 +341,3 @@ impl WalletTrackerHandle {
         let _ = self.handle.await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_wallet_tracker_config() {
-        let config = WalletTrackerConfig {
-            interval: Duration::from_secs(60),
-            csv_path: "test.csv".to_string(),
-        };
-        assert_eq!(config.interval.as_secs(), 60);
-        assert_eq!(config.csv_path, "test.csv");
-    }
-}

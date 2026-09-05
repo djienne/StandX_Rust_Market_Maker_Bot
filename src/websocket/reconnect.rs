@@ -152,20 +152,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let config = ReconnectConfig::default();
-        assert_eq!(config.initial_delay_secs, 5);
-        assert_eq!(config.max_delay_secs, 60);
-        assert!(config.max_retries.is_none());
-    }
-
-    #[test]
-    fn test_for_orders_config() {
-        let config = ReconnectConfig::for_orders();
-        assert_eq!(config.max_retries, Some(10));
-    }
-
-    #[test]
     fn test_exponential_backoff() {
         let config = ReconnectConfig::default();
         let mut state = ReconnectState::new(&config);

@@ -1,148 +1,27 @@
-# Monitoring Runbook
+# Operating checks
 
-This file captures the current monitoring setup and tips for long runs (e.g., 8h).
+Use the deployment and observe-only commands in [README](README.md). Run only one live bot on a dedicated account: startup and reconciliation cancel account-wide orders. Do not run the historical leverage-test executable as a health check; it can change leverage.
 
-## Start a run (full debug logs)
-
-```bash
-RUST_LOG=debug ./target/release/standx-orderbook config.json > run_debug_8h.log 2>&1 &
-echo $! > run_debug_8h.pid
-```
-
-## Periodic checks (every ~10 minutes)
-
-A background watcher scans the log and appends summaries to `run_debug_8h_watch.log`.
-It records:
-- alerts (WARN/ERROR/panic/etc.)
-- sanity drift (non-zero REST vs WS bid/ask diffs)
-
-To start the watcher:
+## While running
 
 ```bash
-(while true; do ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
-  hits=$(rg -n "WARN|ERROR|panic|Orderbook drift|Crossed book|Orderbook validation failed" run_debug_8h.log | tail -n 20); \
-  sanity_hits=$(tail -n 2000 run_debug_8h.log | awk '/SANITY/ { if (match($0, /diff: bid=([-0-9.]+) ask=([-0-9.]+)/, m)) { if (m[1] != "0.00" || m[2] != "0.00") print $0 } }' | tail -n 20); \
-  { printf "=== %s ===\n" "$ts"; \
-    if [ -n "$hits" ]; then printf "[alerts]\n%s\n" "$hits"; else printf "[alerts]\n(no hits)\n"; fi; \
-    if [ -n "$sanity_hits" ]; then printf "[sanity_nonzero]\n%s\n" "$sanity_hits"; else printf "[sanity_nonzero]\n(no hits)\n"; fi; } >> run_debug_8h_watch.log; \
-  sleep 600; done) &
-echo $! > run_debug_8h_watch.pid
+docker compose logs --tail 100 bot
+docker compose ps
 ```
 
-## Log rotation (size-based)
+Inspect fresh valid-depth activity, current position/equity age, warmup status, pause reasons, exchange order identities, and reconciliation failures. A running process or continuing ping/pong traffic does not establish healthy trading. Repeated empty REST polls cannot prove that an unacknowledged submission was rejected.
 
-A lightweight rotator keeps logs from filling disk. It checks every 5 minutes,
-rotates `run_debug_8h.log` at 50MB, and keeps the 5 newest archives.
+REST/WS price differences are diagnostics between observations at different times. The checker does not correct the trading book. Inspect depth freshness and timestamps before interpreting those differences.
+
+Compose rotates logs at 50 MB with five files. Wallet CSVs are under `data/`; test-service CSVs are under `data/observe/`. The old `monitor_*`, `rotate_4h.sh`, and latency scripts refer to historical run paths and are not started by Compose.
+
+## Stop and verify
 
 ```bash
-(while true; do size=$(stat -c %s run_debug_8h.log 2>/dev/null || echo 0); max=$((50*1024*1024)); \
-  if [ "$size" -ge "$max" ]; then ts=$(date -u +"%Y%m%dT%H%M%SZ"); \
-    cp run_debug_8h.log "run_debug_8h.log.$ts"; : > run_debug_8h.log; \
-    ls -1t run_debug_8h.log.20* 2>/dev/null | tail -n +6 | xargs -r rm --; fi; \
-  sleep 300; done) &
-echo $! > run_debug_8h_rotate.pid
+docker compose stop bot
+docker compose logs --tail 100 bot
 ```
 
-## Quick checks
+SIGTERM invokes the same cleanup as Ctrl+C: permanently stop new submissions, settle outstanding submission outcomes, cancel orders, and verify zero open orders. Compose allows 120 seconds; final reconciliation has a 90-second budget. Positions are reported but not closed.
 
-- Latest warnings/errors:
-  ```bash
-  rg -n "WARN|ERROR|panic|Orderbook drift|Crossed book|Orderbook validation failed" run_debug_8h.log | tail -n 50
-  ```
-
-- Latest watch summary:
-  ```bash
-  tail -n 40 run_debug_8h_watch.log
-  ```
-
-- Latest quote lines:
-  ```bash
-  rg -n "Quote: bid=|bid=|ask=" run_debug_8h.log | tail -n 5
-  ```
-
-- Latest position lines:
-  ```bash
-  rg -n "Position:" run_debug_8h.log | tail -n 5
-  ```
-
-- Latest warmup status:
-  ```bash
-  rg -n "\[WARM" run_debug_8h.log | tail -n 1
-  ```
-
-- Latest sanity check (REST vs WS):
-  ```bash
-  rg -n "SANITY" run_debug_8h.log | tail -n 5
-  ```
-
-- Live tail (debug stream):
-  ```bash
-  tail -f run_debug_8h.log
-  ```
-
-## Process status
-
-- Confirm only one orderbook process:
-  ```bash
-  ps -ef | rg -n "standx-orderbook"
-  ```
-
-- Check watcher/rotator PIDs:
-  ```bash
-  ps -p "$(cat run_debug_8h_watch.pid)" -o pid,cmd
-  ps -p "$(cat run_debug_8h_rotate.pid)" -o pid,cmd
-  ```
-
-## Disk usage
-
-- Check available space:
-  ```bash
-  df -h /home/ubuntu/standx
-  ```
-
-- Check current log sizes:
-  ```bash
-  ls -lh run_debug_8h.log run_debug_8h_watch.log
-  ```
-
-## Troubleshooting notes
-
-- If you see frequent `Orderbook drift` corrections:
-  - Confirm WS ordering is monotonic (watch for SANITY diffs).
-  - Consider raising `orderbook_sanity_check.drift_threshold_bps`
-    or increasing `interval_secs`.
-- If you see `Crossed book` or validation failures:
-  - Verify bid/ask ordering in upstream feed.
-  - Inspect latest SANITY line for non-zero diffs.
-- If `disconnected`/`reconnect` messages appear:
-  - Check network stability and WebSocket endpoints in `config.json`.
-
-## Rotate cleanup
-
-- Keep only the newest 5 archives:
-  ```bash
-  ls -1t run_debug_8h.log.20* 2>/dev/null | tail -n +6 | xargs -r rm --
-  ```
-
-## Restart sequence
-
-```bash
-kill "$(cat run_debug_8h_watch.pid)"
-kill "$(cat run_debug_8h_rotate.pid)"
-kill "$(cat run_debug_8h.pid)"
-RUST_LOG=debug ./target/release/standx-orderbook config.json > run_debug_8h.log 2>&1 &
-echo $! > run_debug_8h.pid
-```
-
-## Stop
-
-```bash
-kill "$(cat run_debug_8h_watch.pid)"
-kill "$(cat run_debug_8h_rotate.pid)"
-kill "$(cat run_debug_8h.pid)"
-```
-
-## Notes
-
-- Logs live in the workspace: `run_debug_8h.log` and `run_debug_8h_watch.log`.
-- The watcher scans the last 2000 lines for sanity diffs and reports non-zero entries.
+An unverified cleanup exits with an error and the service does not automatically restart. Inspect outstanding orders and positions directly at the exchange before restarting. An unresolved submission may have been accepted even if it is absent from the latest open-order response. Do not replace verification with repeated restarts.

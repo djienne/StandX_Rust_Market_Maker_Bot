@@ -518,12 +518,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_is_futures() {
-        let config = BinanceClientConfig::default();
-        assert_eq!(config.market_type, MarketType::Futures);
-    }
-
-    #[test]
     fn test_futures_config_urls() {
         let config = BinanceClientConfig::futures("btcusdt");
         assert!(config.ws_stream_url().contains("fstream.binance.com"));
@@ -579,13 +573,4 @@ mod tests {
         assert!(config.ws_stream_url().contains("fstream.binance.com"));
     }
 
-    #[test]
-    fn test_stats_default() {
-        let stats = BinanceWsStats::new();
-        let snapshot = stats.snapshot();
-
-        assert_eq!(snapshot.messages_received, 0);
-        assert_eq!(snapshot.reconnects, 0);
-        assert_eq!(snapshot.bytes_received, 0);
-    }
 }

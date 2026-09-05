@@ -2,7 +2,7 @@
 //!
 //! Snapshot storage is deliberately kept off the quote-to-order path. A compact
 //! `parking_lot` lock makes the ownership rules explicit and supports the market
-//! stream and the infrequent REST sanity correction without unsafe aliasing.
+//! stream and diagnostic readers without unsafe aliasing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,7 +22,7 @@ pub struct CurrentOrderbook {
 }
 
 impl CurrentOrderbook {
-    /// Create a new triple buffer for the given symbol.
+    /// Create current-book storage for the given symbol.
     pub fn new(symbol: Symbol) -> Self {
         Self {
             snapshot: RwLock::new(None),
@@ -179,7 +179,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_triple_buffer_basic() {
+    fn test_current_book_basic() {
         let ob = CurrentOrderbook::new(Symbol::new("TEST-USD"));
 
         // Initially no data
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_triple_buffer_updates() {
+    fn test_current_book_updates() {
         let ob = CurrentOrderbook::new(Symbol::new("TEST-USD"));
 
         // Multiple updates

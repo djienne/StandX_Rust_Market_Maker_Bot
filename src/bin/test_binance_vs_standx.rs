@@ -297,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_reconnect_delay_secs: 60,
         connect_timeout_secs: 30,
         stale_timeout_secs: 60,
+        depth_stale_timeout_secs: 5,
     };
     let standx_client = Arc::new(WsClient::new(standx_config, vec!["BTC-USD".to_string()]));
     let mut standx_obi = StandXObiCalculator::new(window_size, looking_depth);
@@ -367,12 +368,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = timeout(Duration::from_millis(100), standx_rx.recv()) => {
                 if let Ok(Some(event)) = result {
                     match event {
-                        WsEvent::Message(StandXMessage::DepthBook(data), _ts) => {
+                        WsEvent::Message(StandXMessage::DepthBook(snapshot), _ts) => {
                             standx_count += 1;
-                            // Convert to OrderbookSnapshot
-                            let mut snapshot = OrderbookSnapshot::new(standx_orderbook::types::Symbol::new("BTC-USD"));
-                            snapshot.set_bids_from_strings(&data.bids, 50);
-                            snapshot.set_asks_from_strings(&data.asks, 50);
 
                             // Run sanity check
                             let check = SanityCheck::check_snapshot(&snapshot);

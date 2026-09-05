@@ -1,13 +1,31 @@
 services:
-  collector:
+  bot:
     build: .
-    container_name: lighter-ohlcv-collector
-    restart: unless-stopped
-    network_mode: host
+    env_file: .env
+    command: ["/app/config.json"]
     volumes:
+      - ./config.json:/app/config.json:ro
       - ./data:/data
-    environment:
-      - DATA_DIR=/data
-      - SYMBOLS=BTC,ETH,HYPE
-      - EARLIEST_DATE=2025-01-15
-      - POLL_INTERVAL=14400
+    stop_signal: SIGTERM
+    stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  bot-test:
+    build: .
+    profiles: [test]
+    env_file: .env
+    command: ["/app/config.test.json"]
+    volumes:
+      - ./config.test.json:/app/config.test.json:ro
+      - ./data/observe:/data
+    stop_signal: SIGTERM
+    stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

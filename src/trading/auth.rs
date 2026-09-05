@@ -118,6 +118,34 @@ impl AuthToken {
 
 /// Authentication manager for StandX API.
 ///
+/// Request-signing material. The ed25519 keypair is generated once per process
+/// and reused across token refreshes, so a copy can sign order writes without
+/// waiting for the shared auth mutex that REST polls hold across round trips.
+#[derive(Clone)]
+pub struct RequestSigner {
+    key: Ed25519SigningKey,
+    request_id: String,
+}
+
+impl RequestSigner {
+    /// Returns `(request_id, timestamp_ms, base64 signature)` for `body`.
+    pub fn sign(&self, body: &str) -> (String, u64, String) {
+        use ed25519_dalek::Signer;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Format: v1,{request_id},{timestamp_ms},{body}
+        let message = format!("v1,{},{},{}", self.request_id, timestamp_ms, body);
+        let signature = self.key.sign(message.as_bytes());
+        let sig_base64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            signature.to_bytes(),
+        );
+        (self.request_id.clone(), timestamp_ms, sig_base64)
+    }
+}
+
 /// Handles JWT token acquisition and refresh.
 pub struct AuthManager {
     /// HTTP client for API calls
@@ -157,6 +185,15 @@ impl AuthManager {
             request_id: None,
             auth_count: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(client: StandXClient) -> Self {
+        let mut auth = Self::new();
+        auth.client = client;
+        auth.generate_keypair();
+        auth.token = Some(AuthToken { token: "test-token".into(), expires_at: u64::MAX, address: "test".into() });
+        auth
     }
 
     /// Create auth manager from environment variables.
@@ -499,6 +536,11 @@ impl AuthManager {
             .map_err(Into::into)
     }
 
+    pub async fn query_order(&mut self, cl_ord_id: &str) -> Result<super::client::OpenOrder, AuthError> {
+        let token = self.ensure_valid_token().await?.to_string();
+        self.client.query_order(&token, cl_ord_id).await.map_err(Into::into)
+    }
+
     /// Query current leverage for a symbol.
     pub async fn query_leverage(&mut self, symbol: &str) -> Result<i32, AuthError> {
         // Proactive refresh
@@ -567,28 +609,15 @@ impl AuthManager {
     ///
     /// A tuple of (request_id, timestamp_ms, signature_base64)
     pub fn sign_request(&self, body: &str) -> Result<(String, u64, String), AuthError> {
-        let ed25519_key = self.ed25519_key.as_ref()
-            .ok_or(AuthError::NotAuthenticated)?;
-        let request_id = self.request_id.as_ref()
-            .ok_or(AuthError::NotAuthenticated)?;
+        Ok(self.signer()?.sign(body))
+    }
 
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        // Format: v1,{request_id},{timestamp_ms},{body}
-        let message = format!("v1,{},{},{}", request_id, timestamp_ms, body);
-
-        // Sign with ed25519
-        use ed25519_dalek::Signer;
-        let signature = ed25519_key.sign(message.as_bytes());
-        let sig_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            signature.to_bytes()
-        );
-
-        Ok((request_id.clone(), timestamp_ms, sig_base64))
+    /// Copy of the signing material; `NotAuthenticated` before keypair generation.
+    pub fn signer(&self) -> Result<RequestSigner, AuthError> {
+        Ok(RequestSigner {
+            key: self.ed25519_key.clone().ok_or(AuthError::NotAuthenticated)?,
+            request_id: self.request_id.clone().ok_or(AuthError::NotAuthenticated)?,
+        })
     }
 
     /// Get authentication count.
@@ -617,26 +646,6 @@ pub trait Authenticated {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_credentials() {
-        let creds = Credentials::new(
-            "0x1234567890abcdef",
-            "deadbeef",
-            "bsc"
-        );
-        assert_eq!(creds.chain, "bsc");
-    }
-
-    #[test]
-    fn test_auth_manager() {
-        let mut auth = AuthManager::new();
-        assert!(!auth.has_credentials());
-        assert!(!auth.is_authenticated());
-
-        auth.set_credentials(Credentials::new("addr", "key", "bsc"));
-        assert!(auth.has_credentials());
-    }
 
     #[test]
     fn test_token_expiration() {

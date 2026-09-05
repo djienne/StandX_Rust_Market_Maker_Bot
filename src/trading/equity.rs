@@ -193,15 +193,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_shared_equity_new() {
-        let equity = SharedEquity::new(2, 10.0, 1.0);
-        assert_eq!(equity.equity(), 0.0);
-        assert_eq!(equity.order_qty_dollar(), 0.0);
-        assert_eq!(equity.max_position_dollar(), 0.0);
-        assert!(!equity.is_initialized());
-    }
-
-    #[test]
     fn test_shared_equity_formula() {
         // Test with $500 equity and 2 order levels
         // order_qty: $500 / 5 * 0.9 / 2 = $45

@@ -1,7 +1,7 @@
 //! Orderbook sanity checker via REST API.
 //!
 //! Periodically compares the WebSocket-maintained orderbook against
-//! a REST API "ground truth" snapshot and applies corrections if drift is detected.
+//! a REST API snapshot. Their observation times differ; this is diagnostic only.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,8 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::SanityCheckConfig;
 use crate::trading::client::{DepthBookResponse, StandXClient};
-use crate::types::{OrderbookSnapshot, Symbol};
-use crate::websocket::current_time_ns;
+use crate::types::{OrderbookSnapshot};
 use super::OrderbookStore;
 
 /// Statistics for sanity checker.
@@ -21,8 +20,6 @@ use super::OrderbookStore;
 pub struct SanityCheckerStats {
     /// Total checks performed
     pub checks: AtomicU64,
-    /// Total corrections applied
-    pub corrections: AtomicU64,
     /// Total drift detections (including those below threshold)
     pub drift_detections: AtomicU64,
 }
@@ -32,7 +29,6 @@ impl SanityCheckerStats {
     pub fn snapshot(&self) -> SanityCheckerStatsSnapshot {
         SanityCheckerStatsSnapshot {
             checks: self.checks.load(Ordering::Relaxed),
-            corrections: self.corrections.load(Ordering::Relaxed),
             drift_detections: self.drift_detections.load(Ordering::Relaxed),
         }
     }
@@ -42,7 +38,6 @@ impl SanityCheckerStats {
 #[derive(Debug, Clone)]
 pub struct SanityCheckerStatsSnapshot {
     pub checks: u64,
-    pub corrections: u64,
     pub drift_detections: u64,
 }
 
@@ -53,8 +48,6 @@ pub struct SanityCheckerConfig {
     pub interval: Duration,
     /// Drift threshold in basis points
     pub drift_threshold_bps: f64,
-    /// Max orderbook levels to use for comparison/correction
-    pub max_levels: usize,
 }
 
 impl From<&SanityCheckConfig> for SanityCheckerConfig {
@@ -62,7 +55,6 @@ impl From<&SanityCheckConfig> for SanityCheckerConfig {
         Self {
             interval: Duration::from_secs(config.interval_secs),
             drift_threshold_bps: config.drift_threshold_bps,
-            max_levels: 20, // Default, can be made configurable
         }
     }
 }
@@ -135,7 +127,7 @@ impl OrderbookSanityChecker {
         info!("Orderbook sanity checker stopped");
     }
 
-    /// Check a single symbol and apply correction if needed.
+    /// Compare a single symbol without changing published data.
     async fn check_and_correct(&self, symbol: &str, ob: &super::SymbolOrderbook) {
         self.stats.checks.fetch_add(1, Ordering::Relaxed);
 
@@ -148,7 +140,7 @@ impl OrderbookSanityChecker {
             }
         };
 
-        // 2. Get current WS book (lock-free peek - doesn't swap indices)
+        // 2. Read the current WS book for comparison
         let ws_book = match ob.peek() {
             Some(b) => b,
             None => {
@@ -170,19 +162,8 @@ impl OrderbookSanityChecker {
             );
         }
 
-        // 4. Apply correction if above threshold
         if max_drift > self.config.drift_threshold_bps {
-            warn!(
-                "[{}] Orderbook drift {:.2}bps exceeds threshold {:.1}bps, applying correction",
-                symbol, max_drift, self.config.drift_threshold_bps
-            );
-
-            // Convert REST to OrderbookSnapshot and apply
-            let corrected = self.rest_to_snapshot(&rest_book);
-            ob.update(corrected);
-
-            self.stats.corrections.fetch_add(1, Ordering::Relaxed);
-            info!("[{}] Orderbook corrected from REST API", symbol);
+            warn!("[{}] REST/WS difference {:.2}bps; observations are not simultaneous", symbol, max_drift);
         }
     }
 
@@ -245,27 +226,6 @@ impl OrderbookSanityChecker {
         (drift_bid_bps, drift_ask_bps)
     }
 
-    /// Convert REST DepthBookResponse to OrderbookSnapshot.
-    fn rest_to_snapshot(&self, rest_book: &DepthBookResponse) -> OrderbookSnapshot {
-        let now_ns = current_time_ns();
-        let mut snapshot = OrderbookSnapshot::new(Symbol::new(&rest_book.symbol));
-        snapshot.timestamp_ns = now_ns;
-        snapshot.received_at_ns = now_ns;
-
-        // Convert bids: [[price, qty], ...] to [(String, String), ...]
-        let bids: Vec<(String, String)> = rest_book.bids.iter()
-            .map(|[p, q]| (p.clone(), q.clone()))
-            .collect();
-        snapshot.set_bids_from_strings(&bids, self.config.max_levels);
-
-        // Convert asks
-        let asks: Vec<(String, String)> = rest_book.asks.iter()
-            .map(|[p, q]| (p.clone(), q.clone()))
-            .collect();
-        snapshot.set_asks_from_strings(&asks, self.config.max_levels);
-
-        snapshot
-    }
 }
 
 /// Handle to control the sanity checker.
@@ -289,22 +249,5 @@ impl SanityCheckerHandle {
     /// Wait for the checker to finish.
     pub async fn join(self) {
         let _ = self.handle.await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_conversion() {
-        let config = SanityCheckConfig {
-            enabled: true,
-            interval_secs: 30,
-            drift_threshold_bps: 1.0,
-        };
-        let checker_config: SanityCheckerConfig = (&config).into();
-        assert_eq!(checker_config.interval.as_secs(), 30);
-        assert_eq!(checker_config.drift_threshold_bps, 1.0);
     }
 }

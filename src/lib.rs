@@ -1,86 +1,4 @@
-//! # StandX Market Maker
-//!
-//! High-performance market making system for the StandX perpetual futures exchange.
-//!
-//! ## Features
-//!
-//! - **Lock-free data structures**: Triple buffer for current state,
-//!   ring buffer for history (no mutexes on hot path)
-//! - **OBI Strategy**: Order Book Imbalance based quote generation with
-//!   volatility scaling and position skew adjustment
-//! - **Low-latency trading**: WebSocket order API (5-50ms) with HTTP fallback
-//! - **Position management**: Background polling with atomic updates (lock-free reads)
-//! - **Auto-reconnection**: WebSocket clients with exponential backoff
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    Market Data (WebSocket)                   │
-//! │  Orderbook ─► Snapshot ─► OBI Strategy ─► Quote Generation  │
-//! └─────────────────────────────────────────────────────────────┘
-//!                              ▲
-//!                              │ lock-free read
-//!               ┌──────────────┴──────────────┐
-//!               │   SharedPosition (Atomic)   │
-//!               └──────────────▲──────────────┘
-//!                              │ background update
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │               Position Poller (HTTP, 2s interval)           │
-//! └─────────────────────────────────────────────────────────────┘
-//!                              │
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                 Order Execution (WebSocket)                  │
-//! │    NewOrder ─► OrderWsClient ─► Exchange ─► Confirmation    │
-//! └─────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Modules
-//!
-//! - [`types`]: Core data types (PriceLevel, OrderbookSnapshot, Symbol)
-//! - [`config`]: Configuration loading and validation
-//! - [`orderbook`]: Lock-free orderbook storage
-//! - [`websocket`]: WebSocket client for market data
-//! - [`trading`]: Authentication, order management, position polling
-//! - [`logging`]: Centralized logging with debug flag control
-//! - [`strategy`]: OBI market making strategy and quote generation
-//!
-//! ## Quick Start
-//!
-//! ```ignore
-//! use std::sync::Arc;
-//! use standx_orderbook::{Config, OrderbookStore, WsClient, WsClientBuilder, WsEvent};
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     // Load configuration
-//!     let config = Config::from_file("config.json").unwrap();
-//!
-//!     // Create orderbook store
-//!     let store = Arc::new(OrderbookStore::new(
-//!         &config.symbols,
-//!         config.history_buffer_size,
-//!         config.history_minutes,
-//!     ));
-//!
-//!     // Create WebSocket client
-//!     let client = WsClientBuilder::new()
-//!         .config(config.websocket.clone())
-//!         .symbols(config.symbols.clone())
-//!         .build();
-//!
-//!     // Run client and process messages
-//!     let mut rx = client.run().await;
-//!     while let Some(event) = rx.recv().await {
-//!         match event {
-//!             WsEvent::Message(msg, received_at) => {
-//!                 // Process orderbook updates
-//!             }
-//!             _ => {}
-//!         }
-//!     }
-//! }
-//! ```
+//! StandX BTC market maker. See README.md for operation and SPREAD_CALCULATION.md for the model.
 
 pub mod binance;
 pub mod config;
@@ -95,7 +13,7 @@ pub mod websocket;
 pub use config::{Config, ConfigError, WebSocketConfig, StrategyConfig, PositionConfig, OrderConfig, WalletConfig, SanityCheckConfig, SymbolInfoConfig};
 pub use logging::{init as init_logging, is_enabled as logging_enabled, logger};
 pub use orderbook::{
-    CurrentOrderbook, OrderbookHistory, OrderbookManager, OrderbookStore,
+    CurrentOrderbook, OrderbookManager, OrderbookStore,
     SymbolOrderbook, OrderbookStats,
     OrderbookSanityChecker, SanityCheckerConfig, SanityCheckerHandle, SanityCheckerStats,
 };
@@ -113,12 +31,10 @@ pub use binance::{
     BinanceClient, BinanceClientConfig, BinanceEvent, BinanceObiCalculator,
     BinanceOrderbook, BinanceWsStats, BinanceWsStatsSnapshot,
     SharedAlpha, BinanceAlphaPollerHandle, start_binance_alpha_poller,
-    SharedBbo, BinanceBboPollerHandle, start_binance_bbo_poller,
-    BinanceBookTickerClient, BookTickerClientConfig, BookTickerEvent,
 };
 pub use websocket::{
     WsClient, WsClientBuilder, WsEvent, WsStats, WsStatsSnapshot,
-    StandXMessage, DepthBookData, MessageError,
+    StandXMessage, MessageError,
     current_time_ns,
 };
 

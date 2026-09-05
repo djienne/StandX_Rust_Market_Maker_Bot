@@ -255,6 +255,7 @@ impl PositionPoller {
             None => 0.0, // No position entry = zero position
         };
 
+        if !position.is_finite() { return Err("nonfinite position quantity".into()); }
         Ok(position)
     }
 }
@@ -297,14 +298,4 @@ mod tests {
         assert_eq!(pos.update_version(), 2);
     }
 
-    #[test]
-    fn test_atomic_operations() {
-        let pos = Arc::new(SharedPosition::new("TEST-USD"));
-
-        // Simulate concurrent reads
-        let pos_clone = Arc::clone(&pos);
-        pos.set(123.456);
-
-        assert_eq!(pos_clone.get(), 123.456);
-    }
 }

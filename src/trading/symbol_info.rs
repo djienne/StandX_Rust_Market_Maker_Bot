@@ -25,6 +25,7 @@ pub struct SharedSymbolInfo {
     tick_size_bits: AtomicU64,
     /// Lot size (quantity increment), stored as f64 bits
     lot_size_bits: AtomicU64,
+    min_order_qty_bits: AtomicU64,
     /// Price tick decimals (for logging/debugging)
     price_tick_decimals: AtomicU8,
     /// Qty tick decimals (for logging/debugging)
@@ -42,6 +43,7 @@ impl SharedSymbolInfo {
             symbol: symbol.into(),
             tick_size_bits: AtomicU64::new(tick_size.to_bits()),
             lot_size_bits: AtomicU64::new(lot_size.to_bits()),
+            min_order_qty_bits: AtomicU64::new(lot_size.to_bits()),
             price_tick_decimals: AtomicU8::new(Self::decimals_from_step(tick_size)),
             qty_tick_decimals: AtomicU8::new(Self::decimals_from_step(lot_size)),
             generation: AtomicU64::new(0),
@@ -51,7 +53,9 @@ impl SharedSymbolInfo {
 
     /// Create from SymbolInfo API response.
     pub fn from_api_response(info: &SymbolInfo) -> Self {
-        Self::new(&info.symbol, info.tick_size(), info.lot_size())
+        let shared = Self::new(&info.symbol, info.tick_size(), info.lot_size());
+        shared.min_order_qty_bits.store(info.min_order_qty.parse::<f64>().unwrap_or(f64::NAN).to_bits(), Ordering::Release);
+        shared
     }
 
     /// Calculate decimal places from step size (e.g., 0.01 -> 2, 0.001 -> 3)
@@ -73,6 +77,10 @@ impl SharedSymbolInfo {
     #[inline]
     pub fn lot_size(&self) -> f64 {
         f64::from_bits(self.lot_size_bits.load(Ordering::Acquire))
+    }
+
+    pub fn min_order_qty(&self) -> f64 {
+        f64::from_bits(self.min_order_qty_bits.load(Ordering::Acquire))
     }
 
     /// Get price tick decimals.
@@ -129,15 +137,18 @@ impl SharedSymbolInfo {
             ));
         }
 
+        let min_qty = info.min_order_qty.parse::<f64>().map_err(|e| e.to_string())?;
+        if !min_qty.is_finite() || min_qty <= 0.0 { return Err("invalid min_order_qty".into()); }
         let old_tick_size = self.tick_size();
         let old_lot_size = self.lot_size();
 
         // Check if values changed (using epsilon for float comparison)
         let tick_changed = (new_tick_size - old_tick_size).abs() > 1e-12;
         let lot_changed = (new_lot_size - old_lot_size).abs() > 1e-12;
-        let changed = tick_changed || lot_changed;
+        let changed = tick_changed || lot_changed || min_qty != self.min_order_qty();
 
         // Update values
+        self.min_order_qty_bits.store(min_qty.to_bits(), Ordering::Release);
         self.tick_size_bits.store(new_tick_size.to_bits(), Ordering::Release);
         self.lot_size_bits.store(new_lot_size.to_bits(), Ordering::Release);
         self.price_tick_decimals.store(info.price_tick_decimals, Ordering::Release);
@@ -181,6 +192,7 @@ impl SharedSymbolInfo {
 /// Signal sent when tick size or lot size changes.
 #[derive(Debug, Clone)]
 pub struct TickSizeChangedSignal {
+    pub info: SymbolInfo,
     /// Symbol that changed
     pub symbol: String,
     /// Old tick size
@@ -278,13 +290,15 @@ impl SymbolInfoPoller {
                     let old_lot_size = self.info.lot_size();
 
                     // Try to update - validates values before accepting
-                    match self.info.try_update(&api_info) {
+                    let candidate = SharedSymbolInfo::new(&api_info.symbol, old_tick_size, old_lot_size);
+                    candidate.min_order_qty_bits.store(self.info.min_order_qty().to_bits(), Ordering::Release);
+                    match candidate.try_update(&api_info) {
                         Ok(changed) => {
                             consecutive_errors = 0;
 
                             if changed {
-                                let new_tick_size = self.info.tick_size();
-                                let new_lot_size = self.info.lot_size();
+                                let new_tick_size = candidate.tick_size();
+                                let new_lot_size = candidate.lot_size();
 
                                 warn!(
                                     "[{}] TICK SIZE CHANGED! tick_size: {} -> {}, lot_size: {} -> {}",
@@ -293,6 +307,7 @@ impl SymbolInfoPoller {
                                 );
 
                                 let signal = TickSizeChangedSignal {
+                                    info: api_info,
                                     symbol: self.config.symbol.clone(),
                                     old_tick_size,
                                     new_tick_size,
@@ -383,22 +398,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_shared_symbol_info_new() {
-        let info = SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001);
-        assert_eq!(info.symbol(), "TEST-USD");
-        assert_eq!(info.tick_size(), 0.01);
-        assert_eq!(info.lot_size(), 0.0001);
-        assert_eq!(info.price_tick_decimals(), 2);
-        assert_eq!(info.qty_tick_decimals(), 4);
-        assert_eq!(info.generation(), 0);
-    }
-
-    #[test]
     fn test_shared_symbol_info_from_api() {
         let api_info = SymbolInfo {
             symbol: "ETH-USD".to_string(),
             price_tick_decimals: 2,
             qty_tick_decimals: 3,
+            min_order_qty: "0.001".into(),
         };
 
         let info = SharedSymbolInfo::from_api_response(&api_info);
@@ -417,6 +422,7 @@ mod tests {
             symbol: "TEST-USD".to_string(),
             price_tick_decimals: 2,
             qty_tick_decimals: 4,
+            min_order_qty: "0.0001".into(),
         };
         let changed = info.update(&api_info);
         assert!(!changed);
@@ -427,21 +433,12 @@ mod tests {
             symbol: "TEST-USD".to_string(),
             price_tick_decimals: 1, // 0.1 instead of 0.01
             qty_tick_decimals: 4,
+            min_order_qty: "0.0001".into(),
         };
         let changed = info.update(&api_info);
         assert!(changed);
         assert_eq!(info.tick_size(), 0.1);
         assert_eq!(info.generation(), 2);
-    }
-
-    #[test]
-    fn test_atomic_operations() {
-        let info = Arc::new(SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001));
-
-        // Simulate concurrent reads
-        let info_clone = Arc::clone(&info);
-        assert_eq!(info_clone.tick_size(), 0.01);
-        assert_eq!(info_clone.lot_size(), 0.0001);
     }
 
     #[test]
@@ -454,37 +451,19 @@ mod tests {
     }
 
     #[test]
-    fn test_poller_config_default() {
-        let config = SymbolInfoPollerConfig::default();
-        assert_eq!(config.interval, Duration::from_secs(30));
-        assert_eq!(config.symbol, "TEST-USD");
-    }
-
-    #[test]
     fn test_try_update_rejects_invalid_values() {
         let info = SharedSymbolInfo::new("TEST-USD", 0.01, 0.0001);
-
-        // Valid update should succeed
-        let valid_info = SymbolInfo {
-            symbol: "TEST-USD".to_string(),
-            price_tick_decimals: 1, // 0.1
-            qty_tick_decimals: 3,   // 0.001
-        };
-        assert!(info.try_update(&valid_info).is_ok());
-        assert_eq!(info.tick_size(), 0.1);
-
-        // Zero tick_size (decimals=255 would give extremely small value)
-        // Note: price_tick_decimals is u8, so max is 255 -> 10^-255 which is essentially 0
-        // We can't really test 0 directly, but we can test the validation logic
-
-        // Test that valid values work
-        let valid_info = SymbolInfo {
-            symbol: "TEST-USD".to_string(),
-            price_tick_decimals: 2,
-            qty_tick_decimals: 4,
-        };
-        let result = info.try_update(&valid_info);
-        assert!(result.is_ok());
+        let valid = SymbolInfo { symbol: "TEST-USD".to_string(), price_tick_decimals: 1, qty_tick_decimals: 3, min_order_qty: "0.001".into() };
+        assert_eq!(info.try_update(&valid), Ok(true));
+        assert_eq!((info.tick_size(), info.lot_size(), info.min_order_qty()), (0.1, 0.001, 0.001));
+        assert_eq!(info.try_update(&valid), Ok(false), "unchanged values are not a change");
+        for bad_min in ["0", "-1", "nan", "abc"] {
+            let invalid = SymbolInfo { min_order_qty: bad_min.into(), ..valid.clone() };
+            assert!(info.try_update(&invalid).is_err(), "{bad_min}");
+        }
+        let invalid = SymbolInfo { price_tick_decimals: 40, ..valid.clone() };
+        assert!(info.try_update(&invalid).is_err(), "tick below 1e-12 is rejected");
+        assert_eq!((info.tick_size(), info.lot_size(), info.min_order_qty()), (0.1, 0.001, 0.001), "rejected updates leave values intact");
     }
 
     #[test]

@@ -37,17 +37,11 @@
 //! }
 //! ```
 
-pub mod book_ticker_client;
 pub mod client;
 pub mod messages;
 pub mod orderbook;
 pub mod shared_alpha;
-pub mod shared_bbo;
 
-pub use book_ticker_client::{
-    BinanceBookTickerClient, BookTickerClientConfig, BookTickerEvent, BookTickerWsStats,
-    BookTickerWsStatsSnapshot,
-};
 pub use client::{
     BinanceClient, BinanceClientConfig, BinanceEvent, BinanceWsStats, BinanceWsStatsSnapshot,
     MarketType, BINANCE_FUTURES_REST_URL, BINANCE_FUTURES_WS_URL, BINANCE_REST_URL, BINANCE_WS_URL,
@@ -55,7 +49,6 @@ pub use client::{
 pub use messages::{BinanceBookTicker, BinanceDepthSnapshot, BinanceDepthUpdate, ParseError, parse_book_ticker};
 pub use orderbook::{BinanceOrderbook, SyncError};
 pub use shared_alpha::SharedAlpha;
-pub use shared_bbo::SharedBbo;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -367,132 +360,6 @@ pub fn start_binance_alpha_poller(
         stop_flag,
         _event_rx: None,
     }
-}
-
-// ============================================================================
-// Binance BBO Poller (bookTicker feed)
-// ============================================================================
-
-/// Handle for the Binance BBO poller task.
-pub struct BinanceBboPollerHandle {
-    stop_flag: Arc<AtomicBool>,
-}
-
-impl BinanceBboPollerHandle {
-    /// Stop the poller gracefully.
-    pub fn stop(&self) {
-        self.stop_flag.store(true, Ordering::Release);
-    }
-
-    /// Check if the poller is running.
-    pub fn is_running(&self) -> bool {
-        !self.stop_flag.load(Ordering::Acquire)
-    }
-}
-
-/// Start the Binance BBO poller as a background task.
-///
-/// Connects to the bookTicker WebSocket stream and updates SharedBbo
-/// atomically for lock-free reads from the hot path.
-///
-/// # Arguments
-/// * `symbol` - Binance symbol (e.g., "btcusdt")
-/// * `shared_bbo` - Arc to shared BBO storage for lock-free reads
-pub fn start_binance_bbo_poller(
-    symbol: &str,
-    shared_bbo: Arc<SharedBbo>,
-) -> BinanceBboPollerHandle {
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_clone = Arc::clone(&stop_flag);
-    let symbol = symbol.to_string();
-
-    tokio::spawn(async move {
-        info!("Binance BBO poller starting for {}", symbol);
-
-        loop {
-            if stop_flag_clone.load(Ordering::Acquire) {
-                info!("Binance BBO poller stopping (stop requested)");
-                break;
-            }
-
-            let client = Arc::new(BinanceBookTickerClient::new(&symbol));
-
-            // Reset shared BBO on reconnect
-            shared_bbo.reset();
-
-            let mut rx = client.clone().run().await;
-            let mut logged_first = false;
-
-            while let Some(event) = rx.recv().await {
-                if stop_flag_clone.load(Ordering::Acquire) {
-                    client.stop();
-                    break;
-                }
-
-                match event {
-                    BookTickerEvent::Update(ticker) => {
-                        // Parse f64 values
-                        let bid = match ticker.bid_price_f64() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                debug!("BBO parse error (bid): {}", e);
-                                continue;
-                            }
-                        };
-                        let ask = match ticker.ask_price_f64() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                debug!("BBO parse error (ask): {}", e);
-                                continue;
-                            }
-                        };
-                        let bid_qty = match ticker.bid_qty_f64() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                debug!("BBO parse error (bid_qty): {}", e);
-                                continue;
-                            }
-                        };
-                        let ask_qty = match ticker.ask_qty_f64() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                debug!("BBO parse error (ask_qty): {}", e);
-                                continue;
-                            }
-                        };
-
-                        shared_bbo.update(bid, ask, bid_qty, ask_qty, ticker.update_id);
-
-                        if !logged_first {
-                            info!(
-                                "Binance BBO first update: bid={:.2} ask={:.2} mid={:.2} spread={:.2}",
-                                bid, ask, (bid + ask) / 2.0, ask - bid
-                            );
-                            logged_first = true;
-                        }
-                    }
-                    BookTickerEvent::Disconnected(reason) => {
-                        warn!("Binance BBO poller disconnected: {}", reason);
-                        break;
-                    }
-                    BookTickerEvent::Error(err) => {
-                        debug!("Binance BBO poller error: {}", err);
-                    }
-                }
-            }
-
-            if stop_flag_clone.load(Ordering::Acquire) {
-                break;
-            }
-
-            info!("Binance BBO poller reconnecting in 5 seconds...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-
-        info!("Binance BBO poller stopped");
-    });
-
-    BinanceBboPollerHandle { stop_flag }
 }
 
 #[cfg(test)]

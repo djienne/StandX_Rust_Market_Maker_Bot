@@ -1,23 +1,10 @@
-# Build artifacts
-target/
-
-# Secrets and credentials
-.env
-
-# Data files
-*.csv
-
-# Version control
-.git/
-.gitignore
-
-# Documentation
-*.md
-
-# IDE files
-.vscode/
-.idea/
-
-# OS files
-.DS_Store
-Thumbs.db
+# Only source and runtime configuration enter the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!config.json
+!config.test.json
+!benches/
+!benches/**

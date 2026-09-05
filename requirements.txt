@@ -1,2 +1,2 @@
-aiohttp>=3.9
+# Used by the historical Python backtest reference in DOCS.
 numpy>=1.24

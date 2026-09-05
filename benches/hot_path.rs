@@ -36,6 +36,8 @@ fn manager() -> QuoteOrderManager {
     let config = OrderManagerConfig {
         symbol: "BTC-USD".to_string(),
         num_levels: 2,
+        lot_size: 0.00001,
+        min_order_qty: 0.00001,
         ..OrderManagerConfig::default()
     };
     QuoteOrderManager::new(config, position, equity)
@@ -120,5 +122,48 @@ fn bench_snapshot(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_order_manager, bench_snapshot);
+fn bench_strategy(c: &mut Criterion) {
+    let equity = Arc::new(SharedEquity::new(2, 10.0, 1.0));
+    equity.set_equity(10_000.0);
+    let config = standx_orderbook::StrategyConfig::default();
+    let step = config.step_ns as i64;
+    let mut strategy = standx_orderbook::ObiStrategy::new(config, None, Some(equity), None, 10, 5);
+    let mut book = snapshot(1);
+    for i in 0..=6000 { book.received_at_ns = 1 + i * step; strategy.update(&book); }
+    assert!(strategy.is_valid_for_trading());
+    c.bench_function("strategy_valid_depth_grid_update", |b| {
+        b.iter(|| {
+            book.received_at_ns += step;
+            black_box(strategy.update(black_box(&book)))
+        })
+    });
+}
+
+fn depth_message(levels: usize) -> String {
+    let mut bids = Vec::new();
+    let mut asks = Vec::new();
+    for i in 0..levels {
+        bids.push(format!(r#"["{:.2}","{:.3}"]"#, 121_884.01 - i as f64 * 0.3, 0.001 + i as f64 * 0.01));
+        asks.push(format!(r#"["{:.2}","{:.3}"]"#, 121_895.81 + i as f64 * 0.3, 0.843 + i as f64 * 0.01));
+    }
+    bids.reverse(); // exchange sends bids ascending (see DOCS/websocket.md)
+    format!(
+        r#"{{"seq":1,"channel":"depth_book","data":{{"symbol":"BTC-USD","asks":[{}],"bids":[{}],"sequence":123456,"time":"2025-08-11T03:44:40.922233Z"}}}}"#,
+        asks.join(","), bids.join(",")
+    )
+}
+
+fn bench_parse(c: &mut Criterion) {
+    let text = depth_message(20);
+    c.bench_function("parse_depth_20_levels_to_snapshot", |b| {
+        b.iter(|| {
+            match standx_orderbook::StandXMessage::parse_str(black_box(&text), 20, 1).unwrap() {
+                standx_orderbook::StandXMessage::DepthBook(book) => black_box(book),
+                _ => unreachable!(),
+            }
+        })
+    });
+}
+
+criterion_group!(benches, bench_order_manager, bench_snapshot, bench_strategy, bench_parse);
 criterion_main!(benches);

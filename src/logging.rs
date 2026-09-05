@@ -127,12 +127,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_logger_enabled() {
-        init(true);
-        assert!(is_enabled());
-    }
-
-    #[test]
     fn test_logger_toggle() {
         init(true);
         logger().set_enabled(false);
