@@ -353,14 +353,12 @@ pub struct OrderConfig {
     #[serde(default = "default_circuit_breaker_rejections")]
     pub circuit_breaker_rejections: u32,
 
-    /// Circuit breaker cooldown in seconds (default: 300). After it elapses an
-    /// account reconciliation runs; trading resumes only when that verifies.
-    /// Set to 0 to recover only through an unrelated reconciliation.
+    /// Circuit breaker cooldown in seconds (default: 300) before a verified
+    /// reconciliation resumes trading; must be > 0 while the breaker is enabled.
     #[serde(default = "default_circuit_breaker_recovery_secs")]
     pub circuit_breaker_recovery_secs: u64,
 
-    /// Safety pause cooldown in seconds (default: 30), with the same
-    /// reconcile-then-resume recovery as the circuit breaker.
+    /// Safety pause cooldown in seconds (default: 30), same rule as above.
     #[serde(default = "default_safety_pause_recovery_secs")]
     pub safety_pause_recovery_secs: u64,
 
@@ -816,6 +814,14 @@ impl Config {
             ));
         }
 
+        if self.order.circuit_breaker_rejections > 0
+            && (self.order.circuit_breaker_recovery_secs == 0 || self.order.safety_pause_recovery_secs == 0)
+        {
+            return Err(ConfigError::ValidationError(
+                "order.circuit_breaker_recovery_secs and order.safety_pause_recovery_secs must be > 0 while the circuit breaker is enabled".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -891,6 +897,12 @@ mod tests {
         let mut config = Config::default();
         config.strategy.lot_size = f64::NAN;
         assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.order.circuit_breaker_recovery_secs = 0;
+        assert!(config.validate().is_err(), "a tripped breaker must have a cooldown");
+        config.order.circuit_breaker_rejections = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

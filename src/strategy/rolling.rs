@@ -150,14 +150,16 @@ impl RollingStats {
         }
         let old_value = self.window.push(value);
 
-        // Add new value's contribution
-        self.sum += value;
-        self.sum_sq += value * value;
-
-        // Remove old value's contribution (if window was full)
-        if let Some(old_val) = old_value {
-            self.sum -= old_val;
-            self.sum_sq -= old_val * old_val;
+        if self.window.is_full() && self.window.write_pos.is_multiple_of(self.window.capacity) {
+            // Once per wrap, rebuild the sums so add/subtract rounding cannot drift forever.
+            (self.sum, self.sum_sq) = self.window.iter().fold((0.0, 0.0), |(s, q), v| (s + v, q + v * v));
+        } else {
+            self.sum += value;
+            self.sum_sq += value * value;
+            if let Some(old_val) = old_value {
+                self.sum -= old_val;
+                self.sum_sq -= old_val * old_val;
+            }
         }
 
         // Update cached statistics (avoids sqrt() on every zscore call)
@@ -342,22 +344,16 @@ mod tests {
     #[test]
     fn test_rolling_stats_with_wrap() {
         let mut stats = RollingStats::new(3);
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0] { stats.push(v); }
+        assert!((stats.mean() - 4.0).abs() < 1e-10, "window is [3, 4, 5]");
 
-        stats.push(1.0);
-        stats.push(2.0);
-        stats.push(3.0);
-
-        // Mean of [1, 2, 3] = 2
-        assert!((stats.mean() - 2.0).abs() < 1e-10);
-
-        stats.push(4.0);  // Now [2, 3, 4]
-
-        // Mean of [2, 3, 4] = 3
-        assert!((stats.mean() - 3.0).abs() < 1e-10);
-
-        stats.push(5.0);  // Now [3, 4, 5]
-
-        // Mean of [3, 4, 5] = 4
-        assert!((stats.mean() - 4.0).abs() < 1e-10);
+        // Long run with a large offset: incremental sums drift, the wrap rebuild must not.
+        let mut stats = RollingStats::new(6000);
+        for i in 0..200_000 { stats.push(1e3 + (i as f64).sin()); }
+        let window: Vec<f64> = stats.window.iter().collect();
+        let mean = window.iter().sum::<f64>() / window.len() as f64;
+        let exact = (window.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / window.len() as f64).sqrt();
+        assert!((stats.std() - exact).abs() < 1e-7, "std {} vs exact {}", stats.std(), exact);
+        assert!((stats.zscore(1e3 + 1.0) - (1e3 + 1.0 - mean) / exact).abs() < 1e-6);
     }
 }
